@@ -1,0 +1,47 @@
+# Models and large weight files
+models/
+backend/models/
+*.onnx
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Python virtual environment & caches
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Node / Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Tauri & Desktop Packaging
+src-tauri/target/
+frontend/src-tauri/target/
+frontend/src-tauri/binaries/*.exe
+packaging/build/
+packaging/dist/
+packaging/*.exe
+*.spec
+!packaging/*.spec
+!packaging/pyinstaller/*.spec
+
+# Logs & Environment
+.env
+.env.*.local
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# OS artifacts
+.DS_Store
+Thumbs.db
