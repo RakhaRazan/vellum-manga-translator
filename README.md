@@ -98,3 +98,13 @@ To build against CUDA or CPU-only ONNX Runtime instead of DirectML, pass `-DMANG
 - `packaging/` - Windows release script, icon, and optional Koharu ONNX converter
 - `docs/` - Architecture notes and API spec (`SPEC.md`)
 - `samples/` - Sample JA / KO / ZH pages for testing
+
+## Credits
+
+Vellum does not bundle third-party model weights. Supported models are downloaded from their original sources or imported from your local cache, and remain subject to their respective licenses:
+
+- [Koharu (`mayocream`)](https://huggingface.co/mayocream) - `koharu-layout-rfdetr-seg-2xl-1152`, `lama-manga`, and `manga-ocr` weights
+- [comic-text-detector](https://github.com/dmMaze/comic-text-detector) - ComicTextDetector model
+- [manga-ocr](https://github.com/kha-white/manga-ocr) - Japanese manga OCR
+- [RapidOCR](https://github.com/RapidAI/RapidOCR) / [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) - Korean & Chinese OCR models
+- [LaMa](https://github.com/advimman/lama) - Image inpainting architecture
