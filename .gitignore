@@ -1,15 +1,19 @@
-# Models and large weight files
+# Models, fonts & large weight files
 models/
 backend/models/
+fonts/
+backend/fonts/
 *.onnx
+*.gguf
 *.bin
 *.safetensors
 *.pt
 *.pth
 
-# Python virtual environment & caches
+# Python virtual environments & caches
 venv/
 .venv/
+backend/venv/
 env/
 __pycache__/
 *.py[cod]
@@ -17,24 +21,43 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+# C++17 CMake / MSVC build artifacts
+backend-cpp/build/
+backend-cpp/out/
+backend-cpp/CMakeUserPresets.json
+*.pdb
+*.lib
+*.obj
+*.exp
+*.ilk
+
 # Node / Frontend
 node_modules/
+frontend/node_modules/
 dist/
+frontend/dist/
 dist-ssr/
 *.local
 
-# Tauri & Desktop Packaging
+# Standalone Desktop Bundles, Release Archives & Compiled Binaries
+MangaFlow_App/
+MangaFlow_Cpp/
+release/
+*.exe
+*.dll
+
+# Tauri & Legacy Packaging Staging
 src-tauri/target/
 frontend/src-tauri/target/
-frontend/src-tauri/binaries/*.exe
 packaging/build/
 packaging/dist/
-packaging/*.exe
+packaging/_koharu_stage/
 *.spec
 !packaging/*.spec
 !packaging/pyinstaller/*.spec
 
-# Logs & Environment
+# Local runtime settings (may contain API keys), logs & environment files
+backend/settings.json
 .env
 .env.*.local
 *.log

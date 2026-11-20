@@ -18,7 +18,6 @@ from typing import Protocol, TypedDict, cast
 
 import cv2
 import numpy as np
-import onnxruntime as ort  # pyright: ignore[reportMissingTypeStubs]
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +32,7 @@ from backend.core.detector import (  # noqa: E402
 )
 from backend.core.model_manager import (  # noqa: E402
     ModelManager,
+    create_onnx_session,
     get_execution_provider,
 )
 
@@ -205,6 +205,7 @@ class LamaInpainter:
     force_cpu: bool
     _session: _OrtSession | None
     _active_provider: str | None
+    _last_provider: str | None
 
     def __init__(
         self,
@@ -230,11 +231,15 @@ class LamaInpainter:
         self.force_cpu = force_cpu
         self._session = None
         self._active_provider = None
+        self._last_provider = None
 
     def _get_session(self, fallback_cpu: bool = False) -> _OrtSession:
-        """Lazily initialize the ONNX Runtime session with automatic CPU fallback on low VRAM / OOM."""
+        """Lazily initialize the ONNX Runtime session with CUDA / DirectML -> CPU fallback."""
         if self._session is not None and not fallback_cpu:
             return self._session
+
+        if fallback_cpu and self._session is not None:
+            self.unload()
 
         self.model_path = (
             self._custom_model_path
@@ -247,39 +252,29 @@ class LamaInpainter:
                 + "Run ModelManager.download_missing_models() first."
             )
 
-        use_cpu = self.force_cpu or fallback_cpu
-        primary_provider = (
-            "CPUExecutionProvider" if use_cpu else get_execution_provider()
+        raw_session, active_provider = create_onnx_session(
+            self.model_path,
+            force_cpu=(self.force_cpu or fallback_cpu),
         )
-        preferred_providers: list[str] = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if primary_provider == "CUDAExecutionProvider"
-            else ["CPUExecutionProvider"]
-        )
-
-        try:
-            raw_session = ort.InferenceSession(
-                str(self.model_path),
-                providers=preferred_providers,
-            )
-            self._active_provider = primary_provider
-        except Exception:
-            raw_session = ort.InferenceSession(
-                str(self.model_path),
-                providers=["CPUExecutionProvider"],
-            )
-            self._active_provider = "CPUExecutionProvider"
-
         session = cast(_OrtSession, cast(object, raw_session))
         self._session = session
+        self._active_provider = active_provider
+        self._last_provider = active_provider
         return session
 
     @property
+    def is_loaded(self) -> bool:
+        """Return True if the LaMa ONNX session is currently resident in memory."""
+        return self._session is not None
+
+    @property
     def execution_provider(self) -> str:
-        """Return the active ONNX Runtime execution provider."""
-        if self._active_provider is None:
-            _ = self._get_session()
-        return self._active_provider or "CPUExecutionProvider"
+        """Return the active or most recently used ONNX Runtime execution provider."""
+        if self._active_provider is not None:
+            return self._active_provider
+        if self._last_provider is not None:
+            return self._last_provider
+        return get_execution_provider(force_cpu=self.force_cpu)
 
     def unload(self) -> None:
         """Release the ONNX session from memory/VRAM and run garbage collection."""
@@ -312,7 +307,9 @@ class LamaInpainter:
                 {"image": img_tensor, "mask": mask_tensor},
             )
         except Exception:
-            # SPEC.md Section 6.3: Automatic CPU fallback if CUDA runs out of VRAM during inference
+            if self._active_provider == "CPUExecutionProvider":
+                raise
+            # Automatic safe CPU fallback if CUDA/DirectML fails or OOMs during inference
             session = self._get_session(fallback_cpu=True)
             outputs = session.run(
                 None,
@@ -415,6 +412,7 @@ class LamaInpainter:
         bboxes: Sequence[Sequence[int]] | None = None,
         tile_padding: int | None = None,
         refine_mask: bool = True,
+        auto_unload: bool = True,
     ) -> InpaintResult:
         """Erase text regions indicated by `mask` (and optional `bboxes`) using tile-based LaMa inpainting."""
         rgb = load_rgb_image(image)
@@ -442,19 +440,26 @@ class LamaInpainter:
         pad = self.tile_padding if tile_padding is None else tile_padding
 
         tiles_count = 0
-        for box in roi_boxes:
-            if self._inpaint_roi(
-                canvas=canvas,
-                full_mask=working_mask,
-                bbox=box,
-                padding=pad,
-            ):
-                tiles_count += 1
+        provider_used = get_execution_provider(force_cpu=self.force_cpu)
+        try:
+            for box in roi_boxes:
+                if self._inpaint_roi(
+                    canvas=canvas,
+                    full_mask=working_mask,
+                    bbox=box,
+                    padding=pad,
+                ):
+                    tiles_count += 1
+            if self._active_provider is not None:
+                provider_used = self._active_provider
+        finally:
+            if auto_unload:
+                self.unload()
 
         return {
             "image": canvas,
             "tiles_processed": tiles_count,
-            "execution_provider": self.execution_provider,
+            "execution_provider": provider_used,
         }
 
     def inpaint(

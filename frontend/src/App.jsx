@@ -10,121 +10,297 @@ import {
   RefreshCw,
   Trash2,
 } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import DownloadModal from './components/DownloadModal.jsx';
-import Toolbar from './components/Toolbar.jsx';
+import SettingsModal from './components/SettingsModal.jsx';
+import MenuBar from './components/MenuBar.jsx';
+import FrontControlBar from './components/FrontControlBar.jsx';
 import MangaCanvas from './components/MangaCanvas.jsx';
-import TextSidebar, { COMIC_FONT_FAMILIES } from './components/TextSidebar.jsx';
+import TextSidebar from './components/TextSidebar.jsx';
+import StatusBar from './components/StatusBar.jsx';
+import useEditorStore, {
+  bindSystemThemeListener,
+  ensurePageFontsLoaded,
+  normalizeBlocks,
+} from './store/useEditorStore.js';
 
-const API_BASE_URL = 'http://localhost:8000';
+function resolveBackendUrl(url, apiBaseUrl) {
+  if (!url) return null;
+  if (/^(data:|blob:|https?:\/\/)/i.test(url)) return url;
+  if (url.startsWith('/')) {
+    const base = String(apiBaseUrl || '').replace(/\/+$/, '');
+    return base ? `${base}${url}` : url;
+  }
+  return url;
+}
 
-/**
- * Normalize raw blocks returned from `/api/process-page` into canvas-ready block objects
- * with explicit `x`, `y`, `width`, `height`, `rotation`, and style properties.
- */
-function normalizeBlocks(rawBlocks = []) {
-  return rawBlocks.map((b, index) => {
-    const bbox = Array.isArray(b.bbox) && b.bbox.length >= 4 ? b.bbox : [60, 60, 220, 140];
-    const x1 = Number(bbox[0]) || 0;
-    const y1 = Number(bbox[1]) || 0;
-    const x2 = Number(bbox[2]) || x1 + 140;
-    const y2 = Number(bbox[3]) || y1 + 60;
-    const width = Math.max(36, x2 - x1);
-    const height = Math.max(24, y2 - y1);
-    const fontSize = b.font_size || b.style?.font_size || 18;
-    const color = b.color || b.style?.color || '#000000';
-    const align = b.align || b.style?.align || 'center';
-    const fontFamily =
-      b.font_family || b.style?.font_family || COMIC_FONT_FAMILIES[0].value;
-    const strokeColor = b.stroke_color || b.style?.stroke_color || '#ffffff';
-    const strokeWidth =
-      b.stroke_width !== undefined
-        ? b.stroke_width
-        : b.style?.stroke_width !== undefined
-        ? b.style.stroke_width
-        : 4;
-    const lineHeight = b.line_height || b.style?.line_height || 1.18;
+const naturalSortCollator = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: 'base',
+});
 
-    return {
-      ...b,
-      id: b.id || `block_${String(index + 1).padStart(3, '0')}`,
-      order: b.order ?? index + 1,
-      bbox: [x1, y1, x1 + width, y1 + height],
-      x: typeof b.x === 'number' ? b.x : x1,
-      y: typeof b.y === 'number' ? b.y : y1,
-      width: typeof b.width === 'number' ? b.width : width,
-      height: typeof b.height === 'number' ? b.height : height,
-      rotation: typeof b.rotation === 'number' ? b.rotation : 0,
-      original_text: b.original_text ?? b.source_text ?? '',
-      source_text: b.source_text ?? b.original_text ?? '',
-      translated_text: b.translated_text ?? '',
-      font_family: fontFamily,
-      font_size: fontSize,
-      color,
-      stroke_color: strokeColor,
-      stroke_width: strokeWidth,
-      align,
-      line_height: lineHeight,
-      style: {
-        font_family: fontFamily,
-        font_size: fontSize,
-        color,
-        stroke_color: strokeColor,
-        stroke_width: strokeWidth,
-        align,
-        line_height: lineHeight,
-      },
-    };
+async function resolvePageImageFile(pageItem) {
+  if (pageItem?.file instanceof File || pageItem?.file instanceof Blob) {
+    return pageItem.file;
+  }
+  const srcUrl = pageItem?.originalUrl || pageItem?.cleanedImage;
+  if (!srcUrl) return null;
+  const resp = await fetch(srcUrl);
+  if (!resp.ok) {
+    throw new Error(`Could not fetch source image for ${pageItem.name} (HTTP ${resp.status})`);
+  }
+  const blob = await resp.blob();
+  return new File([blob], pageItem.name || 'page.png', {
+    type: blob.type || 'image/png',
   });
 }
 
+function triggerBlobDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function extractDataTransferFiles(dataTransfer) {
+  const items = Array.from(dataTransfer?.items || []);
+  const hasEntries = items.some(
+    (it) => typeof it.webkitGetAsEntry === 'function'
+  );
+  if (!hasEntries) {
+    return Array.from(dataTransfer?.files || []);
+  }
+
+  const droppedFiles = [];
+  const walkEntry = (entry, prefix = '') =>
+    new Promise((resolve) => {
+      if (!entry) {
+        resolve();
+        return;
+      }
+      if (entry.isFile) {
+        entry.file(
+          (file) => {
+            if (prefix && !file.webkitRelativePath) {
+              try {
+                Object.defineProperty(file, 'webkitRelativePath', {
+                  value: `${prefix}${file.name}`,
+                  configurable: true,
+                });
+              } catch {
+                // ignore non-configurable property
+              }
+            }
+            droppedFiles.push(file);
+            resolve();
+          },
+          () => resolve()
+        );
+        return;
+      }
+      if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const readBatch = () => {
+          reader.readEntries(
+            async (batch) => {
+              if (!batch || batch.length === 0) {
+                resolve();
+                return;
+              }
+              for (const child of batch) {
+                await walkEntry(child, `${prefix}${entry.name}/`);
+              }
+              readBatch();
+            },
+            () => resolve()
+          );
+        };
+        readBatch();
+        return;
+      }
+      resolve();
+    });
+
+  for (const item of items) {
+    if (item.kind !== 'file') continue;
+    const entry = item.webkitGetAsEntry?.();
+    if (entry) {
+      await walkEntry(entry);
+    } else {
+      const f = item.getAsFile?.();
+      if (f) droppedFiles.push(f);
+    }
+  }
+
+  return droppedFiles.length > 0
+    ? droppedFiles
+    : Array.from(dataTransfer?.files || []);
+}
+
 export default function App() {
-  // Startup model verification state
+  // Startup model verification & transient UI state
   const [startupChecking, setStartupChecking] = useState(true);
   const [startupError, setStartupError] = useState(null);
-  const [modelsStatus, setModelsStatus] = useState(null);
   const [isWorkspaceUnlocked, setIsWorkspaceUnlocked] = useState(false);
   const [isDownloadModalOpen, setIsDownloadModalOpen] = useState(false);
-
-  // Translation language configuration
-  const [sourceLang, setSourceLang] = useState('ja');
-  const [targetLang, setTargetLang] = useState('id');
-
-  // Multi-page batch queue & active editor state
-  const [pages, setPages] = useState([]);
-  const [activePageId, setActivePageId] = useState(null);
-  const [selectedBlockId, setSelectedBlockId] = useState(null);
-  const [isRetranslating, setIsRetranslating] = useState(false);
+  const [isPipelineRunning, setIsPipelineRunning] = useState(false);
+  const [busyLayerAction, setBusyLayerAction] = useState(null); // { blockId, stage: 'ocr' | 'translate' } | null
+  const [isPollingLlm, setIsPollingLlm] = useState(false);
   const [statusBanner, setStatusBanner] = useState(null);
 
   const canvasRef = useRef(null);
-  const isQueueWorkerRunningRef = useRef(false);
 
-  // 1. Startup Check: Query GET http://localhost:8000/api/models/status (with retry while Tauri sidecar boots)
+  // Core studio state & actions from Zustand store
+  const {
+    pages,
+    activePageId,
+    selectedPageIds,
+    selectedBlockId,
+    zenMode,
+    activeModal,
+    pipelineConfig,
+    viewLayers,
+    modelsStatus,
+    addPages,
+    removePage,
+    updatePage,
+    setPageStatus,
+    setActivePage,
+    toggleSelectPage,
+    selectPageRange,
+    setSelectedBlock,
+    updateBlock,
+    addBlock,
+    deleteBlock,
+    applyStyleToAll,
+    replaceProjectState,
+    setSourceLang,
+    hydratePipelineConfig,
+    setSupportedTargetLanguages,
+    setModelsStatus,
+    setLmStudioStatus,
+    setHealthStatus,
+    openModal,
+    closeModal,
+  } = useEditorStore(
+    useShallow((s) => ({
+      pages: s.pages,
+      activePageId: s.activePageId,
+      selectedPageIds: s.selectedPageIds,
+      selectedBlockId: s.selectedBlockId,
+      zenMode: s.zenMode,
+      activeModal: s.activeModal,
+      pipelineConfig: s.pipelineConfig,
+      viewLayers: s.viewLayers,
+      modelsStatus: s.runtimeStatus.modelsStatus,
+      addPages: s.addPages,
+      removePage: s.removePage,
+      updatePage: s.updatePage,
+      setPageStatus: s.setPageStatus,
+      setActivePage: s.setActivePage,
+      toggleSelectPage: s.toggleSelectPage,
+      selectPageRange: s.selectPageRange,
+      setSelectedBlock: s.setSelectedBlock,
+      updateBlock: s.updateBlock,
+      addBlock: s.addBlock,
+      deleteBlock: s.deleteBlock,
+      applyStyleToAll: s.applyStyleToAll,
+      replaceProjectState: s.replaceProjectState,
+      setSourceLang: s.setSourceLang,
+      hydratePipelineConfig: s.hydratePipelineConfig,
+      setSupportedTargetLanguages: s.setSupportedTargetLanguages,
+      setModelsStatus: s.setModelsStatus,
+      setLmStudioStatus: s.setLmStudioStatus,
+      setHealthStatus: s.setHealthStatus,
+      openModal: s.openModal,
+      closeModal: s.closeModal,
+    }))
+  );
+
+  const { apiBaseUrl, sourceLang, targetLang } = pipelineConfig;
+
+  // Bind Dark / Light / System OS media query synchronization
+  useEffect(() => bindSystemThemeListener(), []);
+
+  // Poll live LM Studio telemetry into store
+  const fetchLlmAndHealthStatus = useCallback(async () => {
+    setIsPollingLlm(true);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/lmstudio/status`, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const data = await response.json();
+      setLmStudioStatus(data);
+    } catch (err) {
+      setLmStudioStatus({
+        connected: false,
+        endpoint: pipelineConfig.baseUrl || 'http://localhost:1235/v1',
+        active_model: null,
+        error: err?.message || 'LM Studio unreachable',
+      });
+    } finally {
+      setIsPollingLlm(false);
+    }
+  }, [apiBaseUrl, pipelineConfig.baseUrl, setLmStudioStatus]);
+
+  // Hydrate persistent backend settings, languages & health metadata (non-blocking)
+  const hydrateBackendContext = useCallback(async () => {
+    try {
+      const [settingsRes, healthRes, langsRes] = await Promise.allSettled([
+        fetch(`${apiBaseUrl}/api/settings`, {
+          headers: { Accept: 'application/json' },
+        }),
+        fetch(`${apiBaseUrl}/api/health`, {
+          headers: { Accept: 'application/json' },
+        }),
+        fetch(`${apiBaseUrl}/api/languages`, {
+          headers: { Accept: 'application/json' },
+        }),
+      ]);
+
+      if (settingsRes.status === 'fulfilled' && settingsRes.value.ok) {
+        const settingsData = await settingsRes.value.json();
+        hydratePipelineConfig(settingsData);
+      }
+      if (healthRes.status === 'fulfilled' && healthRes.value.ok) {
+        const healthData = await healthRes.value.json();
+        setHealthStatus(healthData);
+      }
+      if (langsRes.status === 'fulfilled' && langsRes.value.ok) {
+        const langsData = await langsRes.value.json();
+        if (Array.isArray(langsData?.target_languages)) {
+          setSupportedTargetLanguages(langsData.target_languages);
+        }
+      }
+    } catch {
+      // Non-fatal; fallback defaults in store remain active
+    }
+  }, [
+    apiBaseUrl,
+    hydratePipelineConfig,
+    setHealthStatus,
+    setSupportedTargetLanguages,
+  ]);
+
+  // 1. Startup Check: Query GET /api/models/status (with retry while FastAPI backend initializes)
   const checkModelsStatus = useCallback(async () => {
     setStartupChecking(true);
     setStartupError(null);
-
-    // If running inside Tauri shell and sidecar isn't up yet, allow @tauri-apps/plugin-shell fallback spawn
-    if (typeof window !== 'undefined' && window.__TAURI_INTERNALS__) {
-      import('@tauri-apps/plugin-shell')
-        .then(({ Command }) => {
-          const cmd = Command.sidecar('binaries/comic-backend');
-          return cmd.spawn();
-        })
-        .then((child) => {
-          window.__COMIC_BACKEND_CHILD__ = child;
-        })
-        .catch(() => {
-          // Sidecar already spawned by Rust host in src-tauri/src/main.rs
-        });
-    }
 
     const maxAttempts = 12;
     let lastErr = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
-        const response = await fetch(`${API_BASE_URL}/api/models/status`, {
+        const response = await fetch(`${apiBaseUrl}/api/models/status`, {
           method: 'GET',
           headers: { Accept: 'application/json' },
         });
@@ -142,6 +318,7 @@ export default function App() {
           setIsDownloadModalOpen(true);
         }
         setStartupChecking(false);
+        hydrateBackendContext();
         return;
       } catch (err) {
         lastErr = err;
@@ -151,29 +328,32 @@ export default function App() {
       }
     }
 
+    const displayOrigin =
+      apiBaseUrl || (typeof window !== 'undefined' ? window.location.origin : '');
     setStartupError(
       lastErr?.message ||
-        'Unable to reach FastAPI backend at http://localhost:8000/api/models/status'
+        `Unable to reach FastAPI backend at ${displayOrigin}/api/models/status`
     );
     setIsWorkspaceUnlocked(false);
     setStartupChecking(false);
-  }, []);
+  }, [apiBaseUrl, setModelsStatus, hydrateBackendContext]);
 
   useEffect(() => {
     checkModelsStatus();
-    const handleUnload = () => {
-      if (window.__COMIC_BACKEND_CHILD__ && typeof window.__COMIC_BACKEND_CHILD__.kill === 'function') {
-        window.__COMIC_BACKEND_CHILD__.kill().catch(() => {});
-      }
-    };
-    window.addEventListener('beforeunload', handleUnload);
-    return () => window.removeEventListener('beforeunload', handleUnload);
   }, [checkModelsStatus]);
+
+  // Periodic LM Studio status polling
+  useEffect(() => {
+    fetchLlmAndHealthStatus();
+    const intervalId = setInterval(fetchLlmAndHealthStatus, 10000);
+    return () => clearInterval(intervalId);
+  }, [fetchLlmAndHealthStatus]);
 
   const handleModelsReady = (updatedStatus) => {
     setModelsStatus(updatedStatus);
     setIsWorkspaceUnlocked(true);
     setIsDownloadModalOpen(false);
+    hydrateBackendContext();
   };
 
   // Active page lookup
@@ -182,21 +362,22 @@ export default function App() {
     [pages, activePageId]
   );
 
-  // Batch queue statistics
-  const batchStats = useMemo(() => {
-    const total = pages.length;
-    const completed = pages.filter((p) => p.status === 'done').length;
-    const processing = pages.filter((p) => p.status === 'processing').length;
-    const queued = pages.filter((p) => p.status === 'queued').length;
-    return { total, completed, processing, queued };
-  }, [pages]);
-
-  // Enqueue one or multiple imported image files into the batch queue
+  // Queue-only import for one or multiple image files (Pages picker, Folder picker, or drag-and-drop)
+  // Appends raw pages as `status: 'idle'` without triggering any AI processing until Run is clicked.
   const handleImportFiles = useCallback(
     (fileList) => {
-      const validFiles = Array.from(fileList || []).filter((f) =>
-        f.type ? f.type.startsWith('image/') : /\.(jpe?g|png|webp|bmp)$/i.test(f.name)
-      );
+      const validFiles = Array.from(fileList || [])
+        .filter((f) =>
+          f.type
+            ? f.type.startsWith('image/')
+            : /\.(jpe?g|png|webp|bmp)$/i.test(f.name)
+        )
+        .sort((a, b) =>
+          naturalSortCollator.compare(
+            a.webkitRelativePath || a.name,
+            b.webkitRelativePath || b.name
+          )
+        );
       if (validFiles.length === 0) return;
 
       const timestamp = Date.now();
@@ -206,9 +387,12 @@ export default function App() {
         file,
         originalUrl: URL.createObjectURL(file),
         cleanedImage: null,
+        inpaintedUrl: null,
+        maskUrl: null,
+        maskId: null,
         dimensions: null,
         blocks: [],
-        status: 'queued', // queued | processing | done | error
+        status: 'idle',
         error: null,
         sourceLang,
         targetLang,
@@ -216,35 +400,136 @@ export default function App() {
         tilesInpainted: 0,
       }));
 
-      setPages((prev) => [...prev, ...newPages]);
-      setActivePageId((prevActive) => prevActive || newPages[0].id);
-      setSelectedBlockId(null);
+      addPages(newPages, { activateFirst: true, recordHistory: true });
       setStatusBanner(null);
     },
-    [sourceLang, targetLang]
+    [sourceLang, targetLang, addPages]
   );
 
-  // Process a single page via POST http://localhost:8000/api/process-page
+  // Import a .cbz or .zip comic archive via POST /api/import/archive (queue-only, no auto-run)
+  const handleImportArchive = useCallback(
+    async (archiveFile) => {
+      if (!archiveFile) return;
+      setStatusBanner(null);
+      try {
+        const formData = new FormData();
+        formData.append('archive', archiveFile, archiveFile.name);
+        const response = await fetch(`${apiBaseUrl}/api/import/archive`, {
+          method: 'POST',
+          body: formData,
+        });
+        if (!response.ok) {
+          let detail = `HTTP ${response.status}`;
+          try {
+            const errJson = await response.json();
+            if (errJson?.detail) detail = errJson.detail;
+          } catch {
+            // ignore
+          }
+          throw new Error(detail);
+        }
+        const data = await response.json();
+        const extracted = data.pages || [];
+        if (extracted.length === 0) {
+          throw new Error('Archive contained no supported comic page images.');
+        }
+
+        const timestamp = Date.now();
+        const importedPages = extracted.map((p, idx) => ({
+          id: `page_arc_${timestamp}_${idx}_${Math.random().toString(36).slice(2, 6)}`,
+          name: p.filename || `page_${String(idx + 1).padStart(3, '0')}.png`,
+          file: null,
+          originalUrl: resolveBackendUrl(p.image_url, apiBaseUrl),
+          cleanedImage: null,
+          inpaintedUrl: null,
+          maskUrl: null,
+          maskId: null,
+          dimensions: p.dimensions || null,
+          blocks: [],
+          status: 'idle',
+          error: null,
+          sourceLang,
+          targetLang,
+          model: null,
+          tilesInpainted: 0,
+        }));
+
+        addPages(importedPages, { activateFirst: true, recordHistory: true });
+        setStatusBanner({
+          type: 'success',
+          message: `Imported ${importedPages.length} pages from ${data.archive_name || archiveFile.name}. Press Run to process.`,
+        });
+      } catch (err) {
+        setStatusBanner({
+          type: 'error',
+          message: `Archive import failed: ${err?.message || 'Unknown error'}`,
+        });
+      }
+    },
+    [apiBaseUrl, sourceLang, targetLang, addPages]
+  );
+
+  // Unified queue-only handler for drag-and-drop of images, folders, or .cbz/.zip archives
+  const handleImportDroppedFiles = useCallback(
+    async (fileList) => {
+      const files = Array.from(fileList || []);
+      if (files.length === 0) return;
+
+      const archiveFiles = files.filter((f) => /\.(cbz|zip)$/i.test(f.name || ''));
+      const imageFiles = files.filter(
+        (f) =>
+          !/\.(cbz|zip)$/i.test(f.name || '') &&
+          (f.type
+            ? f.type.startsWith('image/')
+            : /\.(jpe?g|png|webp|bmp)$/i.test(f.name || ''))
+      );
+
+      if (imageFiles.length > 0) {
+        handleImportFiles(imageFiles);
+      }
+      for (const archive of archiveFiles) {
+        await handleImportArchive(archive);
+      }
+    },
+    [handleImportFiles, handleImportArchive]
+  );
+
+  const handleWorkspaceDrop = useCallback(
+    async (e) => {
+      e.preventDefault();
+      if (!isWorkspaceUnlocked) return;
+      const files = await extractDataTransferFiles(e.dataTransfer);
+      if (files.length > 0) {
+        handleImportDroppedFiles(files);
+      }
+    },
+    [isWorkspaceUnlocked, handleImportDroppedFiles]
+  );
+
+  // Process a full page in one call via POST /api/process-page
   const processSinglePage = useCallback(
     async (pageItem, overrideSourceLang, overrideTargetLang) => {
       const src = overrideSourceLang || pageItem.sourceLang || sourceLang;
       const tgt = overrideTargetLang || pageItem.targetLang || targetLang;
 
-      setPages((prev) =>
-        prev.map((p) =>
-          p.id === pageItem.id
-            ? { ...p, status: 'processing', error: null, sourceLang: src, targetLang: tgt }
-            : p
-        )
-      );
+      setPageStatus(pageItem.id, 'processing', {
+        error: null,
+        sourceLang: src,
+        targetLang: tgt,
+      });
 
       try {
+        const imageFile = await resolvePageImageFile(pageItem);
+        if (!imageFile) {
+          throw new Error(`No source image available for ${pageItem.name}`);
+        }
+
         const formData = new FormData();
-        formData.append('image', pageItem.file, pageItem.name);
+        formData.append('image', imageFile, pageItem.name || 'page.png');
         formData.append('source_lang', src);
         formData.append('target_lang', tgt);
 
-        const response = await fetch(`${API_BASE_URL}/api/process-page`, {
+        const response = await fetch(`${apiBaseUrl}/api/process-page`, {
           method: 'POST',
           body: formData,
         });
@@ -262,272 +547,476 @@ export default function App() {
 
         const data = await response.json();
         const normalizedBlocks = normalizeBlocks(data.blocks || data.bubbles || []);
+        const rawCleaned =
+          data.cleaned_image_url ||
+          data.inpainted_image_url ||
+          data.cleaned_image ||
+          data.inpainted_image;
+        const resolvedMaskUrl = resolveBackendUrl(
+          data.mask_url || data.mask,
+          apiBaseUrl
+        );
 
-        setPages((prev) =>
-          prev.map((p) =>
-            p.id === pageItem.id
-              ? {
-                  ...p,
-                  status: 'done',
-                  error: null,
-                  cleanedImage: data.cleaned_image || data.inpainted_image,
-                  dimensions: data.dimensions || null,
-                  blocks: normalizedBlocks,
-                  sourceLang: data.source_lang || src,
-                  targetLang: data.target_lang || tgt,
-                  model: data.model || null,
-                  tilesInpainted: data.tiles_inpainted ?? 0,
-                }
-              : p
-          )
+        const resolvedCleaned = resolveBackendUrl(rawCleaned, apiBaseUrl);
+
+        updatePage(
+          pageItem.id,
+          {
+            status: 'done',
+            activeStage: null,
+            error: null,
+            cleanedImage: resolvedCleaned,
+            inpaintedUrl: resolvedCleaned,
+            maskId: data.mask_id || pageItem.maskId || null,
+            maskUrl: resolvedMaskUrl || pageItem.maskUrl || null,
+            dimensions: data.dimensions || pageItem.dimensions || null,
+            blocks: normalizedBlocks,
+            sourceLang: data.source_lang || src,
+            targetLang: data.target_lang || tgt,
+            model: data.model || null,
+            tilesInpainted: data.tiles_inpainted ?? 0,
+          },
+          { recordHistory: true }
         );
       } catch (err) {
         const msg = err?.message || 'Failed to process comic page.';
-        setPages((prev) =>
-          prev.map((p) =>
-            p.id === pageItem.id ? { ...p, status: 'error', error: msg } : p
-          )
-        );
+        setPageStatus(pageItem.id, 'error', { activeStage: null, error: msg });
         setStatusBanner({
           type: 'error',
           message: `Error processing ${pageItem.name}: ${msg}`,
         });
       }
     },
-    [sourceLang, targetLang]
+    [apiBaseUrl, sourceLang, targetLang, setPageStatus, updatePage]
   );
 
-  // Sequential batch queue processor (processes one queued page at a time to protect VRAM)
-  useEffect(() => {
-    if (!isWorkspaceUnlocked) return;
-    if (isQueueWorkerRunningRef.current) return;
+  // Granular single-stage runner (`detect` | `ocr` | `inpaint` | `translate`)
+  const runSingleStageOnPage = useCallback(
+    async (pageId, stage, restrictedLayerIds = null) => {
+      const currentPage = useEditorStore
+        .getState()
+        .pages.find((p) => p.id === pageId);
+      if (!currentPage) return;
 
-    const currentlyProcessing = pages.some((p) => p.status === 'processing');
-    if (currentlyProcessing) return;
+      const cfg = useEditorStore.getState().pipelineConfig;
+      const src = cfg.sourceLang || 'ja';
+      const tgt = cfg.targetLang || 'id';
 
-    const nextQueuedPage = pages.find((p) => p.status === 'queued');
-    if (!nextQueuedPage) return;
+      setPageStatus(pageId, 'processing', { activeStage: stage, error: null });
 
-    isQueueWorkerRunningRef.current = true;
-    processSinglePage(nextQueuedPage).finally(() => {
-      isQueueWorkerRunningRef.current = false;
-    });
-  }, [pages, isWorkspaceUnlocked, processSinglePage]);
+      try {
+        if (stage === 'detect') {
+          const imageFile = await resolvePageImageFile(currentPage);
+          if (!imageFile) throw new Error('Source image missing for detection.');
 
-  // Update a specific block's properties (position, size, original_text, translated_text, font family, size, color, white outline stroke)
-  const handleUpdateBlock = useCallback(
-    (blockId, updates) => {
-      if (!activePageId) return;
-      setPages((prev) =>
-        prev.map((page) => {
-          if (page.id !== activePageId) return page;
-          return {
-            ...page,
-            blocks: (page.blocks || []).map((b) => {
-              if (b.id !== blockId) return b;
-              const nextFontFamily =
-                updates.font_family ??
-                updates.style?.font_family ??
-                b.style?.font_family ??
-                b.font_family ??
-                COMIC_FONT_FAMILIES[0].value;
-              const nextFontSize =
-                updates.font_size ??
-                updates.style?.font_size ??
-                b.font_size ??
-                18;
-              const nextColor =
-                updates.color ?? updates.style?.color ?? b.color ?? '#000000';
-              const nextAlign =
-                updates.align ?? updates.style?.align ?? b.align ?? 'center';
-              const nextStrokeColor =
-                updates.stroke_color ??
-                updates.style?.stroke_color ??
-                b.style?.stroke_color ??
-                b.stroke_color ??
-                '#ffffff';
-              const nextStrokeWidth =
-                updates.stroke_width !== undefined
-                  ? updates.stroke_width
-                  : updates.style?.stroke_width !== undefined
-                  ? updates.style.stroke_width
-                  : b.style?.stroke_width !== undefined
-                  ? b.style.stroke_width
-                  : 4;
-              const nextLineHeight =
-                updates.line_height ??
-                updates.style?.line_height ??
-                b.style?.line_height ??
-                1.18;
+          const formData = new FormData();
+          formData.append('image', imageFile, currentPage.name || 'page.png');
+          formData.append('source_lang', src);
 
-              return {
-                ...b,
-                ...updates,
-                font_family: nextFontFamily,
-                font_size: nextFontSize,
-                color: nextColor,
-                stroke_color: nextStrokeColor,
-                stroke_width: nextStrokeWidth,
-                align: nextAlign,
-                line_height: nextLineHeight,
-                style: {
-                  ...(b.style || {}),
-                  ...(updates.style || {}),
-                  font_family: nextFontFamily,
-                  font_size: nextFontSize,
-                  color: nextColor,
-                  stroke_color: nextStrokeColor,
-                  stroke_width: nextStrokeWidth,
-                  align: nextAlign,
-                  line_height: nextLineHeight,
-                },
-              };
+          const resp = await fetch(`${apiBaseUrl}/api/stage/detect`, {
+            method: 'POST',
+            body: formData,
+          });
+          if (!resp.ok) {
+            const errJson = await resp.json().catch(() => ({}));
+            throw new Error(errJson?.detail || `HTTP ${resp.status}`);
+          }
+          const data = await resp.json();
+          const detectedBlocks = normalizeBlocks(data.blocks || data.bubbles || []);
+          updatePage(
+            pageId,
+            {
+              status: 'done',
+              activeStage: null,
+              error: null,
+              dimensions: data.dimensions || currentPage.dimensions || null,
+              maskId: data.mask_id || null,
+              maskUrl: resolveBackendUrl(data.mask_url || data.mask, apiBaseUrl),
+              blocks: detectedBlocks,
+              sourceLang: data.source_lang || src,
+            },
+            { recordHistory: true }
+          );
+          return;
+        }
+
+        const targetBlocks =
+          restrictedLayerIds && restrictedLayerIds.length > 0
+            ? (currentPage.blocks || []).filter((b) =>
+                restrictedLayerIds.includes(b.id)
+              )
+            : currentPage.blocks || [];
+
+        if (stage === 'ocr') {
+          if (targetBlocks.length === 0) {
+            throw new Error('No bounding boxes available for OCR. Run Detection first.');
+          }
+          const imageFile = await resolvePageImageFile(currentPage);
+          if (!imageFile) throw new Error('Source image missing for OCR.');
+
+          const liveOcrBlocks = targetBlocks.map((b) => {
+            const hasLiveGeom =
+              typeof b.x === 'number' &&
+              typeof b.y === 'number' &&
+              typeof b.width === 'number' &&
+              typeof b.height === 'number';
+            const liveBbox = hasLiveGeom
+              ? [
+                  Math.max(0, Math.round(b.x)),
+                  Math.max(0, Math.round(b.y)),
+                  Math.max(1, Math.round(b.x + b.width)),
+                  Math.max(1, Math.round(b.y + b.height)),
+                ]
+              : b.bbox;
+            return { ...b, bbox: liveBbox };
+          });
+
+          const formData = new FormData();
+          formData.append('image', imageFile, currentPage.name || 'page.png');
+          formData.append('source_lang', src);
+          formData.append('bboxes', JSON.stringify(liveOcrBlocks));
+
+          const resp = await fetch(`${apiBaseUrl}/api/stage/ocr`, {
+            method: 'POST',
+            body: formData,
+          });
+          if (!resp.ok) {
+            const errJson = await resp.json().catch(() => ({}));
+            throw new Error(errJson?.detail || `HTTP ${resp.status}`);
+          }
+          const data = await resp.json();
+          const ocrById = Object.fromEntries(
+            (data.blocks || data.bubbles || []).map((b) => [b.id, b])
+          );
+          updatePage(
+            pageId,
+            (existing) => ({
+              status: 'done',
+              activeStage: null,
+              error: null,
+              sourceLang: src,
+              blocks: (existing.blocks || []).map((b) => {
+                const hit = ocrById[b.id];
+                if (!hit) return b;
+                const text = hit.original_text ?? hit.source_text ?? b.original_text;
+                return { ...b, original_text: text, source_text: text };
+              }),
             }),
+            { recordHistory: true }
+          );
+          return;
+        }
+
+        if (stage === 'inpaint') {
+          const imageFile = await resolvePageImageFile(currentPage);
+          if (!imageFile) throw new Error('Source image missing for inpainting.');
+
+          const formData = new FormData();
+          formData.append('image', imageFile, currentPage.name || 'page.png');
+          if (currentPage.maskId) {
+            formData.append('mask_id', currentPage.maskId);
+          } else if (currentPage.maskUrl) {
+            formData.append('mask_url', currentPage.maskUrl);
+          }
+          if (targetBlocks.length > 0) {
+            formData.append(
+              'bboxes',
+              JSON.stringify(targetBlocks.map((b) => b.bbox))
+            );
+          } else if (!currentPage.maskId && !currentPage.maskUrl) {
+            throw new Error('No mask or bounding boxes available for inpainting.');
+          }
+
+          const resp = await fetch(`${apiBaseUrl}/api/stage/inpaint`, {
+            method: 'POST',
+            body: formData,
+          });
+          if (!resp.ok) {
+            const errJson = await resp.json().catch(() => ({}));
+            throw new Error(errJson?.detail || `HTTP ${resp.status}`);
+          }
+          const data = await resp.json();
+          const cleanedUrl =
+            data.cleaned_image_url ||
+            data.inpainted_image_url ||
+            data.cleaned_image ||
+            data.inpainted_image;
+          const resolvedCleaned = resolveBackendUrl(cleanedUrl, apiBaseUrl);
+          updatePage(
+            pageId,
+            {
+              status: 'done',
+              activeStage: null,
+              error: null,
+              cleanedImage: resolvedCleaned,
+              inpaintedUrl: resolvedCleaned,
+              dimensions: data.dimensions || currentPage.dimensions || null,
+              tilesInpainted: data.tiles_inpainted ?? currentPage.tilesInpainted,
+            },
+            { recordHistory: true }
+          );
+          return;
+        }
+
+        if (stage === 'translate') {
+          if (targetBlocks.length === 0) {
+            throw new Error('No text blocks available to translate.');
+          }
+          const payload = {
+            source_lang: src,
+            target_lang: tgt,
+            blocks: targetBlocks.map((b) => ({
+              id: b.id,
+              order: b.order,
+              bbox: b.bbox,
+              original_text: b.original_text || b.source_text || '',
+              source_text: b.source_text || b.original_text || '',
+              translated_text: b.translated_text || '',
+            })),
+            config: {
+              provider: cfg.provider || undefined,
+              model: cfg.model || undefined,
+              temperature: cfg.temperature,
+              top_p: cfg.topP ?? undefined,
+              top_k: cfg.topK ?? undefined,
+              max_tokens: cfg.maxTokens,
+              frequency_penalty: cfg.frequencyPenalty ?? undefined,
+              reasoning_effort: cfg.reasoningEffort || undefined,
+              custom_instructions: cfg.customInstructions || undefined,
+              glossary: cfg.glossary,
+              use_vision: cfg.useVision,
+              vision_max_side: cfg.visionMaxSide || undefined,
+            },
           };
-        })
-      );
+
+          const resp = await fetch(`${apiBaseUrl}/api/stage/translate`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            body: JSON.stringify(payload),
+          });
+          if (!resp.ok) {
+            const errJson = await resp.json().catch(() => ({}));
+            throw new Error(errJson?.detail || `HTTP ${resp.status}`);
+          }
+          const data = await resp.json();
+          const transMap = data.translations || {};
+          const byId = Object.fromEntries(
+            (data.blocks || data.bubbles || []).map((b) => [b.id, b])
+          );
+          updatePage(
+            pageId,
+            (existing) => ({
+              status: 'done',
+              activeStage: null,
+              error: null,
+              targetLang: data.target_lang || tgt,
+              model: data.model || existing.model,
+              blocks: (existing.blocks || []).map((b) => {
+                const updated =
+                  transMap[b.id] ?? byId[b.id]?.translated_text;
+                if (updated === undefined) return b;
+                return { ...b, translated_text: updated };
+              }),
+            }),
+            { recordHistory: true }
+          );
+        }
+      } catch (err) {
+        const msg = err?.message || `Stage ${stage} failed.`;
+        setPageStatus(pageId, 'error', { activeStage: null, error: msg });
+        setStatusBanner({
+          type: 'error',
+          message: `${stage.toUpperCase()} failed on ${currentPage.name}: ${msg}`,
+        });
+        throw err;
+      }
     },
-    [activePageId]
+    [apiBaseUrl, setPageStatus, updatePage]
   );
 
-  // Apply typography style settings to all blocks on the current active page
+  // Execute a sequence of stages across one or more target pages
+  const runStagesForPages = useCallback(
+    async (targetPageIds, stagesToRun, restrictedLayerIds = null) => {
+      if (!targetPageIds.length || !stagesToRun.length) return;
+      setIsPipelineRunning(true);
+      setStatusBanner(null);
+
+      const allFourStages =
+        stagesToRun.length === 4 &&
+        ['detect', 'ocr', 'inpaint', 'translate'].every((s) =>
+          stagesToRun.includes(s)
+        );
+
+      try {
+        for (const pageId of targetPageIds) {
+          const liveState = useEditorStore.getState();
+          const pageObj = liveState.pages.find((p) => p.id === pageId);
+          if (!pageObj) continue;
+
+          if (allFourStages && !restrictedLayerIds) {
+            await processSinglePage(
+              pageObj,
+              liveState.pipelineConfig.sourceLang,
+              liveState.pipelineConfig.targetLang
+            );
+          } else {
+            for (const stage of stagesToRun) {
+              await runSingleStageOnPage(pageId, stage, restrictedLayerIds);
+            }
+          }
+        }
+        setStatusBanner({
+          type: 'success',
+          message: `Completed ${stagesToRun.join(' → ')} on ${targetPageIds.length} page${
+            targetPageIds.length === 1 ? '' : 's'
+          }.`,
+        });
+      } catch {
+        // Error banner already reported by stage handler
+      } finally {
+        setIsPipelineRunning(false);
+      }
+    },
+    [processSinglePage, runSingleStageOnPage]
+  );
+
+  // FrontControlBar primary Run handler
+  const handleFrontControlRun = useCallback(() => {
+    const state = useEditorStore.getState();
+    const { scope, enabledStages } = state.pipelineConfig;
+    const stagesToRun = ['detect', 'ocr', 'inpaint', 'translate'].filter((k) =>
+      Boolean(enabledStages?.[k])
+    );
+    if (stagesToRun.length === 0) return;
+
+    let targetIds = [];
+    if (scope === 'project') {
+      targetIds = state.pages.map((p) => p.id);
+    } else if (scope === 'selected_pages') {
+      targetIds =
+        state.selectedPageIds.length > 0
+          ? state.selectedPageIds
+          : state.activePageId
+          ? [state.activePageId]
+          : [];
+    } else if (state.activePageId) {
+      targetIds = [state.activePageId];
+    }
+
+    runStagesForPages(targetIds, stagesToRun);
+  }, [runStagesForPages]);
+
+  const handleProcessProject = useCallback(() => {
+    const state = useEditorStore.getState();
+    const stages = ['detect', 'ocr', 'inpaint', 'translate'].filter((k) =>
+      Boolean(state.pipelineConfig.enabledStages?.[k])
+    );
+    runStagesForPages(
+      state.pages.map((p) => p.id),
+      stages.length > 0 ? stages : ['detect', 'ocr', 'inpaint', 'translate']
+    );
+  }, [runStagesForPages]);
+
+  const handleProcessSelectedPages = useCallback(() => {
+    const state = useEditorStore.getState();
+    const targetIds =
+      state.selectedPageIds.length > 0
+        ? state.selectedPageIds
+        : state.activePageId
+        ? [state.activePageId]
+        : [];
+    const stages = ['detect', 'ocr', 'inpaint', 'translate'].filter((k) =>
+      Boolean(state.pipelineConfig.enabledStages?.[k])
+    );
+    runStagesForPages(
+      targetIds,
+      stages.length > 0 ? stages : ['detect', 'ocr', 'inpaint', 'translate']
+    );
+  }, [runStagesForPages]);
+
+  const handleProcessSelectedLayers = useCallback(() => {
+    const state = useEditorStore.getState();
+    if (!state.activePageId) return;
+    const layerIds =
+      state.selectedLayerIds.length > 0
+        ? state.selectedLayerIds
+        : state.selectedBlockId
+        ? [state.selectedBlockId]
+        : [];
+    if (layerIds.length === 0) return;
+    const stages = ['ocr', 'inpaint', 'translate'].filter((k) =>
+      Boolean(state.pipelineConfig.enabledStages?.[k])
+    );
+    runStagesForPages(
+      [state.activePageId],
+      stages.length > 0 ? stages : ['ocr', 'inpaint', 'translate'],
+      layerIds
+    );
+  }, [runStagesForPages]);
+
+  const handleRunSingleStage = useCallback(
+    (stage) => {
+      if (!activePageId) return;
+      runStagesForPages([activePageId], [stage]);
+    },
+    [activePageId, runStagesForPages]
+  );
+
+  // Quick per-layer Re-OCR (/api/stage/ocr) & Re-Translate (/api/stage/translate) actions for TextSidebar
+  const handleRunLayerAction = useCallback(
+    async (blockId, stage) => {
+      if (!activePageId || !blockId) return;
+      setBusyLayerAction({ blockId, stage });
+      setStatusBanner(null);
+      try {
+        await runSingleStageOnPage(activePageId, stage, [blockId]);
+        setStatusBanner({
+          type: 'success',
+          message:
+            stage === 'ocr'
+              ? `Re-OCR completed for layer ${blockId}.`
+              : `Re-translated layer ${blockId} successfully.`,
+        });
+      } catch {
+        // Error banner already reported by runSingleStageOnPage
+      } finally {
+        setBusyLayerAction(null);
+      }
+    },
+    [activePageId, runSingleStageOnPage]
+  );
+
+  const handleReOcrLayer = useCallback(
+    (blockId) => handleRunLayerAction(blockId, 'ocr'),
+    [handleRunLayerAction]
+  );
+
+  const handleReTranslateLayer = useCallback(
+    (blockId) => handleRunLayerAction(blockId, 'translate'),
+    [handleRunLayerAction]
+  );
+
+  // Apply typography style settings to all blocks on the active page
   const handleApplyStyleToAll = useCallback(
     (styleUpdates) => {
       if (!activePageId) return;
-      setPages((prev) =>
-        prev.map((page) => {
-          if (page.id !== activePageId) return page;
-          return {
-            ...page,
-            blocks: (page.blocks || []).map((b) => ({
-              ...b,
-              font_family: styleUpdates.font_family ?? b.font_family,
-              font_size: styleUpdates.font_size ?? b.font_size,
-              color: styleUpdates.color ?? b.color,
-              stroke_color: styleUpdates.stroke_color ?? b.stroke_color,
-              stroke_width: styleUpdates.stroke_width ?? b.stroke_width,
-              align: styleUpdates.align ?? b.align,
-              line_height: styleUpdates.line_height ?? b.line_height,
-              style: {
-                ...(b.style || {}),
-                ...styleUpdates,
-              },
-            })),
-          };
-        })
-      );
+      applyStyleToAll(styleUpdates);
       setStatusBanner({
         type: 'success',
-        message: 'Applied typography and outline stroke settings to all bubbles on this page.',
+        message: 'Applied typography and stroke settings to all layers on this page.',
       });
     },
-    [activePageId]
+    [activePageId, applyStyleToAll]
   );
-
-  // Re-translate current page dialogue bubbles via POST http://localhost:8000/api/retranslate
-  const handleRetranslate = useCallback(async () => {
-    if (!activePage) return;
-
-    // If the page hasn't completed initial CV/OCR or had an error, run full processSinglePage
-    if (!activePage.cleanedImage || !activePage.blocks || activePage.blocks.length === 0) {
-      await processSinglePage(activePage, sourceLang, targetLang);
-      return;
-    }
-
-    // If user switched source language (e.g. ja -> ko), re-run full OCR & detection pipeline
-    if (activePage.sourceLang && activePage.sourceLang !== sourceLang) {
-      await processSinglePage(activePage, sourceLang, targetLang);
-      return;
-    }
-
-    setIsRetranslating(true);
-    setStatusBanner(null);
-
-    try {
-      const payload = {
-        source_lang: sourceLang,
-        target_lang: targetLang,
-        blocks: activePage.blocks.map((b) => ({
-          id: b.id,
-          order: b.order,
-          bbox: b.bbox,
-          polygon: b.polygon,
-          original_text: b.original_text || b.source_text || '',
-          source_text: b.source_text || b.original_text || '',
-          translated_text: b.translated_text || '',
-          font_size: b.font_size,
-          color: b.color || '#000000',
-          align: b.align || 'center',
-        })),
-      };
-
-      const response = await fetch(`${API_BASE_URL}/api/retranslate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify(payload),
-      });
-
-      if (!response.ok) {
-        let errDetail = `HTTP ${response.status}`;
-        try {
-          const errJson = await response.json();
-          if (errJson?.detail) errDetail = errJson.detail;
-        } catch {
-          // ignore
-        }
-        throw new Error(errDetail);
-      }
-
-      const data = await response.json();
-      const translationsMap = data.translations || {};
-      const returnedBlocks = data.blocks || data.bubbles || [];
-      const returnedById = Object.fromEntries(returnedBlocks.map((rb) => [rb.id, rb]));
-
-      // Merge updated translations while preserving user's dragged/resized box geometry & typography
-      setPages((prev) =>
-        prev.map((p) => {
-          if (p.id !== activePage.id) return p;
-          return {
-            ...p,
-            targetLang: data.target_lang || targetLang,
-            model: data.model || p.model,
-            blocks: p.blocks.map((existingBlock) => {
-              const updated = returnedById[existingBlock.id];
-              const newText =
-                translationsMap[existingBlock.id] ??
-                updated?.translated_text ??
-                existingBlock.translated_text;
-
-              return {
-                ...existingBlock,
-                translated_text: newText,
-              };
-            }),
-          };
-        })
-      );
-
-      setStatusBanner({
-        type: 'success',
-        message: `Re-translated ${activePage.blocks.length} bubbles (${sourceLang.toUpperCase()} → ${targetLang.toUpperCase()}) via LM Studio.`,
-      });
-    } catch (err) {
-      setStatusBanner({
-        type: 'error',
-        message: `Re-translation failed: ${err?.message || 'Unknown error'}`,
-      });
-    } finally {
-      setIsRetranslating(false);
-    }
-  }, [activePage, sourceLang, targetLang, processSinglePage]);
 
   // Export current Konva canvas as a full-resolution .png or .jpg image
   const handleExportImage = useCallback(
-    (format = 'png') => {
+    async (format = 'png') => {
       if (!canvasRef.current || !activePage) return;
+      await ensurePageFontsLoaded(activePage, null, apiBaseUrl);
       const normalizedFmt =
         String(format).toLowerCase() === 'jpg' ||
         String(format).toLowerCase() === 'jpeg'
@@ -547,87 +1036,158 @@ export default function App() {
 
       setStatusBanner({
         type: 'success',
-        message: `Exported full-resolution ${filename} (${activePage.dimensions?.width || ''}×${activePage.dimensions?.height || ''}px).`,
+        message: `Exported ${filename} (${activePage.dimensions?.width || ''}×${activePage.dimensions?.height || ''}px).`,
       });
     },
-    [activePage, targetLang]
+    [activePage, apiBaseUrl, targetLang]
   );
 
-  // Add a custom manual text box onto the current page
-  const handleAddTextBlock = useCallback(() => {
-    if (!activePage) return;
-    const nextIdx = (activePage.blocks?.length || 0) + 1;
-    const newId = `block_custom_${Date.now().toString().slice(-4)}`;
-    const centerW = Math.round((activePage.dimensions?.width || 800) / 2 - 80);
-    const centerH = Math.round((activePage.dimensions?.height || 1200) / 2 - 40);
+  // Export multi-page project as 1:1 native-resolution .cbz or .pdf via FastAPI exporter endpoints
+  const handleExportMultiPage = useCallback(
+    async (format) => {
+      if (pages.length === 0) return;
+      setStatusBanner(null);
+      try {
+        const exportStem = `mangaflow_${targetLang}`;
+        let result = null;
 
-    const newBlock = {
-      id: newId,
-      order: nextIdx,
-      bbox: [centerW, centerH, centerW + 160, centerH + 80],
-      x: centerW,
-      y: centerH,
-      width: 160,
-      height: 80,
-      rotation: 0,
-      original_text: '',
-      source_text: '',
-      translated_text: 'New Text',
-      font_family: COMIC_FONT_FAMILIES[0].value,
-      font_size: 20,
-      color: '#000000',
-      stroke_color: '#ffffff',
-      stroke_width: 4,
-      align: 'center',
-      line_height: 1.18,
-      style: {
-        font_family: COMIC_FONT_FAMILIES[0].value,
-        font_size: 20,
-        color: '#000000',
-        stroke_color: '#ffffff',
-        stroke_width: 4,
-        align: 'center',
-        line_height: 1.18,
-      },
-    };
+        if (canvasRef.current?.exportArchive) {
+          result = await canvasRef.current.exportArchive(pages, format, {
+            filename: exportStem,
+            imageFormat: 'png',
+            quality: 0.98,
+          });
+        } else {
+          const formData = new FormData();
+          formData.append('filename', exportStem);
+          for (let idx = 0; idx < pages.length; idx += 1) {
+            const p = pages[idx];
+            let blob = null;
+            if (canvasRef.current?.exportPageBlob) {
+              blob = await canvasRef.current.exportPageBlob(p, 'png', 0.98);
+            }
+            if (!blob) {
+              const imgSrc = p.cleanedImage || p.originalUrl;
+              if (imgSrc) {
+                blob = await (await fetch(imgSrc)).blob();
+              } else if (p.file) {
+                blob = p.file;
+              }
+            }
+            if (blob) {
+              const pageFilename = `${String(idx + 1).padStart(3, '0')}_${p.name.replace(
+                /\.[^/.]+$/,
+                ''
+              )}.png`;
+              formData.append('images', blob, pageFilename);
+            }
+          }
+          const resp = await fetch(`${apiBaseUrl}/api/export/${format}`, {
+            method: 'POST',
+            body: formData,
+          });
+          if (!resp.ok) {
+            const errJson = await resp.json().catch(() => ({}));
+            throw new Error(errJson?.detail || `HTTP ${resp.status}`);
+          }
+          result = {
+            blob: await resp.blob(),
+            filename: `${exportStem}.${format}`,
+            pageCount: pages.length,
+          };
+        }
 
-    setPages((prev) =>
-      prev.map((p) =>
-        p.id === activePage.id ? { ...p, blocks: [...(p.blocks || []), newBlock] } : p
-      )
-    );
-    setSelectedBlockId(newId);
-  }, [activePage]);
-
-  // Delete a text block from the current page
-  const handleDeleteBlock = useCallback(
-    (blockId) => {
-      if (!activePage) return;
-      setPages((prev) =>
-        prev.map((p) =>
-          p.id === activePage.id
-            ? { ...p, blocks: (p.blocks || []).filter((b) => b.id !== blockId) }
-            : p
-        )
-      );
-      if (selectedBlockId === blockId) {
-        setSelectedBlockId(null);
+        triggerBlobDownload(result.blob, result.filename);
+        setStatusBanner({
+          type: 'success',
+          message: `Exported ${result.pageCount} page${
+            result.pageCount === 1 ? '' : 's'
+          } at 1:1 native resolution to ${result.filename}.`,
+        });
+      } catch (err) {
+        setStatusBanner({
+          type: 'error',
+          message: `Export .${format} failed: ${err?.message || 'Unknown error'}`,
+        });
       }
     },
-    [activePage, selectedBlockId]
+    [pages, apiBaseUrl, targetLang]
   );
 
-  // Remove a page from the batch queue
-  const handleRemovePage = (pageId) => {
-    setPages((prev) => {
-      const remaining = prev.filter((p) => p.id !== pageId);
-      if (activePageId === pageId) {
-        setActivePageId(remaining[0]?.id || null);
-        setSelectedBlockId(null);
-      }
-      return remaining;
+  // Save Project (.mflow.json)
+  const handleSaveProject = useCallback(() => {
+    if (pages.length === 0) return;
+    const { apiKey: _redactedKey, ...safePipelineConfig } = pipelineConfig;
+    const projectPayload = {
+      format: 'mangaflow-project',
+      version: 2,
+      savedAt: new Date().toISOString(),
+      activePageId,
+      viewLayers,
+      pipelineConfig: safePipelineConfig,
+      pages: pages.map((p) => ({
+        id: p.id,
+        name: p.name,
+        originalUrl:
+          p.originalUrl && !p.originalUrl.startsWith('blob:')
+            ? p.originalUrl
+            : null,
+        cleanedImage: p.cleanedImage || p.inpaintedUrl || null,
+        inpaintedUrl: p.inpaintedUrl || p.cleanedImage || null,
+        maskUrl: p.maskUrl || null,
+        maskId: p.maskId || null,
+        dimensions: p.dimensions || null,
+        blocks: p.blocks || [],
+        status:
+          p.status === 'processing' || p.status === 'queued'
+            ? 'idle'
+            : p.status,
+        sourceLang: p.sourceLang,
+        targetLang: p.targetLang,
+        model: p.model,
+        tilesInpainted: p.tilesInpainted ?? 0,
+      })),
+    };
+
+    const blob = new Blob([JSON.stringify(projectPayload, null, 2)], {
+      type: 'application/json',
     });
-  };
+    triggerBlobDownload(blob, `mangaflow-project.mflow.json`);
+    setStatusBanner({
+      type: 'success',
+      message: `Saved project (${pages.length} page${pages.length === 1 ? '' : 's'}) to mangaflow-project.mflow.json.`,
+    });
+  }, [pages, activePageId, viewLayers, pipelineConfig]);
+
+  // Open Project (.mflow.json)
+  const handleOpenProject = useCallback(
+    async (file) => {
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        if (!parsed || !Array.isArray(parsed.pages)) {
+          throw new Error('Invalid .mflow.json project file.');
+        }
+        replaceProjectState({
+          pages: parsed.pages,
+          activePageId: parsed.activePageId || null,
+          pipelineConfig: parsed.pipelineConfig || null,
+          viewLayers: parsed.viewLayers || null,
+        });
+        setStatusBanner({
+          type: 'success',
+          message: `Opened project ${file.name} (${parsed.pages.length} pages).`,
+        });
+      } catch (err) {
+        setStatusBanner({
+          type: 'error',
+          message: `Failed to open project: ${err?.message || 'Invalid JSON'}`,
+        });
+      }
+    },
+    [replaceProjectState]
+  );
 
   // Load a bundled sample image (e.g. samples/sample_ja.jpg) and enqueue it
   const handleLoadSample = useCallback(
@@ -639,7 +1199,9 @@ export default function App() {
           throw new Error(`Failed to load /samples/${filename}`);
         }
         const blob = await resp.blob();
-        const file = new File([blob], filename, { type: blob.type || 'image/jpeg' });
+        const file = new File([blob], filename, {
+          type: blob.type || 'image/jpeg',
+        });
 
         const timestamp = Date.now();
         const newPage = {
@@ -648,9 +1210,12 @@ export default function App() {
           file,
           originalUrl: URL.createObjectURL(file),
           cleanedImage: null,
+          inpaintedUrl: null,
+          maskUrl: null,
+          maskId: null,
           dimensions: null,
           blocks: [],
-          status: 'queued',
+          status: 'idle',
           error: null,
           sourceLang: sampleLang,
           targetLang,
@@ -658,9 +1223,7 @@ export default function App() {
           tilesInpainted: 0,
         };
 
-        setPages((prev) => [...prev, newPage]);
-        setActivePageId(newPage.id);
-        setSelectedBlockId(null);
+        addPages([newPage], { activateFirst: true, recordHistory: true });
         setStatusBanner(null);
       } catch (err) {
         setStatusBanner({
@@ -669,226 +1232,284 @@ export default function App() {
         });
       }
     },
-    [targetLang]
+    [targetLang, setSourceLang, addPages]
   );
 
-  const isCurrentPageProcessing = activePage?.status === 'processing';
+  const handleFitScreen = useCallback(() => {
+    if (canvasRef.current?.fitToScreen) {
+      canvasRef.current.fitToScreen();
+    }
+  }, []);
+
+  const handleOpenSettings = useCallback(() => {
+    openModal('settings');
+  }, [openModal]);
+
+  const handlePageClick = (e, pageId) => {
+    if (e.shiftKey) {
+      selectPageRange(pageId);
+    } else if (e.ctrlKey || e.metaKey) {
+      toggleSelectPage(pageId);
+    } else {
+      setActivePage(pageId);
+    }
+  };
+
+  const isAnyProcessing =
+    isPipelineRunning || pages.some((p) => p.status === 'processing');
 
   return (
-    <div className="min-h-screen h-screen w-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden select-none">
-      {/* Top Toolbar */}
-      <Toolbar
-        apiBaseUrl={API_BASE_URL}
-        sourceLang={sourceLang}
-        onSourceLangChange={setSourceLang}
-        targetLang={targetLang}
-        onTargetLangChange={setTargetLang}
+    <div className="min-h-screen h-screen w-screen flex flex-col bg-studio-canvas text-studio-text overflow-hidden select-none">
+      {/* Bar 1: Compact 28px Native Application Menu Bar */}
+      <MenuBar
         onImportFiles={handleImportFiles}
-        onRetranslate={handleRetranslate}
+        onImportArchive={handleImportArchive}
         onExportImage={handleExportImage}
+        onExportCbz={() => handleExportMultiPage('cbz')}
+        onExportPdf={() => handleExportMultiPage('pdf')}
+        onSaveProject={handleSaveProject}
+        onOpenProject={handleOpenProject}
+        onProcessProject={handleProcessProject}
+        onProcessSelectedPages={handleProcessSelectedPages}
+        onProcessSelectedLayers={handleProcessSelectedLayers}
+        onRunStage={handleRunSingleStage}
+        onFitScreen={handleFitScreen}
         onOpenModelsModal={() => setIsDownloadModalOpen(true)}
-        isProcessing={isCurrentPageProcessing}
-        isRetranslating={isRetranslating}
-        canRetranslate={Boolean(activePage)}
-        canExport={Boolean(activePage && (activePage.cleanedImage || activePage.originalUrl))}
+        isProcessing={isAnyProcessing}
         isWorkspaceUnlocked={isWorkspaceUnlocked}
-        modelsStatus={modelsStatus}
-        batchStats={batchStats}
       />
 
-      {/* Status Notification Bar */}
+      {/* Bar 2: Compact 36px Pipeline Front Control Bar */}
+      <FrontControlBar
+        onRun={handleFrontControlRun}
+        onOpenSettings={handleOpenSettings}
+        isProcessing={isAnyProcessing}
+        isWorkspaceUnlocked={isWorkspaceUnlocked}
+      />
+
+      {/* Compact Notification Strip */}
       {statusBanner && (
         <div
-          className={`px-4 py-1.5 text-xs flex items-center justify-between border-b ${
+          className={`px-3 py-1 text-[11px] flex items-center justify-between border-b border-studio-border ${
             statusBanner.type === 'error'
-              ? 'bg-rose-950/70 border-rose-500/40 text-rose-200'
-              : 'bg-emerald-950/60 border-emerald-500/30 text-emerald-200'
+              ? 'bg-studio-danger/10 text-studio-danger'
+              : 'bg-studio-success/10 text-studio-success'
           }`}
         >
           <div className="flex items-center gap-2 truncate">
             {statusBanner.type === 'error' ? (
-              <AlertCircle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
+              <AlertCircle className="h-3.5 w-3.5 shrink-0" />
             ) : (
-              <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+              <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
             )}
-            <span className="truncate">{statusBanner.message}</span>
+            <span className="truncate font-medium">{statusBanner.message}</span>
           </div>
           <button
             type="button"
             onClick={() => setStatusBanner(null)}
-            className="ml-4 text-[11px] text-slate-400 hover:text-slate-200"
+            className="ml-4 text-[11px] text-studio-text-secondary hover:text-studio-text cursor-pointer"
           >
             Dismiss
           </button>
         </div>
       )}
 
-      {/* Main Editor Workspace */}
-      <main className="relative flex-1 flex overflow-hidden">
-        {/* Left Sidebar: Multi-Page Batch Queue */}
-        <aside className="w-60 shrink-0 border-r border-slate-800/80 bg-slate-900/60 flex flex-col overflow-hidden">
-          <div className="p-3.5 border-b border-slate-800/80 flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Layers className="h-4 w-4 text-indigo-400" />
-              <span className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-                Page Queue
-              </span>
-            </div>
-            <span className="rounded-md bg-slate-800 px-2 py-0.5 font-mono text-[11px] text-slate-300">
-              {pages.length}
-            </span>
-          </div>
-
-          <div className="flex-1 overflow-y-auto p-2.5 space-y-2">
-            {pages.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-slate-800/90 p-4 text-center space-y-1.5 my-2">
-                <FileImage className="h-6 w-6 text-slate-600 mx-auto" />
-                <p className="text-xs font-medium text-slate-400">Queue Empty</p>
-                <p className="text-[11px] text-slate-500">
-                  Import single or multiple comic pages to start batch translation.
-                </p>
+      {/* Main Three-Pane Desktop Studio Workspace */}
+      <main
+        className="relative flex-1 min-h-0 flex overflow-hidden"
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={handleWorkspaceDrop}
+      >
+        {/* Left Sidebar: Multi-Page Filmstrip / Queue (collapsed in Zen Mode) */}
+        {!zenMode && (
+          <aside className="w-56 shrink-0 border-r border-studio-border bg-studio-panel flex flex-col overflow-hidden">
+            <div className="h-9 px-3 border-b border-studio-border flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-1.5">
+                <Layers className="h-3.5 w-3.5 text-studio-accent" />
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-studio-text">
+                  Pages
+                </span>
               </div>
-            ) : (
-              pages.map((p, idx) => {
-                const isActive = p.id === activePageId;
-                return (
-                  <div
-                    key={p.id}
-                    onClick={() => {
-                      setActivePageId(p.id);
-                      setSelectedBlockId(null);
-                    }}
-                    className={`group relative rounded-xl border p-2.5 transition-all cursor-pointer flex items-center gap-2.5 ${
-                      isActive
-                        ? 'border-indigo-500/70 bg-indigo-950/35 shadow-md'
-                        : 'border-slate-800/80 bg-slate-950/50 hover:border-slate-700'
-                    }`}
-                  >
-                    {/* Page Thumbnail */}
-                    <div className="h-12 w-9 shrink-0 rounded-lg bg-slate-900 border border-slate-800 overflow-hidden flex items-center justify-center">
-                      {p.cleanedImage || p.originalUrl ? (
-                        <img
-                          src={p.cleanedImage || p.originalUrl}
-                          alt={p.name}
-                          className="h-full w-full object-cover"
-                        />
-                      ) : (
-                        <FileImage className="h-4 w-4 text-slate-600" />
-                      )}
-                    </div>
+              <div className="flex items-center gap-1.5">
+                {selectedPageIds.length > 1 && (
+                  <span className="rounded-studio-sm bg-studio-accent/15 border border-studio-accent/40 px-1.5 py-0.5 font-mono text-[10px] leading-none text-studio-accent tabular-nums">
+                    {selectedPageIds.length} sel
+                  </span>
+                )}
+                <span className="rounded-studio-sm border border-studio-border bg-studio-surface px-1.5 py-0.5 font-mono text-[10px] leading-none text-studio-text-secondary tabular-nums">
+                  {pages.length}
+                </span>
+              </div>
+            </div>
 
-                    {/* Page Metadata */}
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between gap-1">
-                        <span className="text-xs font-medium text-slate-200 truncate">
-                          {idx + 1}. {p.name}
-                        </span>
-                      </div>
-
-                      <div className="mt-1 flex items-center gap-1.5 text-[11px]">
-                        {p.status === 'done' && (
-                          <span className="inline-flex items-center gap-1 text-emerald-400 font-medium">
-                            <CheckCircle2 className="h-3 w-3" />
-                            {p.blocks?.length || 0} bubbles
-                          </span>
-                        )}
-                        {p.status === 'processing' && (
-                          <span className="inline-flex items-center gap-1 text-indigo-300 font-medium">
-                            <Loader2 className="h-3 w-3 animate-spin" />
-                            Translating...
-                          </span>
-                        )}
-                        {p.status === 'queued' && (
-                          <span className="inline-flex items-center gap-1 text-amber-300 font-medium">
-                            <Clock className="h-3 w-3" />
-                            Queued
-                          </span>
-                        )}
-                        {p.status === 'error' && (
-                          <span
-                            className="inline-flex items-center gap-1 text-rose-400 font-medium truncate"
-                            title={p.error}
-                          >
-                            <AlertCircle className="h-3 w-3 shrink-0" />
-                            Failed
-                          </span>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Remove Page Button */}
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleRemovePage(p.id);
-                      }}
-                      className="opacity-0 group-hover:opacity-100 p-1 rounded-lg hover:bg-slate-800 text-slate-500 hover:text-rose-400 transition-all"
-                      title="Remove page from queue"
+            <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
+              {pages.length === 0 ? (
+                <div className="rounded-studio border border-dashed border-studio-border p-4 text-center space-y-1.5 my-1">
+                  <FileImage className="h-5 w-5 text-studio-text-muted mx-auto" />
+                  <p className="text-xs font-medium text-studio-text-secondary">
+                    No Pages Loaded
+                  </p>
+                  <p className="text-[11px] text-studio-text-muted leading-snug">
+                    Use File → Import Pages (Ctrl+O) or drop images onto the canvas.
+                  </p>
+                </div>
+              ) : (
+                pages.map((p, idx) => {
+                  const isActive = p.id === activePageId;
+                  const isSelected = selectedPageIds.includes(p.id);
+                  return (
+                    <div
+                      key={p.id}
+                      onClick={(e) => handlePageClick(e, p.id)}
+                      className={`group relative rounded-studio border p-2 transition-colors cursor-pointer flex items-center gap-2 ${
+                        isActive
+                          ? 'border-studio-accent bg-studio-accent/10'
+                          : isSelected
+                          ? 'border-studio-accent/50 bg-studio-surface'
+                          : 'border-studio-border bg-studio-surface hover:border-studio-border-strong'
+                      }`}
                     >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                );
-              })
-            )}
-          </div>
-        </aside>
+                      {isActive && (
+                        <span
+                          className="absolute left-0 top-1 bottom-1 w-0.5 bg-studio-accent"
+                          aria-hidden="true"
+                        />
+                      )}
 
-        {/* Center Interactive Konva Canvas */}
-        <MangaCanvas
-          ref={canvasRef}
-          page={activePage}
-          selectedBlockId={selectedBlockId}
-          onSelectBlock={setSelectedBlockId}
-          onUpdateBlock={handleUpdateBlock}
-          onImportDrop={handleImportFiles}
-          onLoadSample={handleLoadSample}
-          isProcessing={isCurrentPageProcessing}
-        />
+                      <div className="h-11 w-8 shrink-0 rounded-studio-sm bg-studio-canvas border border-studio-border overflow-hidden flex items-center justify-center">
+                        {p.cleanedImage || p.originalUrl ? (
+                          <img
+                            src={p.cleanedImage || p.originalUrl}
+                            alt={p.name}
+                            className="h-full w-full object-cover"
+                          />
+                        ) : (
+                          <FileImage className="h-3.5 w-3.5 text-studio-text-muted" />
+                        )}
+                      </div>
 
-        {/* Right Sidebar: Synchronized Text Blocks & Real-time Typography Customizer */}
-        <TextSidebar
-          page={activePage}
-          selectedBlockId={selectedBlockId}
-          onSelectBlock={setSelectedBlockId}
-          onUpdateBlock={handleUpdateBlock}
-          onApplyStyleToAll={handleApplyStyleToAll}
-          onAddBlock={handleAddTextBlock}
-          onDeleteBlock={handleDeleteBlock}
-        />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="text-xs font-medium text-studio-text truncate">
+                            <span className="font-mono text-[10px] text-studio-text-muted mr-1 tabular-nums">
+                              {String(idx + 1).padStart(2, '0')}
+                            </span>
+                            {p.name}
+                          </span>
+                        </div>
 
-        {/* Initial Startup Check Overlay (while querying /api/models/status or if backend is down) */}
+                        <div className="mt-1 flex items-center gap-1.5 text-[10px] font-mono">
+                          {p.status === 'done' && (
+                            <span className="inline-flex items-center gap-1 text-studio-success">
+                              <CheckCircle2 className="h-3 w-3" />
+                              {p.blocks?.length || 0} blocks
+                            </span>
+                          )}
+                          {p.status === 'processing' && (
+                            <span className="inline-flex items-center gap-1 text-studio-accent">
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                              {p.activeStage ? `${p.activeStage}…` : 'Running…'}
+                            </span>
+                          )}
+                          {(p.status === 'queued' || p.status === 'idle') && (
+                            <span className="inline-flex items-center gap-1 text-studio-text-muted">
+                              <Clock className="h-3 w-3" />
+                              {p.status === 'queued' ? 'Queued' : 'Ready'}
+                            </span>
+                          )}
+                          {p.status === 'error' && (
+                            <span
+                              className="inline-flex items-center gap-1 text-studio-danger truncate"
+                              title={p.error}
+                            >
+                              <AlertCircle className="h-3 w-3 shrink-0" />
+                              Failed
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removePage(p.id);
+                        }}
+                        className="opacity-0 group-hover:opacity-100 p-1 rounded-studio-sm hover:bg-studio-hover text-studio-text-muted hover:text-studio-danger transition-colors cursor-pointer"
+                        title="Remove page"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </aside>
+        )}
+
+        {/* Center Interactive 60fps Konva Canvas */}
+        <div className="relative flex-1 min-w-0 h-full flex overflow-hidden">
+          <MangaCanvas
+            ref={canvasRef}
+            page={activePage}
+            selectedBlockId={selectedBlockId}
+            onSelectBlock={setSelectedBlock}
+            onUpdateBlock={updateBlock}
+            onImportDrop={handleImportDroppedFiles}
+            onLoadSample={handleLoadSample}
+            isProcessing={activePage?.status === 'processing'}
+          />
+        </div>
+
+        {/* Right Sidebar: Text Layers & Typography Inspector (collapsed in Zen Mode) */}
+        {!zenMode && (
+          <TextSidebar
+            page={activePage}
+            selectedBlockId={selectedBlockId}
+            onSelectBlock={setSelectedBlock}
+            onUpdateBlock={updateBlock}
+            onApplyStyleToAll={handleApplyStyleToAll}
+            onAddBlock={() => addBlock()}
+            onDeleteBlock={deleteBlock}
+            onReOcrLayer={handleReOcrLayer}
+            onReTranslateLayer={handleReTranslateLayer}
+            busyLayerAction={busyLayerAction}
+            isProcessing={isAnyProcessing}
+          />
+        )}
+
+        {/* Startup Check / Backend Error Overlay */}
         {(startupChecking || startupError) && !isDownloadModalOpen && (
-          <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/90 backdrop-blur-md p-4">
-            <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6 text-center space-y-4 shadow-2xl">
+          <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/65 p-4">
+            <div className="w-full max-w-md rounded-studio-md border border-studio-border bg-studio-panel p-5 text-center space-y-3.5">
               {startupChecking ? (
                 <>
-                  <Loader2 className="h-9 w-9 animate-spin text-indigo-400 mx-auto" />
+                  <Loader2 className="h-7 w-7 animate-spin text-studio-accent mx-auto" />
                   <div className="space-y-1">
-                    <h3 className="text-sm font-semibold text-slate-100">
-                      Checking Local AI Models...
+                    <h3 className="text-sm font-semibold text-studio-text">
+                      Verifying Local AI Models…
                     </h3>
-                    <p className="text-xs text-slate-400 font-mono">
-                      GET {API_BASE_URL}/api/models/status
+                    <p className="text-xs text-studio-text-muted font-mono">
+                      GET {apiBaseUrl}/api/models/status
                     </p>
                   </div>
                 </>
               ) : (
                 <>
-                  <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-400">
-                    <AlertTriangle className="h-6 w-6" />
+                  <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-studio border border-studio-danger/40 bg-studio-danger/10 text-studio-danger">
+                    <AlertTriangle className="h-5 w-5" />
                   </div>
                   <div className="space-y-1">
-                    <h3 className="text-base font-semibold text-slate-100">
+                    <h3 className="text-sm font-semibold text-studio-text">
                       Backend Connection Failed
                     </h3>
-                    <p className="text-xs text-slate-400">{startupError}</p>
+                    <p className="text-xs text-studio-text-secondary">{startupError}</p>
                   </div>
                   <button
                     type="button"
                     onClick={checkModelsStatus}
-                    className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 px-4 py-2 text-xs font-semibold text-white transition-colors"
+                    className="studio-btn-accent h-8 px-3.5 text-xs"
                   >
                     <RefreshCw className="h-3.5 w-3.5" />
                     Retry Connection
@@ -900,15 +1521,33 @@ export default function App() {
         )}
       </main>
 
-      {/* Dark-mode Blocking Model Download & SSE Verification Modal */}
+      {/* Bottom 24px Native Studio Status Bar */}
+      <StatusBar
+        onResetZoom={activePage ? handleFitScreen : undefined}
+        onRefreshLlmStatus={fetchLlmAndHealthStatus}
+        isPollingLlm={isPollingLlm}
+      />
+
+      {/* Model Download & SSE Verification Modal */}
       <DownloadModal
         isOpen={isDownloadModalOpen}
         initialStatus={modelsStatus}
-        apiBaseUrl={API_BASE_URL}
+        apiBaseUrl={apiBaseUrl}
         onModelsReady={handleModelsReady}
         onClose={
           modelsStatus?.all_ready ? () => setIsDownloadModalOpen(false) : undefined
         }
+      />
+
+      {/* Koharu-style 5-Tab Studio Settings Modal */}
+      <SettingsModal
+        isOpen={activeModal === 'settings'}
+        onClose={closeModal}
+        onSaved={() => {
+          hydrateBackendContext();
+          fetchLlmAndHealthStatus();
+        }}
+        onApplyTypesettingToPage={handleApplyStyleToAll}
       />
     </div>
   );

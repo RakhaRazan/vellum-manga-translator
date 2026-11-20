@@ -1,0 +1,1164 @@
+#include "exporter.hpp"
+#include "utils.hpp"
+
+#include <miniz.h>
+
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4100 4244 4456 4996)
+#endif
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
+#include <iomanip>
+#include <memory>
+#include <sstream>
+#include <unordered_set>
+
+namespace mangaflow {
+
+namespace fs = std::filesystem;
+
+namespace {
+
+constexpr size_t kMaxArchivePages = 500;
+constexpr size_t kMaxArchiveUncompressedBytes = 1024ULL * 1024ULL * 1024ULL;  // 1 GiB
+constexpr size_t kMaxSingleImageBytes = 64ULL * 1024ULL * 1024ULL;            // 64 MiB
+
+struct StbiDeleter {
+    void operator()(unsigned char* ptr) const noexcept {
+        if (ptr) stbi_image_free(ptr);
+    }
+};
+using StbiBuffer = std::unique_ptr<unsigned char, StbiDeleter>;
+
+bool is_safe_image_id(const std::string& id) {
+    if (id.empty() || id.size() > 128) return false;
+    for (unsigned char c : id) {
+        if (!std::isalnum(c) && c != '_' && c != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_cacheable_ext(const std::string& ext_lower) {
+    return ext_lower == "png" || ext_lower == "jpg" ||
+           ext_lower == "jpeg" || ext_lower == "webp";
+}
+
+bool is_supported_archive_image_ext(const std::string& ext_lower) {
+    return ext_lower == ".png" || ext_lower == ".jpg" ||
+           ext_lower == ".jpeg" || ext_lower == ".webp" || ext_lower == ".bmp";
+}
+
+bool is_safe_archive_member(const std::string& member_name) {
+    std::string norm = member_name;
+    std::replace(norm.begin(), norm.end(), '\\', '/');
+    if (norm.empty() || norm.front() == '/' || norm.back() == '/') {
+        return false;
+    }
+
+    std::vector<std::string> parts;
+    std::istringstream iss(norm);
+    std::string seg;
+    while (std::getline(iss, seg, '/')) {
+        if (!seg.empty()) {
+            parts.push_back(seg);
+        }
+    }
+    if (parts.empty()) return false;
+
+    for (const auto& part : parts) {
+        if (part == "." || part == ".." || part == "__MACOSX" || part.front() == '.') {
+            return false;
+        }
+    }
+
+    const fs::path leaf(util::utf8_to_wide(parts.back()));
+    const std::string ext_lower = util::to_lower_ascii(util::path_to_utf8(leaf.extension()));
+    return is_supported_archive_image_ext(ext_lower);
+}
+
+enum class DetectedImageFormat {
+    Unknown,
+    Jpeg,
+    Png,
+    Webp,
+    Bmp,
+};
+
+DetectedImageFormat detect_image_magic(const std::vector<uint8_t>& data) {
+    if (data.size() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF) {
+        return DetectedImageFormat::Jpeg;
+    }
+    if (data.size() >= 8 &&
+        data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 &&
+        data[4] == 0x0D && data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A) {
+        return DetectedImageFormat::Png;
+    }
+    if (data.size() >= 12 &&
+        std::memcmp(data.data(), "RIFF", 4) == 0 &&
+        std::memcmp(data.data() + 8, "WEBP", 4) == 0) {
+        return DetectedImageFormat::Webp;
+    }
+    if (data.size() >= 2 && data[0] == 'B' && data[1] == 'M') {
+        return DetectedImageFormat::Bmp;
+    }
+    return DetectedImageFormat::Unknown;
+}
+
+uint16_t u16_le(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
+}
+
+uint32_t u24_le(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16);
+}
+
+uint32_t u32_le(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+uint16_t u16_be(const uint8_t* p) {
+    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+}
+
+// Parse VP8 / VP8L / VP8X WebP container header for exact pixel dimensions.
+bool parse_webp_dimensions(const std::vector<uint8_t>& data, int& width, int& height) {
+    if (data.size() < 30 ||
+        std::memcmp(data.data(), "RIFF", 4) != 0 ||
+        std::memcmp(data.data() + 8, "WEBP", 4) != 0) {
+        return false;
+    }
+
+    size_t pos = 12;
+    while (pos + 8 <= data.size()) {
+        const uint8_t* chunk = data.data() + pos;
+        const uint32_t chunk_size = u32_le(chunk + 4);
+        const size_t payload = pos + 8;
+        if (payload > data.size()) break;
+
+        if (std::memcmp(chunk, "VP8X", 4) == 0 && payload + 10 <= data.size()) {
+            width = static_cast<int>(u24_le(data.data() + payload + 4) + 1);
+            height = static_cast<int>(u24_le(data.data() + payload + 7) + 1);
+            return width > 0 && height > 0;
+        }
+        if (std::memcmp(chunk, "VP8 ", 4) == 0 && payload + 10 <= data.size()) {
+            if (data[payload + 3] == 0x9D && data[payload + 4] == 0x01 && data[payload + 5] == 0x2A) {
+                width = static_cast<int>(u16_le(data.data() + payload + 6) & 0x3FFF);
+                height = static_cast<int>(u16_le(data.data() + payload + 8) & 0x3FFF);
+                return width > 0 && height > 0;
+            }
+        }
+        if (std::memcmp(chunk, "VP8L", 4) == 0 && payload + 5 <= data.size() && data[payload] == 0x2F) {
+            const uint32_t bits = u32_le(data.data() + payload + 1);
+            width = static_cast<int>((bits & 0x3FFFU) + 1);
+            height = static_cast<int>(((bits >> 14) & 0x3FFFU) + 1);
+            return width > 0 && height > 0;
+        }
+
+        const size_t padded_size = static_cast<size_t>(chunk_size) + (chunk_size & 1U);
+        if (payload + padded_size < pos) break;
+        pos = payload + padded_size;
+    }
+    return false;
+}
+
+struct JpegHeaderInfo {
+    int width = 0;
+    int height = 0;
+    int components = 0;
+    int precision = 0;
+    bool is_adobe_cmyk = false;
+};
+
+// Parse JPEG SOF0/SOF1/SOF2 marker to allow lossless /DCTDecode passthrough into PDF 1.4.
+bool parse_jpeg_header(const std::vector<uint8_t>& data, JpegHeaderInfo& info) {
+    if (data.size() < 4 || data[0] != 0xFF || data[1] != 0xD8) {
+        return false;
+    }
+
+    size_t pos = 2;
+    bool found_sof = false;
+    while (pos + 2 <= data.size()) {
+        // Seek to marker 0xFF
+        while (pos < data.size() && data[pos] != 0xFF) {
+            ++pos;
+        }
+        while (pos < data.size() && data[pos] == 0xFF) {
+            ++pos;
+        }
+        if (pos >= data.size()) break;
+
+        const uint8_t marker = data[pos++];
+        if (marker == 0xD9 || marker == 0xDA) {  // EOI or SOS (scan data follows)
+            break;
+        }
+        if ((marker >= 0xD0 && marker <= 0xD7) || marker == 0x01 || marker == 0x00) {
+            continue;
+        }
+        if (pos + 2 > data.size()) break;
+        const uint16_t seg_len = u16_be(data.data() + pos);
+        if (seg_len < 2 || pos + seg_len > data.size()) {
+            break;
+        }
+
+        // Adobe APP14 marker (checks CMYK YCCK inversion flag)
+        if (marker == 0xEE && seg_len >= 14 &&
+            std::memcmp(data.data() + pos + 2, "Adobe", 5) == 0) {
+            info.is_adobe_cmyk = true;
+        }
+
+        // SOF0 (Baseline), SOF1 (Extended Sequential), SOF2 (Progressive)
+        if ((marker == 0xC0 || marker == 0xC1 || marker == 0xC2) && seg_len >= 9) {
+            info.precision = data[pos + 2];
+            info.height = static_cast<int>(u16_be(data.data() + pos + 3));
+            info.width = static_cast<int>(u16_be(data.data() + pos + 5));
+            info.components = data[pos + 7];
+            found_sof = true;
+        }
+        pos += seg_len;
+    }
+
+    return found_sof && info.width > 0 && info.height > 0 &&
+           info.precision == 8 &&
+           (info.components == 1 || info.components == 3 || info.components == 4);
+}
+
+void stbi_write_vec_callback(void* context, void* data, int size) {
+    if (!context || !data || size <= 0) return;
+    auto* vec = static_cast<std::vector<uint8_t>*>(context);
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    vec->insert(vec->end(), bytes, bytes + size);
+}
+
+// Flatten decoded 1/2/3/4-channel pixels onto opaque white (RGB or Grayscale).
+std::vector<uint8_t> flatten_pixels_to_rgb(
+    const uint8_t* pixels,
+    int width,
+    int height,
+    int channels) {
+    const size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
+    std::vector<uint8_t> rgb(pixel_count * 3);
+
+    if (channels == 3) {
+        std::memcpy(rgb.data(), pixels, pixel_count * 3);
+    } else if (channels == 4) {
+        for (size_t i = 0; i < pixel_count; ++i) {
+            const uint32_t r = pixels[i * 4 + 0];
+            const uint32_t g = pixels[i * 4 + 1];
+            const uint32_t b = pixels[i * 4 + 2];
+            const uint32_t a = pixels[i * 4 + 3];
+            const uint32_t inv_a = 255U - a;
+            rgb[i * 3 + 0] = static_cast<uint8_t>((r * a + 255U * inv_a + 127U) / 255U);
+            rgb[i * 3 + 1] = static_cast<uint8_t>((g * a + 255U * inv_a + 127U) / 255U);
+            rgb[i * 3 + 2] = static_cast<uint8_t>((b * a + 255U * inv_a + 127U) / 255U);
+        }
+    } else if (channels == 2) {
+        for (size_t i = 0; i < pixel_count; ++i) {
+            const uint32_t g = pixels[i * 2 + 0];
+            const uint32_t a = pixels[i * 2 + 1];
+            const uint8_t v = static_cast<uint8_t>((g * a + 255U * (255U - a) + 127U) / 255U);
+            rgb[i * 3 + 0] = v;
+            rgb[i * 3 + 1] = v;
+            rgb[i * 3 + 2] = v;
+        }
+    } else {
+        for (size_t i = 0; i < pixel_count; ++i) {
+            const uint8_t v = pixels[i];
+            rgb[i * 3 + 0] = v;
+            rgb[i * 3 + 1] = v;
+            rgb[i * 3 + 2] = v;
+        }
+    }
+    return rgb;
+}
+
+std::vector<uint8_t> encode_rgb_png(const uint8_t* rgb, int width, int height) {
+    std::vector<uint8_t> out;
+    out.reserve(static_cast<size_t>(width) * static_cast<size_t>(height));
+    const int ok = stbi_write_png_to_func(
+        stbi_write_vec_callback, &out, width, height, 3, rgb, width * 3);
+    if (!ok || out.empty()) {
+        throw ComicExportError("Failed to encode image as PNG.");
+    }
+    return out;
+}
+
+std::vector<uint8_t> encode_rgb_jpg(const uint8_t* rgb, int width, int height, int quality) {
+    std::vector<uint8_t> out;
+    out.reserve(static_cast<size_t>(width) * static_cast<size_t>(height) / 4);
+    const int clamped_q = std::max(50, std::min(100, quality));
+    const int ok = stbi_write_jpg_to_func(
+        stbi_write_vec_callback, &out, width, height, 3, rgb, clamped_q);
+    if (!ok || out.empty()) {
+        throw ComicExportError("Failed to encode image as JPEG.");
+    }
+    return out;
+}
+
+struct NaturalSegment {
+    struct Token {
+        bool is_number = false;
+        uint64_t num = 0;
+        std::string text;
+    };
+    std::vector<Token> tokens;
+};
+
+std::vector<NaturalSegment> build_natural_key(const std::string& path_str) {
+    std::string norm = path_str;
+    std::replace(norm.begin(), norm.end(), '\\', '/');
+    while (!norm.empty() && norm.front() == '/') norm.erase(norm.begin());
+    while (!norm.empty() && norm.back() == '/') norm.pop_back();
+
+    std::vector<NaturalSegment> segments;
+    std::istringstream iss(norm);
+    std::string seg_str;
+    while (std::getline(iss, seg_str, '/')) {
+        NaturalSegment seg;
+        const std::string lower = util::to_lower_ascii(seg_str);
+        size_t i = 0;
+        while (i < lower.size()) {
+            if (std::isdigit(static_cast<unsigned char>(lower[i]))) {
+                size_t start = i;
+                uint64_t val = 0;
+                while (i < lower.size() && std::isdigit(static_cast<unsigned char>(lower[i]))) {
+                    const uint64_t digit = static_cast<uint64_t>(lower[i] - '0');
+                    if (val <= (UINT64_MAX - digit) / 10ULL) {
+                        val = val * 10ULL + digit;
+                    }
+                    ++i;
+                }
+                seg.tokens.push_back({true, val, lower.substr(start, i - start)});
+            } else {
+                size_t start = i;
+                while (i < lower.size() && !std::isdigit(static_cast<unsigned char>(lower[i]))) {
+                    ++i;
+                }
+                seg.tokens.push_back({false, 0, lower.substr(start, i - start)});
+            }
+        }
+        segments.push_back(std::move(seg));
+    }
+    return segments;
+}
+
+std::string sanitize_page_stem(const std::optional<std::string>& filename) {
+    if (!filename.has_value() || filename->empty()) {
+        return {};
+    }
+    std::string norm = *filename;
+    std::replace(norm.begin(), norm.end(), '\\', '/');
+    const fs::path p(util::utf8_to_wide(norm));
+    const std::string raw_stem = util::path_to_utf8(p.stem());
+
+    std::string clean;
+    clean.reserve(raw_stem.size());
+    for (unsigned char c : raw_stem) {
+        if (std::isalnum(c) || c == '.' || c == '_' || c == ' ' || c == '-') {
+            clean.push_back(static_cast<char>(c));
+        } else {
+            clean.push_back('_');
+        }
+    }
+    while (!clean.empty() && (clean.front() == ' ' || clean.front() == '.' || clean.front() == '_')) {
+        clean.erase(clean.begin());
+    }
+    while (!clean.empty() && (clean.back() == ' ' || clean.back() == '.' || clean.back() == '_')) {
+        clean.pop_back();
+    }
+    if (clean.size() > 64) {
+        clean.resize(64);
+    }
+    return clean;
+}
+
+std::string format_pdf_number(double val) {
+    char buf[64]{};
+    std::snprintf(buf, sizeof(buf), "%.2f", val);
+    std::string s(buf);
+    if (s.find('.') != std::string::npos) {
+        while (!s.empty() && s.back() == '0') s.pop_back();
+        if (!s.empty() && s.back() == '.') s.pop_back();
+    }
+    return s;
+}
+
+}  // namespace
+
+// -----------------------------------------------------------------------------
+// Image Cache Management
+// -----------------------------------------------------------------------------
+
+fs::path get_image_cache_dir() {
+    fs::path dir;
+    if (auto env_cache = util::get_env_wide(L"MANGA_CACHE_DIR")) {
+        dir = fs::path(*env_cache);
+    } else {
+        std::error_code ec;
+        dir = fs::temp_directory_path(ec) / L"mangaflow_cache" / L"images";
+    }
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    fs::path canon = fs::weakly_canonical(dir, ec);
+    return ec ? dir : canon;
+}
+
+void prune_image_cache(const fs::path& cache_dir, size_t max_files) {
+    std::error_code ec;
+    std::vector<std::pair<fs::file_time_type, fs::path>> files;
+    for (const auto& entry : fs::directory_iterator(cache_dir, ec)) {
+        if (ec) break;
+        std::error_code f_ec;
+        if (!entry.is_regular_file(f_ec) || f_ec) continue;
+        std::string ext = util::to_lower_ascii(util::path_to_utf8(entry.path().extension()));
+        if (!ext.empty() && ext.front() == '.') ext.erase(ext.begin());
+        if (!is_cacheable_ext(ext)) continue;
+        const auto mtime = entry.last_write_time(f_ec);
+        if (!f_ec) {
+            files.emplace_back(mtime, entry.path());
+        }
+    }
+    if (files.size() <= max_files) {
+        return;
+    }
+    std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+    const size_t to_delete = files.size() - max_files;
+    for (size_t i = 0; i < to_delete; ++i) {
+        fs::remove(files[i].second, ec);
+    }
+}
+
+std::string media_type_for_cache_ext(const std::string& ext_lower) {
+    if (ext_lower == "png") return "image/png";
+    if (ext_lower == "jpg" || ext_lower == "jpeg") return "image/jpeg";
+    if (ext_lower == "webp") return "image/webp";
+    return "application/octet-stream";
+}
+
+fs::path resolve_cached_image_path(const std::string& id_or_url) {
+    std::string cleaned = util::trim_ascii(id_or_url);
+    const std::string prefix = "/api/cache/images/";
+    if (const auto pos = cleaned.find(prefix); pos != std::string::npos) {
+        cleaned = cleaned.substr(pos + prefix.size());
+    }
+    if (const auto qpos = cleaned.find('?'); qpos != std::string::npos) {
+        cleaned.resize(qpos);
+    }
+
+    std::optional<std::string> requested_ext;
+    if (const auto dot = cleaned.rfind('.'); dot != std::string::npos) {
+        std::string ext = util::to_lower_ascii(cleaned.substr(dot + 1));
+        if (!is_cacheable_ext(ext)) {
+            throw ComicExportError("Unsupported cached image extension: '" + ext + "'");
+        }
+        cleaned.resize(dot);
+        requested_ext = std::move(ext);
+    }
+
+    if (!is_safe_image_id(cleaned)) {
+        throw ComicExportError("Invalid cached image identifier: '" + id_or_url + "'");
+    }
+
+    const fs::path cache_root = get_image_cache_dir();
+    std::vector<std::string> exts;
+    if (requested_ext.has_value()) {
+        exts.push_back(*requested_ext);
+    } else {
+        exts = {"png", "jpg", "jpeg", "webp"};
+    }
+
+    for (const auto& ext : exts) {
+        std::error_code ec;
+        const fs::path cand = fs::weakly_canonical(
+            cache_root / util::utf8_to_wide(cleaned + "." + ext), ec);
+        if (!ec && fs::is_regular_file(cand, ec) &&
+            util::to_lower_ascii(util::path_to_utf8(cand.parent_path())) ==
+                util::to_lower_ascii(util::path_to_utf8(cache_root))) {
+            return cand;
+        }
+    }
+
+    throw std::runtime_error("Cached image '" + cleaned + "' not found.");
+}
+
+// -----------------------------------------------------------------------------
+// Natural Sort & Filename Helpers
+// -----------------------------------------------------------------------------
+
+bool natural_path_less(const std::string& a, const std::string& b) {
+    const auto ka = build_natural_key(a);
+    const auto kb = build_natural_key(b);
+    const size_t seg_count = std::min(ka.size(), kb.size());
+    for (size_t s = 0; s < seg_count; ++s) {
+        const auto& ta = ka[s].tokens;
+        const auto& tb = kb[s].tokens;
+        const size_t tok_count = std::min(ta.size(), tb.size());
+        for (size_t t = 0; t < tok_count; ++t) {
+            if (ta[t].is_number != tb[t].is_number) {
+                return ta[t].is_number && !tb[t].is_number;
+            }
+            if (ta[t].is_number) {
+                if (ta[t].num != tb[t].num) return ta[t].num < tb[t].num;
+                if (ta[t].text.size() != tb[t].text.size()) {
+                    return ta[t].text.size() < tb[t].text.size();
+                }
+            } else {
+                if (ta[t].text != tb[t].text) return ta[t].text < tb[t].text;
+            }
+        }
+        if (ta.size() != tb.size()) return ta.size() < tb.size();
+    }
+    if (ka.size() != kb.size()) return ka.size() < kb.size();
+    return a < b;
+}
+
+std::string sanitize_export_filename(
+    const std::optional<std::string>& raw_name,
+    const std::string& extension,
+    const std::string& default_stem) {
+    std::string raw = raw_name.has_value() ? util::trim_ascii(*raw_name) : "";
+    if (!raw.empty()) {
+        std::replace(raw.begin(), raw.end(), '\\', '/');
+        if (const auto slash = raw.rfind('/'); slash != std::string::npos) {
+            raw = raw.substr(slash + 1);
+        }
+    }
+
+    const std::string lower = util::to_lower_ascii(raw);
+    for (const char* suffix : {".cbz", ".pdf", ".zip"}) {
+        const size_t slen = std::strlen(suffix);
+        if (lower.size() >= slen && lower.compare(lower.size() - slen, slen, suffix) == 0) {
+            raw.resize(raw.size() - slen);
+            break;
+        }
+    }
+
+    std::string cleaned;
+    cleaned.reserve(raw.size());
+    for (unsigned char c : raw) {
+        if (std::isalnum(c) || c == '.' || c == '_' || c == ' ' || c == '-') {
+            cleaned.push_back(static_cast<char>(c));
+        } else {
+            cleaned.push_back('_');
+        }
+    }
+    while (!cleaned.empty() && (cleaned.front() == ' ' || cleaned.front() == '.' || cleaned.front() == '_')) {
+        cleaned.erase(cleaned.begin());
+    }
+    while (!cleaned.empty() && (cleaned.back() == ' ' || cleaned.back() == '.' || cleaned.back() == '_')) {
+        cleaned.pop_back();
+    }
+    if (cleaned.empty()) {
+        cleaned = default_stem;
+    }
+    if (cleaned.size() > 100) {
+        cleaned.resize(100);
+    }
+    return cleaned + "." + extension;
+}
+
+ExportImageFormat parse_export_image_format(const std::optional<std::string>& raw) {
+    if (!raw.has_value()) {
+        return ExportImageFormat::Original;
+    }
+    const std::string cleaned = util::to_lower_ascii(util::trim_ascii(*raw));
+    if (cleaned.empty() || cleaned == "original" || cleaned == "auto") {
+        return ExportImageFormat::Original;
+    }
+    if (cleaned == "png") {
+        return ExportImageFormat::Png;
+    }
+    if (cleaned == "jpg" || cleaned == "jpeg") {
+        return ExportImageFormat::Jpg;
+    }
+    throw ComicExportError(
+        "Unsupported image_format '" + *raw + "'. Expected 'original', 'png', or 'jpg'.");
+}
+
+std::vector<uint8_t> decode_export_image_reference(const std::string& ref, int page_index) {
+    const std::string cleaned = util::trim_ascii(ref);
+    if (cleaned.empty()) {
+        throw ComicExportError("Page " + std::to_string(page_index) + " image reference is empty.");
+    }
+
+    const bool looks_like_cache_url = (cleaned.rfind("/api/cache/images/", 0) == 0);
+    std::string stem_check = cleaned;
+    if (const auto dot = stem_check.rfind('.'); dot != std::string::npos) {
+        stem_check.resize(dot);
+    }
+    const bool looks_like_cache_id =
+        !looks_like_cache_url &&
+        cleaned.find(',') == std::string::npos &&
+        cleaned.size() <= 134 &&
+        is_safe_image_id(stem_check);
+
+    if (looks_like_cache_url || looks_like_cache_id) {
+        try {
+            const fs::path cached = resolve_cached_image_path(cleaned);
+            auto bytes = util::read_file_bytes(cached);
+            if (bytes.has_value() && !bytes->empty()) {
+                return *bytes;
+            }
+        } catch (const std::exception& ex) {
+            if (looks_like_cache_url) {
+                throw ComicExportError(ex.what());
+            }
+            // Otherwise fall through to base64 decode attempt.
+        }
+    }
+
+    std::string_view b64_view = cleaned;
+    if (cleaned.size() > 5 &&
+        util::to_lower_ascii(cleaned.substr(0, 5)) == "data:") {
+        const auto comma = cleaned.find(',');
+        if (comma == std::string::npos) {
+            throw ComicExportError("Page " + std::to_string(page_index) + " contains malformed data URI.");
+        }
+        b64_view = std::string_view(cleaned).substr(comma + 1);
+    }
+
+    auto decoded = util::base64_decode(b64_view);
+    if (!decoded.has_value() || decoded->empty()) {
+        throw ComicExportError(
+            "Page " + std::to_string(page_index) + " contains invalid base64 or image URL.");
+    }
+    return *decoded;
+}
+
+// -----------------------------------------------------------------------------
+// Archive Import (`POST /api/import/archive`) via miniz + stb_image
+// -----------------------------------------------------------------------------
+
+std::vector<ExtractedArchivePage> extract_archive_pages(
+    const std::vector<uint8_t>& archive_bytes,
+    const fs::path& output_dir,
+    size_t max_pages) {
+    if (archive_bytes.empty()) {
+        throw ArchiveImportError("Uploaded archive file is empty.");
+    }
+
+    std::error_code dir_ec;
+    fs::create_directories(output_dir, dir_ec);
+
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_mem(&zip, archive_bytes.data(), archive_bytes.size(), 0)) {
+        throw ArchiveImportError("Uploaded file is not a valid .cbz or .zip archive.");
+    }
+    struct ZipReaderGuard {
+        mz_zip_archive* z;
+        ~ZipReaderGuard() { mz_zip_reader_end(z); }
+    } guard{&zip};
+
+    struct CandidateEntry {
+        mz_uint index = 0;
+        std::string member_name;
+        uint64_t uncompressed_size = 0;
+    };
+
+    const mz_uint total_files = mz_zip_reader_get_num_files(&zip);
+    std::vector<CandidateEntry> candidates;
+    for (mz_uint i = 0; i < total_files; ++i) {
+        if (mz_zip_reader_is_file_a_directory(&zip, i)) {
+            continue;
+        }
+        mz_zip_archive_file_stat st{};
+        if (!mz_zip_reader_file_stat(&zip, i, &st)) {
+            continue;
+        }
+        const std::string name(st.m_filename);
+        if (!is_safe_archive_member(name)) {
+            continue;
+        }
+        candidates.push_back({i, name, st.m_uncomp_size});
+    }
+
+    if (candidates.empty()) {
+        throw ArchiveImportError(
+            "No supported comic page images (.png, .jpg, .jpeg, .webp, .bmp) found inside the archive.");
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const CandidateEntry& a, const CandidateEntry& b) {
+        return natural_path_less(a.member_name, b.member_name);
+    });
+
+    if (candidates.size() > max_pages) {
+        throw ArchiveImportError(
+            "Archive contains " + std::to_string(candidates.size()) +
+            " images, exceeding limit of " + std::to_string(max_pages) + " pages.");
+    }
+
+    uint64_t declared_total = 0;
+    for (const auto& c : candidates) {
+        declared_total += c.uncompressed_size;
+        if (declared_total > kMaxArchiveUncompressedBytes) {
+            throw ArchiveImportError("Archive uncompressed size exceeds the 1 GiB safety limit.");
+        }
+    }
+
+    std::vector<ExtractedArchivePage> extracted;
+    extracted.reserve(candidates.size());
+    size_t cumulative_bytes = 0;
+
+    for (size_t idx = 0; idx < candidates.size(); ++idx) {
+        const auto& cand = candidates[idx];
+        size_t extracted_size = 0;
+        void* raw_ptr = mz_zip_reader_extract_to_heap(&zip, cand.index, &extracted_size, 0);
+        if (!raw_ptr) {
+            throw ArchiveImportError("Failed to read '" + cand.member_name + "' from archive.");
+        }
+        std::vector<uint8_t> raw_bytes(
+            static_cast<const uint8_t*>(raw_ptr),
+            static_cast<const uint8_t*>(raw_ptr) + extracted_size);
+        mz_free(raw_ptr);
+
+        if (raw_bytes.empty()) {
+            throw ArchiveImportError("Archive entry '" + cand.member_name + "' is empty.");
+        }
+        if (raw_bytes.size() > kMaxSingleImageBytes) {
+            throw ArchiveImportError("Archive entry '" + cand.member_name + "' exceeds 64 MiB limit.");
+        }
+        cumulative_bytes += raw_bytes.size();
+        if (cumulative_bytes > kMaxArchiveUncompressedBytes) {
+            throw ArchiveImportError("Archive extracted payload exceeds the 1 GiB safety limit.");
+        }
+
+        const DetectedImageFormat fmt = detect_image_magic(raw_bytes);
+        int width = 0;
+        int height = 0;
+        std::string out_ext;
+        std::vector<uint8_t> out_bytes;
+
+        if (fmt == DetectedImageFormat::Webp) {
+            if (!parse_webp_dimensions(raw_bytes, width, height)) {
+                throw ArchiveImportError("Archive entry '" + cand.member_name + "' is not a valid WebP image.");
+            }
+            out_ext = "webp";
+            out_bytes = std::move(raw_bytes);
+        } else {
+            int channels = 0;
+            StbiBuffer decoded(stbi_load_from_memory(
+                raw_bytes.data(), static_cast<int>(raw_bytes.size()), &width, &height, &channels, 0));
+            if (!decoded || width <= 0 || height <= 0) {
+                throw ArchiveImportError("Archive entry '" + cand.member_name + "' is not a valid image.");
+            }
+            if (fmt == DetectedImageFormat::Jpeg) {
+                out_ext = "jpg";
+                out_bytes = std::move(raw_bytes);
+            } else if (fmt == DetectedImageFormat::Png) {
+                out_ext = "png";
+                out_bytes = std::move(raw_bytes);
+            } else {
+                const auto rgb = flatten_pixels_to_rgb(decoded.get(), width, height, channels);
+                out_ext = "png";
+                out_bytes = encode_rgb_png(rgb.data(), width, height);
+            }
+        }
+
+        const std::string image_id = "imp_" + util::generate_uuid_hex();
+        const fs::path final_path = output_dir / util::utf8_to_wide(image_id + "." + out_ext);
+        std::string write_err;
+        if (!util::atomic_write_bytes(final_path, out_bytes.data(), out_bytes.size(), &write_err)) {
+            throw std::runtime_error("Failed to write cached archive page: " + write_err);
+        }
+
+        std::string clean_member = cand.member_name;
+        std::replace(clean_member.begin(), clean_member.end(), '\\', '/');
+        const auto slash = clean_member.rfind('/');
+        const std::string leaf_name =
+            (slash == std::string::npos) ? clean_member : clean_member.substr(slash + 1);
+
+        extracted.push_back({
+            static_cast<int>(idx + 1),
+            leaf_name,
+            clean_member,
+            image_id,
+            out_ext,
+            final_path,
+            {width, height},
+            out_bytes.size(),
+        });
+    }
+
+    prune_image_cache(output_dir);
+    return extracted;
+}
+
+// -----------------------------------------------------------------------------
+// CBZ Archive Export (`POST /api/export/cbz`) via miniz + stb_image
+// -----------------------------------------------------------------------------
+
+std::vector<uint8_t> build_cbz_bytes(
+    const std::vector<ExportPageInput>& pages,
+    ExportImageFormat image_format,
+    int jpeg_quality) {
+    if (pages.empty()) {
+        throw ComicExportError("At least one page image is required to export a .cbz archive.");
+    }
+    if (pages.size() > kMaxArchivePages) {
+        throw ComicExportError(
+            "Cannot export " + std::to_string(pages.size()) +
+            " pages; maximum is " + std::to_string(kMaxArchivePages) + ".");
+    }
+
+    const size_t pad_width = std::max<size_t>(3, std::to_string(pages.size()).size());
+
+    mz_zip_archive zip{};
+    if (!mz_zip_writer_init_heap(&zip, 0, 1024ULL * 1024ULL)) {
+        throw ComicExportError("Failed to initialize in-memory CBZ writer.");
+    }
+    bool finalized = false;
+    struct ZipWriterGuard {
+        mz_zip_archive* z;
+        bool* done;
+        ~ZipWriterGuard() {
+            if (!*done) {
+                mz_zip_writer_end(z);
+            }
+        }
+    } guard{&zip, &finalized};
+
+    for (size_t i = 0; i < pages.size(); ++i) {
+        const int page_num = static_cast<int>(i + 1);
+        const auto& raw = pages[i].image_bytes;
+        if (raw.empty()) {
+            throw ComicExportError("Page " + std::to_string(page_num) + " image payload is empty.");
+        }
+        if (raw.size() > kMaxSingleImageBytes) {
+            throw ComicExportError("Page " + std::to_string(page_num) + " exceeds maximum allowed image size.");
+        }
+
+        const DetectedImageFormat fmt = detect_image_magic(raw);
+        std::vector<uint8_t> encoded;
+        std::string ext;
+
+        if (image_format == ExportImageFormat::Original && fmt == DetectedImageFormat::Webp) {
+            int w = 0, h = 0;
+            if (!parse_webp_dimensions(raw, w, h)) {
+                throw ComicExportError("Page " + std::to_string(page_num) + " is not a valid WebP image.");
+            }
+            encoded = raw;
+            ext = "webp";
+        } else {
+            int w = 0, h = 0, channels = 0;
+            StbiBuffer decoded(stbi_load_from_memory(
+                raw.data(), static_cast<int>(raw.size()), &w, &h, &channels, 0));
+            if (!decoded || w <= 0 || h <= 0) {
+                throw ComicExportError("Page " + std::to_string(page_num) + " is not a valid image.");
+            }
+
+            if (image_format == ExportImageFormat::Original) {
+                if (fmt == DetectedImageFormat::Jpeg) {
+                    encoded = raw;
+                    ext = "jpg";
+                } else if (fmt == DetectedImageFormat::Png) {
+                    encoded = raw;
+                    ext = "png";
+                } else {
+                    const auto rgb = flatten_pixels_to_rgb(decoded.get(), w, h, channels);
+                    encoded = encode_rgb_png(rgb.data(), w, h);
+                    ext = "png";
+                }
+            } else if (image_format == ExportImageFormat::Jpg) {
+                const auto rgb = flatten_pixels_to_rgb(decoded.get(), w, h, channels);
+                encoded = encode_rgb_jpg(rgb.data(), w, h, jpeg_quality);
+                ext = "jpg";
+            } else {  // ExportImageFormat::Png
+                if (fmt == DetectedImageFormat::Png) {
+                    encoded = raw;
+                    ext = "png";
+                } else {
+                    const auto rgb = flatten_pixels_to_rgb(decoded.get(), w, h, channels);
+                    encoded = encode_rgb_png(rgb.data(), w, h);
+                    ext = "png";
+                }
+            }
+        }
+
+        std::ostringstream prefix_ss;
+        prefix_ss << std::setw(static_cast<int>(pad_width)) << std::setfill('0') << page_num;
+        const std::string prefix = prefix_ss.str();
+        const std::string stem = sanitize_page_stem(pages[i].filename);
+        const std::string entry_name =
+            (!stem.empty() && stem.rfind(prefix, 0) != 0)
+            ? (prefix + "_" + stem + "." + ext)
+            : (prefix + "." + ext);
+
+        if (!mz_zip_writer_add_mem(
+                &zip,
+                entry_name.c_str(),
+                encoded.data(),
+                encoded.size(),
+                MZ_NO_COMPRESSION)) {
+            throw ComicExportError("Failed to add '" + entry_name + "' to CBZ archive.");
+        }
+    }
+
+    void* out_buf = nullptr;
+    size_t out_size = 0;
+    if (!mz_zip_writer_finalize_heap_archive(&zip, &out_buf, &out_size) || !out_buf) {
+        throw ComicExportError("Failed to finalize CBZ archive.");
+    }
+    mz_zip_writer_end(&zip);
+    finalized = true;
+
+    std::vector<uint8_t> result(
+        static_cast<const uint8_t*>(out_buf),
+        static_cast<const uint8_t*>(out_buf) + out_size);
+    mz_free(out_buf);
+    return result;
+}
+
+// -----------------------------------------------------------------------------
+// Native C++ PDF 1.4 Multi-Page Writer (`POST /api/export/pdf`)
+// -----------------------------------------------------------------------------
+
+std::vector<uint8_t> build_pdf_bytes(const std::vector<ExportPageInput>& pages) {
+    if (pages.empty()) {
+        throw ComicExportError("At least one page image is required to export a .pdf document.");
+    }
+    if (pages.size() > kMaxArchivePages) {
+        throw ComicExportError(
+            "Cannot export " + std::to_string(pages.size()) +
+            " pages; maximum is " + std::to_string(kMaxArchivePages) + ".");
+    }
+
+    struct PdfImageStream {
+        int width = 0;
+        int height = 0;
+        std::string color_space;  // "/DeviceRGB", "/DeviceGray", or "/DeviceCMYK"
+        std::string filter;       // "/DCTDecode" or "/FlateDecode"
+        bool invert_cmyk = false;
+        std::vector<uint8_t> stream_data;
+    };
+
+    std::vector<PdfImageStream> prepared;
+    prepared.reserve(pages.size());
+
+    for (size_t i = 0; i < pages.size(); ++i) {
+        const int page_num = static_cast<int>(i + 1);
+        const auto& raw = pages[i].image_bytes;
+        if (raw.empty()) {
+            throw ComicExportError("Page " + std::to_string(page_num) + " image payload is empty.");
+        }
+        if (raw.size() > kMaxSingleImageBytes) {
+            throw ComicExportError("Page " + std::to_string(page_num) + " exceeds maximum allowed image size.");
+        }
+
+        const DetectedImageFormat fmt = detect_image_magic(raw);
+        PdfImageStream img;
+
+        // 1. Direct lossless JPEG passthrough via /DCTDecode (zero recompression)
+        JpegHeaderInfo jpeg_info{};
+        int probe_w = 0, probe_h = 0, probe_c = 0;
+        if (fmt == DetectedImageFormat::Jpeg &&
+            parse_jpeg_header(raw, jpeg_info) &&
+            stbi_info_from_memory(raw.data(), static_cast<int>(raw.size()), &probe_w, &probe_h, &probe_c)) {
+            img.width = jpeg_info.width;
+            img.height = jpeg_info.height;
+            img.filter = "/DCTDecode";
+            if (jpeg_info.components == 1) {
+                img.color_space = "/DeviceGray";
+            } else if (jpeg_info.components == 4) {
+                img.color_space = "/DeviceCMYK";
+                img.invert_cmyk = jpeg_info.is_adobe_cmyk;
+            } else {
+                img.color_space = "/DeviceRGB";
+            }
+            img.stream_data = raw;
+            prepared.push_back(std::move(img));
+            continue;
+        }
+
+        // 2. PNG / BMP / RGBA -> decode, flatten alpha onto white, zlib-compress for lossless /FlateDecode
+        int w = 0, h = 0, channels = 0;
+        StbiBuffer decoded(stbi_load_from_memory(
+            raw.data(), static_cast<int>(raw.size()), &w, &h, &channels, 0));
+        if (!decoded || w <= 0 || h <= 0) {
+            throw ComicExportError("Page " + std::to_string(page_num) + " is not a valid image.");
+        }
+
+        std::vector<uint8_t> raw_pixels;
+        if (channels == 1) {
+            img.color_space = "/DeviceGray";
+            raw_pixels.assign(decoded.get(), decoded.get() + static_cast<size_t>(w) * static_cast<size_t>(h));
+        } else if (channels == 2) {
+            img.color_space = "/DeviceGray";
+            const size_t px_count = static_cast<size_t>(w) * static_cast<size_t>(h);
+            raw_pixels.resize(px_count);
+            for (size_t p = 0; p < px_count; ++p) {
+                const uint32_t g = decoded.get()[p * 2 + 0];
+                const uint32_t a = decoded.get()[p * 2 + 1];
+                raw_pixels[p] = static_cast<uint8_t>((g * a + 255U * (255U - a) + 127U) / 255U);
+            }
+        } else {
+            img.color_space = "/DeviceRGB";
+            raw_pixels = flatten_pixels_to_rgb(decoded.get(), w, h, channels);
+        }
+
+        mz_ulong comp_bound = mz_compressBound(static_cast<mz_ulong>(raw_pixels.size()));
+        std::vector<uint8_t> compressed(static_cast<size_t>(comp_bound));
+        const int zres = mz_compress2(
+            compressed.data(),
+            &comp_bound,
+            raw_pixels.data(),
+            static_cast<mz_ulong>(raw_pixels.size()),
+            MZ_DEFAULT_COMPRESSION);
+        if (zres != MZ_OK) {
+            throw ComicExportError("Failed to Flate-compress page " + std::to_string(page_num) + " for PDF.");
+        }
+        compressed.resize(static_cast<size_t>(comp_bound));
+
+        img.width = w;
+        img.height = h;
+        img.filter = "/FlateDecode";
+        img.stream_data = std::move(compressed);
+        prepared.push_back(std::move(img));
+    }
+
+    // Assemble PDF 1.4 binary document:
+    //   Obj 1             : /Catalog -> /Pages 2 0 R
+    //   Obj 2             : /Pages   -> /Kids [5 0 R, 8 0 R, ...] /Count N
+    //   Obj 3 + i*3       : Image XObject (/Im0)
+    //   Obj 4 + i*3       : Page Content Stream
+    //   Obj 5 + i*3       : /Page Dictionary
+    const size_t page_count = prepared.size();
+    const size_t total_objects = 2 + page_count * 3;
+    std::vector<size_t> obj_offsets(total_objects + 1, 0);
+
+    std::vector<uint8_t> pdf;
+    size_t estimated_size = 4096;
+    for (const auto& img : prepared) {
+        estimated_size += img.stream_data.size() + 512;
+    }
+    pdf.reserve(estimated_size);
+
+    auto append_str = [&pdf](std::string_view s) {
+        pdf.insert(pdf.end(), s.begin(), s.end());
+    };
+    auto append_bytes = [&pdf](const std::vector<uint8_t>& b) {
+        pdf.insert(pdf.end(), b.begin(), b.end());
+    };
+    auto begin_obj = [&](size_t obj_id) {
+        obj_offsets[obj_id] = pdf.size();
+        append_str(std::to_string(obj_id) + " 0 obj\n");
+    };
+
+    // PDF 1.4 Header + binary comment marker
+    append_str("%PDF-1.4\n");
+    pdf.push_back('%');
+    pdf.push_back(0xE2);
+    pdf.push_back(0xE3);
+    pdf.push_back(0xCF);
+    pdf.push_back(0xD3);
+    pdf.push_back('\n');
+
+    // Object 1: Document Catalog
+    begin_obj(1);
+    append_str("<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    // Object 2: Pages Tree
+    begin_obj(2);
+    {
+        std::ostringstream kids;
+        kids << "<< /Type /Pages /Kids [";
+        for (size_t i = 0; i < page_count; ++i) {
+            if (i > 0) kids << ' ';
+            kids << (5 + i * 3) << " 0 R";
+        }
+        kids << "] /Count " << page_count << " >>\nendobj\n";
+        append_str(kids.str());
+    }
+
+    // Per-page objects (Image XObject, Content Stream, Page Dictionary)
+    for (size_t i = 0; i < page_count; ++i) {
+        const auto& img = prepared[i];
+        const size_t img_obj_id = 3 + i * 3;
+        const size_t content_obj_id = 4 + i * 3;
+        const size_t page_obj_id = 5 + i * 3;
+
+        // Match standard 96 DPI -> 72 PDF points per inch
+        const std::string pt_w = format_pdf_number(static_cast<double>(img.width) * 72.0 / 96.0);
+        const std::string pt_h = format_pdf_number(static_cast<double>(img.height) * 72.0 / 96.0);
+
+        // Image XObject
+        begin_obj(img_obj_id);
+        {
+            std::ostringstream dict;
+            dict << "<< /Type /XObject /Subtype /Image"
+                 << " /Width " << img.width
+                 << " /Height " << img.height
+                 << " /ColorSpace " << img.color_space
+                 << " /BitsPerComponent 8"
+                 << " /Filter " << img.filter;
+            if (img.invert_cmyk) {
+                dict << " /Decode [1 0 1 0 1 0 1 0]";
+            }
+            dict << " /Length " << img.stream_data.size()
+                 << " >>\nstream\n";
+            append_str(dict.str());
+            append_bytes(img.stream_data);
+            append_str("\nendstream\nendobj\n");
+        }
+
+        // Page Content Stream
+        const std::string content_stream =
+            "q\n" + pt_w + " 0 0 " + pt_h + " 0 0 cm\n/Im0 Do\nQ\n";
+        begin_obj(content_obj_id);
+        append_str(
+            "<< /Length " + std::to_string(content_stream.size()) +
+            " >>\nstream\n" + content_stream + "endstream\nendobj\n");
+
+        // Page Dictionary
+        begin_obj(page_obj_id);
+        {
+            std::ostringstream page_dict;
+            page_dict << "<< /Type /Page /Parent 2 0 R"
+                      << " /MediaBox [0 0 " << pt_w << " " << pt_h << "]"
+                      << " /Resources << /XObject << /Im0 " << img_obj_id << " 0 R >> >>"
+                      << " /Contents " << content_obj_id << " 0 R"
+                      << " >>\nendobj\n";
+            append_str(page_dict.str());
+        }
+    }
+
+    // Cross-reference table (PDF 1.4 strict 20-byte entries)
+    const size_t xref_offset = pdf.size();
+    append_str("xref\n0 " + std::to_string(total_objects + 1) + "\n");
+    append_str("0000000000 65535 f \n");
+    for (size_t obj_id = 1; obj_id <= total_objects; ++obj_id) {
+        char line[32]{};
+        std::snprintf(
+            line, sizeof(line), "%010llu 00000 n \n",
+            static_cast<unsigned long long>(obj_offsets[obj_id]));
+        append_str(line);
+    }
+
+    // Trailer & EOF
+    append_str(
+        "trailer\n<< /Size " + std::to_string(total_objects + 1) +
+        " /Root 1 0 R >>\nstartxref\n" +
+        std::to_string(xref_offset) + "\n%%EOF\n");
+
+    return pdf;
+}
+
+}  // namespace mangaflow

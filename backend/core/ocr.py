@@ -10,6 +10,7 @@ Routes text recognition per language using local offline weights in `models/`:
 """
 
 from collections.abc import Sequence
+import gc
 import importlib
 from pathlib import Path
 import sys
@@ -31,7 +32,10 @@ from backend.core.detector import (  # noqa: E402
     TextDirection,
     load_rgb_image,
 )
-from backend.core.model_manager import ModelManager  # noqa: E402
+from backend.core.model_manager import (  # noqa: E402
+    ModelManager,
+    get_execution_provider,
+)
 
 SourceLanguage = Literal["ja", "ko", "zh"]
 SUPPORTED_LANGUAGES: tuple[SourceLanguage, ...] = ("ja", "ko", "zh")
@@ -89,6 +93,9 @@ class _RapidOcrFactory(Protocol):
         det_use_cuda: bool,
         cls_use_cuda: bool,
         rec_use_cuda: bool,
+        det_use_dml: bool = ...,
+        cls_use_dml: bool = ...,
+        rec_use_dml: bool = ...,
     ) -> _RapidOcrEngine: ...
 
 
@@ -340,12 +347,13 @@ def _parse_rapid_det_rec(raw_obj: object) -> list[tuple[float, float, str]]:
 
 
 class OCRRouter:
-    """Multi-language OCR router with lazy initialization for `ja`, `ko`, and `zh`."""
+    """Multi-language OCR router with lazy initialization and clean RAM/ONNX session unloading."""
 
     model_manager: ModelManager
     force_cpu: bool
     _manga_ocr: _MangaOcrEngine | None
     _rapid_ocr_engines: dict[SourceLanguage, _RapidOcrEngine]
+    _rapid_ocr_providers: dict[SourceLanguage, str]
 
     def __init__(
         self,
@@ -356,9 +364,95 @@ class OCRRouter:
         self.force_cpu = force_cpu
         self._manga_ocr = None
         self._rapid_ocr_engines = {}
+        self._rapid_ocr_providers = {}
+
+    @property
+    def is_manga_ocr_loaded(self) -> bool:
+        """Return True if the Japanese `manga-ocr` model is currently resident in memory."""
+        return self._manga_ocr is not None
+
+    @property
+    def is_rapid_ocr_loaded(self) -> bool:
+        """Return True if any Korean/Chinese RapidOCR ONNX session is currently resident in memory."""
+        return len(self._rapid_ocr_engines) > 0
+
+    @property
+    def is_loaded(self) -> bool:
+        """Return True if any OCR model or ONNX session is currently resident in memory."""
+        return self.is_manga_ocr_loaded or self.is_rapid_ocr_loaded
+
+    def unload_manga_ocr(self) -> None:
+        """Explicitly unload Japanese `manga-ocr` weights/processor/tokenizer from RAM/VRAM."""
+        engine = self._manga_ocr
+        self._manga_ocr = None
+        if engine is not None:
+            for attr in ("model", "processor", "tokenizer"):
+                if hasattr(engine, attr):
+                    try:
+                        setattr(engine, attr, None)
+                    except Exception:
+                        pass
+            del engine
+        _ = gc.collect()
+
+        # Flush PyTorch CUDA allocator cache only if torch is already imported
+        torch_mod = sys.modules.get("torch")
+        if torch_mod is not None:
+            cuda_obj: object = getattr(torch_mod, "cuda", None)
+            is_avail: object = getattr(cuda_obj, "is_available", None)
+            empty_cache: object = getattr(cuda_obj, "empty_cache", None)
+            if callable(is_avail) and callable(empty_cache):
+                try:
+                    if is_avail():
+                        _ = empty_cache()
+                except Exception:
+                    pass
+
+    def unload_rapid_ocr(self, lang: Literal["ko", "zh"] | None = None) -> None:
+        """Release RapidOCR ONNX Runtime sessions (`det`, `cls`, `rec`) from RAM/VRAM."""
+        keys: list[SourceLanguage] = (
+            [lang] if lang is not None else list(self._rapid_ocr_engines.keys())
+        )
+        for key in keys:
+            engine = self._rapid_ocr_engines.pop(key, None)
+            _ = self._rapid_ocr_providers.pop(key, None)
+            if engine is None:
+                continue
+            for sub_name in ("text_det", "text_cls", "text_rec"):
+                sub_obj: object = getattr(engine, sub_name, None)
+                if sub_obj is None:
+                    continue
+                for holder_name in ("infer", "session"):
+                    holder: object = getattr(sub_obj, holder_name, None)
+                    if holder is not None and hasattr(holder, "session"):
+                        try:
+                            setattr(holder, "session", None)
+                        except Exception:
+                            pass
+                    if hasattr(sub_obj, holder_name):
+                        try:
+                            setattr(sub_obj, holder_name, None)
+                        except Exception:
+                            pass
+                try:
+                    setattr(engine, sub_name, None)
+                except Exception:
+                    pass
+            del engine
+        _ = gc.collect()
+
+    def unload(self) -> None:
+        """Unload all loaded OCR models (`manga-ocr` and RapidOCR ONNX sessions) from RAM/VRAM."""
+        self.unload_manga_ocr()
+        self.unload_rapid_ocr()
 
     def _get_manga_ocr(self) -> _MangaOcrEngine:
-        """Lazily initialize `MangaOcr` from local weights in `models/manga-ocr-base/`."""
+        """Lazily initialize `MangaOcr` from local weights in `models/manga-ocr-base/`.
+
+        Note: `manga-ocr` 0.1.x uses a PyTorch VisionEncoderDecoderModel (`pytorch_model.bin`)
+        without built-in pure-ONNX inference; callers unload it right after Japanese OCR completes
+        via `unload_manga_ocr()` to keep idle RAM usage minimal.
+        """
         if self._manga_ocr is not None:
             return self._manga_ocr
 
@@ -388,10 +482,17 @@ class OCRRouter:
         self._manga_ocr = instance
         return instance
 
-    def _get_rapid_ocr(self, lang: Literal["ko", "zh"]) -> _RapidOcrEngine:
-        """Lazily initialize `RapidOCR` with local Korean or Chinese PP-OCRv4 ONNX weights."""
-        if lang in self._rapid_ocr_engines:
+    def _get_rapid_ocr(
+        self,
+        lang: Literal["ko", "zh"],
+        fallback_cpu: bool = False,
+    ) -> _RapidOcrEngine:
+        """Lazily initialize `RapidOCR` with CUDA / DirectML -> CPU fallback."""
+        if lang in self._rapid_ocr_engines and not fallback_cpu:
             return self._rapid_ocr_engines[lang]
+
+        if fallback_cpu and lang in self._rapid_ocr_engines:
+            self.unload_rapid_ocr(lang)
 
         paths = self.model_manager.get_rapidocr_paths(language=lang)
         required_paths: tuple[tuple[str, Path], ...] = (
@@ -412,20 +513,43 @@ class OCRRouter:
             getattr(rapidocr_mod, "RapidOCR"),
         )
 
-        use_cuda = (
-            not self.force_cpu
-            and self.model_manager.get_status()["execution_provider"]
-            == "CUDAExecutionProvider"
+        primary_provider = get_execution_provider(
+            force_cpu=(self.force_cpu or fallback_cpu),
         )
-        engine = rapidocr_cls(
-            det_model_path=str(paths["det_model_path"]),
-            rec_model_path=str(paths["rec_model_path"]),
-            cls_model_path=str(paths["cls_model_path"]),
-            det_use_cuda=use_cuda,
-            cls_use_cuda=use_cuda,
-            rec_use_cuda=use_cuda,
-        )
+        use_cuda = primary_provider == "CUDAExecutionProvider"
+        use_dml = primary_provider == "DmlExecutionProvider"
+
+        try:
+            engine = rapidocr_cls(
+                det_model_path=str(paths["det_model_path"]),
+                rec_model_path=str(paths["rec_model_path"]),
+                cls_model_path=str(paths["cls_model_path"]),
+                det_use_cuda=use_cuda,
+                cls_use_cuda=use_cuda,
+                rec_use_cuda=use_cuda,
+                det_use_dml=use_dml,
+                cls_use_dml=use_dml,
+                rec_use_dml=use_dml,
+            )
+            active_provider = primary_provider
+        except Exception:
+            if not use_cuda and not use_dml:
+                raise
+            engine = rapidocr_cls(
+                det_model_path=str(paths["det_model_path"]),
+                rec_model_path=str(paths["rec_model_path"]),
+                cls_model_path=str(paths["cls_model_path"]),
+                det_use_cuda=False,
+                cls_use_cuda=False,
+                rec_use_cuda=False,
+                det_use_dml=False,
+                cls_use_dml=False,
+                rec_use_dml=False,
+            )
+            active_provider = "CPUExecutionProvider"
+
         self._rapid_ocr_engines[lang] = engine
+        self._rapid_ocr_providers[lang] = active_provider
         return engine
 
     def _recognize_ja(
@@ -463,14 +587,12 @@ class OCRRouter:
         pil_crop = Image.fromarray(padded)
         return engine(pil_crop).strip()
 
-    def _recognize_rapid(
+    def _recognize_rapid_with_engine(
         self,
+        engine: _RapidOcrEngine,
         raw_crop: NDArrayU8,
-        lang: Literal["ko", "zh"],
     ) -> str:
-        """Run Korean or Chinese `RapidOCR` using PP-OCRv4 ONNX models."""
-        engine = self._get_rapid_ocr(lang)
-
+        """Execute line-strip + full-crop RapidOCR recognition using an initialized engine."""
         # 1. If the bubble cleanly segments into horizontal lines, run PP-OCRv4 recognition
         # directly on each line strip so DBNet never clips characters at bubble edges.
         line_strips = extract_horizontal_line_strips(raw_crop)
@@ -525,43 +647,74 @@ class OCRRouter:
         lines.sort(key=lambda item: (round(item[0] / 18.0), item[1]))
         return " ".join(item[2] for item in lines).strip()
 
+    def _recognize_rapid(
+        self,
+        raw_crop: NDArrayU8,
+        lang: Literal["ko", "zh"],
+    ) -> str:
+        """Run Korean or Chinese `RapidOCR` using PP-OCRv4 ONNX models with safe CPU fallback."""
+        engine = self._get_rapid_ocr(lang)
+        try:
+            return self._recognize_rapid_with_engine(engine, raw_crop)
+        except Exception:
+            if self._rapid_ocr_providers.get(lang) == "CPUExecutionProvider":
+                raise
+            engine = self._get_rapid_ocr(lang, fallback_cpu=True)
+            return self._recognize_rapid_with_engine(engine, raw_crop)
+
     def recognize_crop(
         self,
         crop_image: ImageInput,
         source_lang: str = "ja",
         text_direction: TextDirection = "horizontal",
+        auto_unload: bool = False,
     ) -> str:
         """Extract text from a single pre-cropped speech bubble image."""
         lang = normalize_language(source_lang)
         rgb_crop = load_rgb_image(crop_image)
-        if lang == "ja":
-            return self._recognize_ja(rgb_crop, text_direction=text_direction)
-        return self._recognize_rapid(rgb_crop, lang=lang)
+        try:
+            if lang == "ja":
+                return self._recognize_ja(rgb_crop, text_direction=text_direction)
+            return self._recognize_rapid(rgb_crop, lang=lang)
+        finally:
+            if auto_unload:
+                if lang == "ja":
+                    self.unload_manga_ocr()
+                else:
+                    self.unload_rapid_ocr(lang)
 
     def recognize_bboxes(
         self,
         image: ImageInput,
         bboxes: Sequence[Sequence[int]],
         source_lang: str = "ja",
+        auto_unload: bool = True,
     ) -> list[str]:
         """Crop each `[x1, y1, x2, y2]` bounding box from `image` and extract text."""
         lang = normalize_language(source_lang)
         rgb_image = load_rgb_image(image)
         texts: list[str] = []
 
-        for bbox in bboxes:
-            raw_crop = crop_bbox_with_padding(
-                rgb_image,
-                bbox=bbox,
-                context_pad=0,
-                border_pad=0,
-            )
-            if lang == "ja":
-                h, w = _image_hw(raw_crop)
-                direction: TextDirection = "vertical" if h > w * 1.2 else "horizontal"
-                texts.append(self._recognize_ja(raw_crop, text_direction=direction))
-            else:
-                texts.append(self._recognize_rapid(raw_crop, lang=lang))
+        try:
+            for bbox in bboxes:
+                raw_crop = crop_bbox_with_padding(
+                    rgb_image,
+                    bbox=bbox,
+                    context_pad=0,
+                    border_pad=0,
+                )
+                if lang == "ja":
+                    h, w = _image_hw(raw_crop)
+                    direction: TextDirection = "vertical" if h > w * 1.2 else "horizontal"
+                    texts.append(self._recognize_ja(raw_crop, text_direction=direction))
+                else:
+                    texts.append(self._recognize_rapid(raw_crop, lang=lang))
+        finally:
+            if auto_unload:
+                if lang == "ja":
+                    self.unload_manga_ocr()
+                else:
+                    self.unload_rapid_ocr(lang)
 
         return texts
 
@@ -570,38 +723,47 @@ class OCRRouter:
         image: ImageInput,
         bubbles: Sequence[DetectedBubble],
         source_lang: str = "ja",
+        auto_unload: bool = True,
     ) -> list[OcrBubbleResult]:
         """Run OCR across a sequence of `DetectedBubble` items and return enriched bubble objects."""
         lang = normalize_language(source_lang)
         rgb_image = load_rgb_image(image)
         results: list[OcrBubbleResult] = []
 
-        for bubble in bubbles:
-            raw_crop = crop_bbox_with_padding(
-                rgb_image,
-                bbox=bubble["bbox"],
-                context_pad=0,
-                border_pad=0,
-            )
-            if lang == "ja":
-                text = self._recognize_ja(
-                    raw_crop,
-                    text_direction=bubble["text_direction"],
+        try:
+            for bubble in bubbles:
+                raw_crop = crop_bbox_with_padding(
+                    rgb_image,
+                    bbox=bubble["bbox"],
+                    context_pad=0,
+                    border_pad=0,
                 )
-            else:
-                text = self._recognize_rapid(raw_crop, lang=lang)
+                if lang == "ja":
+                    text = self._recognize_ja(
+                        raw_crop,
+                        text_direction=bubble["text_direction"],
+                    )
+                else:
+                    text = self._recognize_rapid(raw_crop, lang=lang)
 
-            results.append(
-                {
-                    "id": bubble["id"],
-                    "order": bubble["order"],
-                    "bbox": list(bubble["bbox"]),
-                    "polygon": [list(pt) for pt in bubble["polygon"]],
-                    "source_text": text,
-                    "confidence": bubble["confidence"],
-                    "text_direction": bubble["text_direction"],
-                }
-            )
+                results.append(
+                    {
+                        "id": bubble["id"],
+                        "order": bubble["order"],
+                        "bbox": list(bubble["bbox"]),
+                        "polygon": [list(pt) for pt in bubble["polygon"]],
+                        "source_text": text,
+                        "confidence": bubble["confidence"],
+                        "text_direction": bubble["text_direction"],
+                    }
+                )
+        finally:
+            if auto_unload:
+                if lang == "ja":
+                    self.unload_manga_ocr()
+                else:
+                    self.unload_rapid_ocr(lang)
+
         return results
 
 

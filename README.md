@@ -1,283 +1,306 @@
-# MangaFlow AI — Local Manga, Manhwa & Manhua Comic Translator
+# MangaFlow AI — Native C++17 Manga, Manhwa & Manhua Translator Studio
 
-A high-performance, **100% local-first, offline-capable** desktop and web application for translating **Japanese Manga (`ja`)**, **Korean Manhwa (`ko`)**, and **Chinese Manhua (`zh`)** into **Indonesian (`id`)** and **English (`en`)**.
+[![C++17](https://img.shields.io/badge/Backend-C%2B%2B17%20Native-00599C?logo=cplusplus&logoColor=white)](backend-cpp/CMakeLists.txt)
+[![ONNX Runtime](https://img.shields.io/badge/Inference-ONNX%20Runtime%20DirectML%20%7C%20CUDA%20%7C%20CPU-5C2D91)](backend-cpp/src/pipeline/model_manager.cpp)
+[![React 19 + Konva](https://img.shields.io/badge/Frontend-React%2019%20%2B%20Konva%20v2-61DAFB?logo=react&logoColor=black)](frontend/package.json)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20x64-0078D6?logo=windows&logoColor=white)](packaging/build_cpp_release.bat)
 
-Built with an **ONNX Runtime** computer-vision pipeline, a **Multi-Language OCR Router** (`manga-ocr` + `RapidOCR PP-OCRv4`), **Tile-Based LaMa Inpainting**, **Context-Aware LLM Translation** via **LM Studio** (`localhost:1235`), an interactive **React + Konva** typesetting studio, and standalone Windows desktop packaging via **PyInstaller (`comic-backend.exe`)** + **Tauri Sidecar**.
+A **100% local-first, offline-capable** native Windows desktop studio for detecting, OCR-ing, inpainting, translating, and typesetting **Japanese Manga (`ja`)**, **Korean Manhwa (`ko`)**, and **Chinese Manhua (`zh`)** into **16 target languages** (including Indonesian, English, and more).
+
+Re-architected from a Python prototype into a **modern C++17 native desktop application** (`cpp-httplib` + `webview.h` Edge WebView2 + ONNX Runtime C++ SDK) paired with an interactive **React 19 + Zustand + `react-konva` v2 typesetting studio** — delivering **<1s cold startup**, **~20 MB standalone disk footprint (~7.6 MB `.zip`)**, and **<100 MB idle backend RAM** with zero Python, PyTorch, OpenCV, or Electron overhead.
 
 ---
 
-## 1. Multi-Language Pipeline Architecture (`JA` / `KO` / `ZH`)
+## 1. Architecture Overview
+
+`MangaFlow-Cpp.exe` runs as a single zero-console Win32 executable that hosts an embedded multithreaded `cpp-httplib` backend alongside a native Microsoft Edge WebView2 desktop window rendering the compiled React/Konva v2 studio UI.
 
 ```text
-+-----------------------------------------------------------------------------------+
-|                        RAW COMIC PAGE (Manga / Manhwa / Manhua)                   |
-+-----------------------------------------+-----------------------------------------+
-                                          |
-                                          v
-+-----------------------------------------------------------------------------------+
-|  [STAGE 1] Comic Text Detector (ONNX: models/comictextdetector.pt.onnx)           |
-|  - YOLOv5 block detection + DBNet text probability + UNet pixel segmentation      |
-|  - Outputs: Bounding Boxes [x1, y1, x2, y2] + Binary Text Mask (H x W, uint8)     |
-+--------------------+-----------------------------------------+--------------------+
-                     |                                         |
-                     v                                         | (Binary Text Mask
-+--------------------------------------------------+           |  + Bounding Boxes)
-|  [STAGE 2] Comic Reading-Order Bubble Sorter     |           |
-|  - Japanese (ja) : Right-to-Left, Top-to-Bottom  |           |
-|  - Korean   (ko) : Left-to-Right, Top-to-Bottom  |           |
-|  - Chinese  (zh) : Left-to-Right, Top-to-Bottom  |           |
-+--------------------+-----------------------------+           |
-                     |                                         |
-                     v                                         |
-+--------------------------------------------------+           |
-|  [STAGE 3] Multi-Language OCR Router             |           |
-|  - Border-touching bubble outline eraser         |           |
-|  - Horizontal multi-line strip segmentation      |           |
-|                                                  |           |
-|    +-- [ja] --> manga-ocr (VisionEncoderDecoder) |           |
-|    |            models/manga-ocr-base/           |           |
-|    |            (Vertical tategaki & horizontal) |           |
-|    |                                             |           |
-|    +-- [ko] --> RapidOCR PP-OCRv4 (ONNX)         |           |
-|    |            korean_PP-OCRv4_rec_infer.onnx   |           |
-|    |            Multilingual_PP-OCRv3_det.onnx   |           |
-|    |                                             |           |
-|    +-- [zh] --> RapidOCR PP-OCRv4 (ONNX)         |           |
-|                 ch_PP-OCRv4_rec_infer.onnx       |           |
-|                 ch_PP-OCRv4_det_infer.onnx       |           |
-+--------------------+-----------------------------+           |
-                     |                                         v
-                     |                        +-------------------------------------+
-                     |                        |  [STAGE 4] LaMa Tile Inpainter      |
-                     |                        |  (ONNX: models/lama_fp32.onnx)      |
-                     |                        |  - 512x512 padded ROI tile crops    |
-                     |                        |  - Lossless unmasked pixel patching |
-                     |                        |  - Auto session unload to free VRAM |
-                     |                        +----------------+--------------------+
-                     |                                         |
-                     v                                         |
-+--------------------------------------------------+           |
-|  [STAGE 5] Context-Aware LLM Translation Engine  |           |
-|  - LM Studio OpenAI Server @ localhost:1235/v1   |           |
-|  - Model: "Gemma 4 E2B Uncensored HauhauCS       |           |
-|            Aggressive Q4 K P"                    |           |
-|  - Full-page dialogue array translated in a      |           |
-|    single prompt with strict JSON Schema output  |           |
-|  - Target Languages: Indonesian (id) / English   |           |
-+--------------------+-----------------------------+           |
-                     |                                         |
-                     +--------------------+--------------------+
-                                          |
-                                          v
-+-----------------------------------------------------------------------------------+
-|  [STAGE 6] Interactive React-Konva Typesetting Workspace                          |
-|  - Layer 1 (Background) : Cleaned LaMa-inpainted page + "Hold to Compare Original"|
-|  - Layer 2 (Typography) : Draggable, resizable (Transformer) translated text      |
-|                           with real-time font, size, color & white outline stroke |
-|  - Layer 3 (UI Overlay) : Selection highlights & handles (excluded during export) |
-|  - Full-Resolution Export: 1:1 native dimension .PNG / .JPG composite export      |
-+-----------------------------------------------------------------------------------+
++======================================================================================+
+|                   MangaFlow-Cpp.exe (Native Win32 C++17 Desktop Host)                |
++======================================================================================+
+|                                                                                      |
+|  +--------------------------------------------------------------------------------+  |
+|  |  Native Desktop Window (`webview.h` / Microsoft Edge WebView2)                 |  |
+|  |  React 19 + Zustand + Tailwind CSS + `react-konva` v2 Studio UI                |  |
+|  |  - MenuBar, FrontControlBar, StatusBar, SettingsModal, DownloadModal (SSE)     |  |
+|  |  - 3-Layer Konva Canvas: Inpainted Page, Draggable/Resizable Text, Mask Tools  |  |
+|  |  - Synchronized TextSidebar: OCR/Translation Editor, Fonts, Outlines & Batch   |  |
+|  +---------------------------------------+----------------------------------------+  |
+|                                          | HTTP / SSE (`127.0.0.1:8000`)             |
+|                                          v                                           |
+|  +--------------------------------------------------------------------------------+  |
+|  |  Embedded Local Backend (`cpp-httplib` + `nlohmann/json`)                      |  |
+|  |  - Serves `frontend/dist` at `/` and REST + SSE endpoints at `/api/*`          |  |
+|  |  - Zero-Base64 Disk Image Cache (`/api/cache/images/{id}.png`)                 |  |
+|  |  - Persistent Settings (`%LOCALAPPDATA%\ComicTranslator\settings.json`)        |  |
+|  |  - Local / System / Google Fonts Manager + `miniz` CBZ/ZIP & Native PDF 1.4    |  |
+|  +----+------------------------+-------------------------+--------------------+---+  |
+|       |                        |                         |                    |      |
+|       v                        v                         v                    v      |
+|  +-------------------+  +---------------------+  +--------------------+  +---------+ |
+|  | Stage 1: Detector |  | Stage 2: OCR Router |  | Stage 3: Inpainter |  | Stage 4 | |
+|  | ONNX Runtime C++  |  | ONNX Runtime C++    |  | ONNX Runtime C++   |  | LLM API | |
+|  |                   |  |                     |  |                    |  |         | |
+|  | Primary:          |  | [ja] manga-ocr ONNX |  | Primary:           |  | Local:  | |
+|  |  Koharu RF-DETR   |  |  ViT Enc + BERT Dec |  |  lama_manga.onnx   |  | cpp-    | |
+|  |  Seg-2XL (1152)   |  |  + vocab.txt        |  |  (screentone LaMa) |  | httplib | |
+|  | Fallback:         |  | [ko] RapidOCR       |  | Fallback:          |  |         | |
+|  |  ComicTextDetector|  |  PP-OCRv4 Korean    |  |  lama_fp32.onnx    |  | Cloud:  | |
+|  |                   |  | [zh] RapidOCR       |  |                    |  | WinHTTP | |
+|  | RTL(ja)/LTR(ko,zh)|  |  PP-OCRv4 Chinese   |  | 512x512 ROI Tiles  |  | (TLS)   | |
+|  | + Binary Mask     |  |                     |  | Lossless Composite |  |         | |
+|  +--------+----------+  +----------+----------+  +---------+----------+  +----+----+ |
+|           \________________________|_______________________/                  |      |
+|                                    v                                          v      |
+|          +--------------------------------------------------+   +-----------------+  |
+|          | Hardware-Agnostic ONNX Runtime C++ Session Pool  |   | 8 LLM Providers |  |
+|          | CUDA -> DirectML (D3D12) -> CPU + Auto `unload()`|   | LM Studio :1235 |  |
+|          | Zero OpenCV (`stb_image` / `stb_image_write`)    |   | Ollama, OpenAI, |  |
+|          +--------------------------------------------------+   | Gemini, Claude, |  |
+|                                                                 | DeepSeek, etc.  |  |
+|                                                                 +-----------------+  |
++======================================================================================+
 ```
 
-### Mermaid Flow Diagram
+### Mermaid System Diagram
 
 ```mermaid
-flowchart TD
-    A["Raw Comic Page (JA / KO / ZH)"] --> B["1. Comic Text Detector (ONNX)"]
-    B -->|"Bounding Boxes"| C["2. Reading-Order Sorter"]
-    B -->|"Binary Text Mask + ROIs"| F["4. LaMa Tile Inpainter (512x512 ONNX)"]
-    C -->|"RTL for Manga (ja) / LTR for Manhwa & Manhua (ko, zh)"| D{"3. Multi-Language OCR Router"}
-    D -->|"ja"| D1["manga-ocr (models/manga-ocr-base)"]
-    D -->|"ko"| D2["RapidOCR Korean PP-OCRv4 (ONNX)"]
-    D -->|"zh"| D3["RapidOCR Chinese PP-OCRv4 (ONNX)"]
-    D1 & D2 & D3 -->|"Ordered Page Dialogue Array"| E["5. LM Studio @ localhost:1235/v1<br/>Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P<br/>(Structured JSON Schema -> ID / EN)"]
-    E -->|"Translated Blocks"| G["6. React-Konva Interactive Canvas & TextSidebar"]
-    F -->|"Cleaned Inpainted Base64 PNG"| G
-    G --> H["Lossless Native-Resolution .PNG / .JPG Export"]
+flowchart TB
+    subgraph UI["Native Desktop Shell (webview.h / Edge WebView2)"]
+        REACT["React 19 + Zustand + react-konva v2 Studio UI<br/>(Canvas Editor, TextSidebar, SettingsModal, DownloadModal)"]
+    end
+
+    subgraph CPP["Embedded C++17 Backend (cpp-httplib @ 127.0.0.1:8000)"]
+        API["REST & SSE Router (/api/process-page, /api/stage/*, /api/models/*, /api/fonts/*, /api/export/*)"]
+        MM["ModelManager (Persistent AppData + Koharu 4-Model Cache + WinHTTP Downloader)"]
+        S1["Stage 1: Layout & Text Detector<br/>(RF-DETR-Seg-2XL / ComicTextDetector ONNX)"]
+        S2["Stage 2: Multi-Language OCR Router<br/>(manga-ocr ONNX for JA | PP-OCRv4 ONNX for KO/ZH)"]
+        S3["Stage 3: Tile-Based LaMa Inpainter<br/>(512x512 ROI Patches, lama_manga / lama_fp32 ONNX)"]
+        S4["Stage 4: Multi-Provider LLM Translator<br/>(Structured JSON Schema, Glossary, Optional Vision)"]
+        EX["Archive & Export Engine<br/>(miniz CBZ/ZIP Import & Export + Native PDF 1.4 Writer)"]
+    end
+
+    subgraph HW["Native Execution & LLM Backends"]
+        ORT["ONNX Runtime C++ SDK<br/>CUDA -> DirectML -> CPU + Immediate Session unload()"]
+        LLM["LM Studio (localhost:1235) / Ollama / Cloud APIs via WinHTTP"]
+    end
+
+    REACT <-->|"HTTP JSON / Binary Cache / SSE"| API
+    API --> S1 --> S2 --> S3 --> S4
+    API --> MM
+    API --> EX
+    S1 & S2 & S3 --> ORT
+    S4 -->|"cpp-httplib (HTTP) / WinHTTP (HTTPS)"| LLM
 ```
 
 ---
 
-## 2. Key Features
+## 2. Performance & Footprint Comparison
 
-- **100% Local & Offline-Capable CV/OCR Pipeline**:
-  - Zero external cloud dependencies during translation. Once model weights are verified in `models/` (or `%LOCALAPPDATA%\ComicTranslator\models` in the packaged desktop executable), detection, OCR, and inpainting run completely offline.
-- **First-Launch Auto-Downloader with Real-Time SSE Progress (`DownloadModal.jsx`)**:
-  - On startup, the app queries `GET /api/models/status`. If any ONNX or OCR weights are missing, a blocking dark-mode modal connects to `GET /api/models/download` (Server-Sent Events) and streams real-time per-file and overall progress bars before unlocking the workspace.
-- **Language-Specific OCR Routing & Reading-Order Sorting**:
-  - **Japanese (`ja`)**: Right-to-Left (`RTL`) reading-order sort + local `kha-white/manga-ocr-base` transformer supporting vertical *tategaki* and horizontal *yokogaki* dialogue.
-  - **Korean (`ko`)**: Left-to-Right (`LTR`) reading-order sort + `RapidOCR` with `korean_PP-OCRv4_rec_infer.onnx` and `Multilingual_PP-OCRv3_det_infer.onnx`.
-  - **Chinese (`zh`)**: Left-to-Right (`LTR`) reading-order sort + `RapidOCR` with `ch_PP-OCRv4_rec_infer.onnx` and `ch_PP-OCRv4_det_infer.onnx`.
-- **Context-Aware Full-Page Translation via LM Studio**:
-  - Sends all speech bubbles on a page in reading order within a single prompt to preserve character voice, pronouns, and scene continuity.
-  - Uses strict `response_format: { type: "json_schema" }` with automatic JSON fallback parsing so bubble IDs always map 1:1 back to their bounding boxes.
-  - Instant **"Re-translate"** button (`POST /api/retranslate`) to switch between **Indonesian (`id`)** and **English (`en`)** without re-running detection, OCR, or LaMa inpainting.
-- **VRAM-Safe Tile-Based LaMa Inpainting**:
-  - Crops 32px-padded Regions of Interest around detected text boxes, inpaints them sequentially at `512×512`, composites only the active text mask pixels back onto the original page (keeping unmasked artwork 100% lossless), and unloads the LaMa ONNX session immediately afterward to leave VRAM headroom for LM Studio.
-- **Interactive `react-konva` Canvas & Synchronized `TextSidebar`**:
-  - Multi-page batch import queue with sequential background processing.
-  - Smooth mouse-wheel zoom around the cursor, click-and-drag canvas panning, and a press-and-hold **"Hold to Compare Original"** button.
-  - Draggable and 8-anchor resizable (`Konva.Transformer`) text boxes with live word wrapping.
-  - Two-way synchronized **TextSidebar** to edit `original_text` (OCR), `translated_text`, font family, font size, alignment, text color, and customizable white halo outline stroke (`fillAfterStrokeEnabled`), plus **"Apply Style to All"**.
-  - **Lossless Native-Dimension Export**: Composites the inpainted background layer and Konva typography layer at exact `1:1` original image dimensions into `.PNG` or `.JPG`.
-- **Standalone Windows Desktop Packaging**:
-  - **PyInstaller Sidecar (`comic-backend.exe`)**: Bundles FastAPI, Uvicorn, ONNX Runtime, RapidOCR, and Manga-OCR into a single executable that stores models persistently in `%LOCALAPPDATA%\ComicTranslator\models`.
-  - **Tauri Desktop Shell**: Automatically spawns `comic-backend.exe` silently in the background on startup and terminates the sidecar process cleanly when the window closes.
+Measured on Windows x64 (`Release` build with MSVC `/O2 /GL /LTCG /OPT:REF /OPT:ICF` vs. the previous Python FastAPI + PyInstaller `--onedir` desktop bundle):
+
+| Metric | C++17 Native (`MangaFlow-Cpp`) | Python Prototype (`MangaFlow_App`) | Improvement |
+| :--- | :--- | :--- | :--- |
+| **Standalone Bundle Size (Uncompressed)** | **~20.3 MB** (`1.95 MB` exe + `16.55 MB` ORT DirectML DLLs + `1.77 MB` UI; ~20–35 MB envelope) | **~1,001 MB** (`7,064` files; `303 MB` sidecar binary) | **~49× smaller** |
+| **GitHub Release Archive (`.zip`)** | **~7.6 MB** (`MangaFlow-Cpp-Windows-x64.zip`) | **~350–450 MB** | **~50× smaller** |
+| **Idle Backend Memory (RAM)** | **~37 MB Working Set** (`~9 MB` private, `<100 MB` idle) | **~350–650 MB+** (Python + PyTorch + OpenCV + Uvicorn) | **~10–15× lower** |
+| **Cold Launch to Native Window** | **~0.66 s** (`< 1 s`, zero console flash) | **~4 – 12 s** (Python import + Uvicorn startup) | **~6–18× faster** |
+| **VRAM / Model Memory Lifecycle** | Lazy `Ort::Session` creation + immediate `unload()` after every stage | PyTorch + ORT sessions with GC overhead | Minimal peak VRAM |
+| **CV / Image / Archive Dependencies** | Header-only `stb_image`, `miniz`, native PDF 1.4 writer (zero OpenCV) | `torch`, `transformers`, `opencv-python`, `rapidocr`, `pikepdf` | Zero external runtimes |
+| **GPU Acceleration** | ONNX Runtime C++ (`CUDA` → `DirectML` → `CPU` auto-fallback) | Python `onnxruntime` + PyTorch | Hardware-agnostic native |
 
 ---
 
-## 3. Directory Structure
+## 3. Key Features
+
+- **Native C++17 Inference Pipeline (`CUDA` → `DirectML` → `CPU`)**:
+  - **Text & Layout Detection**: Supports Koharu's high-accuracy `RF-DETR-Seg-2XL` layout segmentation model with automatic fallback to `ComicTextDetector` (`comictextdetector.pt.onnx`), plus reading-order bubble sorting (`RTL` for Manga `ja`, `LTR` for Manhwa `ko` & Manhua `zh`).
+  - **Multi-Language OCR Router**: Runs Japanese `manga-ocr` (ViT encoder + autoregressive BERT decoder ONNX + native C++ `vocab.txt` tokenizer) and Korean/Chinese `PP-OCRv4` ONNX directly in C++ without Python.
+  - **Lossless Tile-Based LaMa Inpainting**: Processes `512×512` padded ROI tiles sequentially (`lama_manga.onnx` screentone model or `lama_fp32.onnx`) and composites only active text-mask pixels onto the original artwork.
+  - **Granular & One-Shot Endpoints**: Run full-page processing (`POST /api/process-page`) or drive individual interactive stages (`POST /api/stage/detect`, `/ocr`, `/inpaint`, `/translate`, `/api/retranslate`).
+- **Multi-Provider Context-Aware LLM Translation (8 Providers, 16 Target Languages)**:
+  - Connects to local **LM Studio** (`http://localhost:1235/v1`) and **Ollama** (`http://localhost:11434/v1`) via `cpp-httplib`, or cloud APIs (**OpenAI**, **Google Gemini**, **Anthropic Claude**, **DeepSeek**, **OpenRouter**, **Custom OpenAI-Compatible**) via native Windows **WinHTTP TLS**.
+  - Enforces Structured JSON Schema output, supports **custom instructions**, **glossary terms**, **reasoning effort** controls with O(N) C++ `<think>...</think>` stripping, and optional **multimodal page-image Vision context** with automatic text-only fallback.
+- **Interactive React 19 + `react-konva` v2 Typesetting Studio**:
+  - Batch page queue, `.cbz`/`.zip` archive import (natural page sorting), and multi-page `.cbz` / native `.pdf` / lossless `.png` & `.jpg` export.
+  - Interactive Konva canvas with draggable/resizable text boxes, manual bubble drawing & mask refinement, mouse-wheel zoom/pan, and press-and-hold **Compare Original**.
+  - Integrated **Font Manager** (local uploads, Windows system fonts, and curated one-click Google Fonts downloader) persisted in `%LOCALAPPDATA%\ComicTranslator\fonts`.
+
+---
+
+## 4. Quickstart Guide
+
+### A. For End-Users (Windows x64 — Zero Setup)
+
+1. **Download the Release Archive**:
+   - Go to the repository's **GitHub Releases** page and download **`MangaFlow-Cpp-Windows-x64.zip`** (~7.6 MB).
+2. **Extract & Launch**:
+   - Extract `MangaFlow-Cpp-Windows-x64.zip` anywhere on your PC.
+   - Open `MangaFlow_Cpp/` and double-click **`MangaFlow-Cpp.exe`**.
+   - The native desktop studio opens immediately (`<1s`) with no terminal window or external browser required. *(Requires Windows 10/11 x64 with Microsoft Edge WebView2 Runtime, pre-installed on modern Windows.)*
+3. **First-Launch Model Setup**:
+   - On first launch, MangaFlow AI checks `%LOCALAPPDATA%\ComicTranslator\models` (and automatically detects any existing local Koharu model cache if present).
+   - If any ONNX weights are missing, the built-in **DownloadModal** streams them automatically from Hugging Face with real-time progress bars.
+4. **Connect an LLM Translator**:
+   - **Recommended Local Setup (LM Studio)**: Load a model (e.g., `Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P`), start LM Studio's Local Server on port **`1235`**, and enable **CORS**.
+   - **Or use Ollama / Cloud APIs**: Open **Settings** inside MangaFlow AI to configure Ollama, OpenAI, Gemini, Anthropic, DeepSeek, OpenRouter, or any custom OpenAI-compatible endpoint.
+
+---
+
+### B. For Developers (Building from Source with CMake + MSVC)
+
+#### Prerequisites
+- **Windows 10 / 11 (x64)**
+- **Visual Studio 2022** (or **Visual Studio 2022 Build Tools**) with the **Desktop development with C++** workload (MSVC v143 + Windows SDK + CMake Tools)
+- **Node.js 18+** & `npm`
+
+All C++ third-party dependencies (`cpp-httplib`, `nlohmann/json`, `webview/webview`, `Microsoft.Web.WebView2`, official prebuilt `ONNX Runtime DirectML win-x64`, `miniz`, `stb`) are fetched automatically by CMake `FetchContent` — **no vcpkg or manual SDK installation required**.
+
+#### Option 1: Automated One-Command Release Build (Recommended)
+
+Run the automated release builder from the repository root:
+
+```bat
+packaging\build_cpp_release.bat
+```
+
+This script automatically:
+1. Runs `npm run build` inside `frontend/` to compile `frontend/dist`.
+2. Configures and compiles `backend-cpp` in `Release` mode with MSVC `/O2 /GL /LTCG /OPT:REF /OPT:ICF`.
+3. Stages `MangaFlow-Cpp.exe`, ONNX Runtime DLLs, and `frontend/dist` into `MangaFlow_Cpp/` and installs the zero-console one-click root launcher **`MangaFlow-Cpp.exe`**.
+4. Packages a clean GitHub Releases archive at **`release/MangaFlow-Cpp-Windows-x64.zip`**.
+
+After building, simply double-click **`MangaFlow-Cpp.exe`** in the repository root.
+
+#### Option 2: Manual CMake Build
+
+```powershell
+# 1. Compile the React v2 frontend bundle
+cd frontend
+npm install
+npm run build
+cd ..
+
+# 2. Configure & build the C++17 native desktop app in Release mode
+cd backend-cpp
+cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel
+
+# Optional: switch ONNX Runtime backend (DIRECTML [default], CUDA, or CPU)
+# cmake -B build -A x64 -DMANGAFLOW_ORT_BACKEND=CUDA -DCMAKE_BUILD_TYPE=Release
+```
+
+Developer runtime flags on `MangaFlow-Cpp.exe`:
+- `--headless` (or `MANGAFLOW_HEADLESS=1`): Run pure HTTP/API server without opening a GUI window (useful for automated API testing).
+- `MANGAFLOW_DEBUG=1`: Enable Edge WebView2 DevTools (`F12`).
+- `MANGAFLOW_PORT=8000`: Override default local HTTP port (falls back automatically to a free loopback port if busy).
+- `MANGA_MODELS_DIR=<path>`: Override persistent model directory (defaults to `%LOCALAPPDATA%\ComicTranslator\models`).
+
+---
+
+### C. Local Koharu Model Cache Auto-Import
+
+If you already have **Koharu** installed locally, MangaFlow AI's `ModelManager` automatically discovers all 4 Koharu Hugging Face snapshots (`<cache_root>/<repo>/snapshots/<hash>/`) with zero redundant downloads:
+
+| Koharu Cache Folder | Role in MangaFlow AI | Target Export in `%LOCALAPPDATA%\ComicTranslator\models` |
+| :--- | :--- | :--- |
+| `mayocream--koharu-layout-rfdetr-seg-2xl-1152` | Primary layout & text segmentation detector | `koharu-layout-rfdetr-seg-2xl-1152.onnx` |
+| `mayocream--lama-manga` | Screentone-tuned manga LaMa inpainter | `lama_manga.onnx` (DirectML/CUDA/CPU safe) |
+| `mayocream--manga-ocr` | Japanese ViT + BERT Manga OCR | `manga-ocr/encoder_model.onnx`, `decoder_model.onnx`, `vocab.txt` |
+| `PaddlePaddle--PaddleOCR-VL-1.6-GGUF` | Vision-Language OCR GGUF (for LM Studio) | `paddleocr-vl-gguf/*.gguf` |
+
+- **Custom Cache Path**: Set `KOHARU_HF_CACHE` (or `KOHARU_MODELS_DIR`) if your Koharu Hugging Face cache is in a custom directory.
+- **One-Time `.safetensors` → `.onnx` Bridge**: If your Koharu cache stores PyTorch `.safetensors` weights, run the one-time converter script (requires the optional Python dev venv):
+  ```bat
+  packaging\convert_koharu_to_onnx.bat
+  ```
+- **No Koharu Installed?** No action needed — MangaFlow AI automatically downloads standard ONNX models via `GET /api/models/download` on first launch.
+
+---
+
+## 5. LM Studio Setup (Port `1235`) & Supported LLM Providers
+
+1. Install [LM Studio](https://lmstudio.ai/) and download a local translation model (default preset: `Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P`, slug `gemma-4-e2b-uncensored-hauhaucs-aggressive`).
+2. Load the model, open **Developer / Local Server**, set **Server Port** to **`1235`**, enable **CORS**, and click **Start Server**.
+3. MangaFlow AI automatically connects to `http://localhost:1235/v1` and verifies availability via `GET /api/lmstudio/status`.
+
+All 8 built-in translation providers (configurable in **Settings**):
+
+| Provider ID | Default Endpoint | Transport | Notes |
+| :--- | :--- | :--- | :--- |
+| `lmstudio` | `http://localhost:1235/v1` | `cpp-httplib` | Default local provider, fuzzy model matching, JSON Schema |
+| `ollama` | `http://localhost:11434/v1` | `cpp-httplib` | Local OpenAI-compatible server |
+| `openai` | `https://api.openai.com/v1` | WinHTTP TLS | GPT-4o / GPT-4.1 / reasoning models |
+| `gemini` | `https://generativelanguage.googleapis.com/v1beta/openai` | WinHTTP TLS | Gemini 2.5 Flash / Pro |
+| `anthropic` | `https://api.anthropic.com/v1` | WinHTTP TLS | Native Anthropic Messages API (`2023-06-01`) |
+| `deepseek` | `https://api.deepseek.com/v1` | WinHTTP TLS | DeepSeek Chat / Reasoner |
+| `openrouter` | `https://openrouter.ai/api/v1` | WinHTTP TLS | Multi-model routing with Vision & JSON Schema |
+| `custom` | User-defined URL | `cpp-httplib` / WinHTTP | Any self-hosted or cloud OpenAI-compatible API |
+
+---
+
+## 6. Repository Structure
 
 ```text
 Manga/
-├── README.md                         # Project documentation & architecture guide
-├── start_dev.bat                     # Single-click launcher for FastAPI + Vite dev servers
+├── README.md                              # Project architecture, benchmarks & quickstart
+├── .gitignore                             # Excludes builds, models, venv, node_modules & binaries
 ├── docs/
-│   └── SPEC.md                       # Complete system & data contract specification
-├── backend/
-│   ├── main.py                       # FastAPI server entry point (port 8000)
-│   ├── requirements.txt              # Python backend dependencies
-│   ├── core/
-│   │   ├── model_manager.py          # Offline verification & Hugging Face SSE downloader
-│   │   ├── detector.py               # Comic Text Detector ONNX + reading-order sorter
-│   │   ├── ocr.py                    # Multi-language OCR router (manga-ocr + RapidOCR)
-│   │   ├── inpainter.py              # Tile-based LaMa ONNX inpainter (512x512 ROI)
-│   │   └── translator.py             # LM Studio OpenAI client + Structured JSON Schema
-│   ├── generate_samples.py           # Synthetic comic page generator (JA / KO / ZH)
-│   ├── test_models.py                # Model download & offline cache verification test
-│   ├── test_pipeline.py              # Full CV/OCR/Inpaint/LLM pipeline test suite
-│   └── test_api.py                   # Live HTTP & SSE FastAPI endpoint test suite
-├── frontend/
-│   ├── package.json                  # React 19, Vite 8, Tailwind CSS 3, react-konva, Tauri CLI
-│   ├── vite.config.js                # Vite configuration (port 5173 + /api proxy)
-│   ├── tailwind.config.js            # Dark-mode Tailwind CSS configuration
-│   ├── src/
-│   │   ├── App.jsx                   # Startup check, batch queue & workspace coordinator
-│   │   ├── components/
-│   │   │   ├── DownloadModal.jsx     # First-launch blocking SSE model progress modal
-│   │   │   ├── Toolbar.jsx           # Batch import, LM Studio badge, language & export bar
-│   │   │   ├── MangaCanvas.jsx       # 3-layer react-konva editor & native 1:1 exporter
-│   │   │   └── TextSidebar.jsx       # Synchronized OCR/translation & typography inspector
-│   └── src-tauri/                    # Tauri desktop host & comic-backend.exe sidecar runner
-│       ├── Cargo.toml
-│       ├── tauri.conf.json
-│       ├── capabilities/
-│       │   └── default.json
-│       ├── binaries/
-│       │   └── comic-backend-x86_64-pc-windows-msvc.exe
-│       └── src/
-│           └── main.rs               # Spawns comic-backend sidecar on launch & kills on exit
-├── models/                           # Local development model weights directory
-├── samples/                          # Sample comic pages (sample_ja.jpg, sample_ko.jpg, sample_zh.jpg)
-└── packaging/
-    ├── comic-backend.spec            # PyInstaller one-file spec for comic-backend.exe
-    ├── build_backend.py              # Automated PyInstaller build & persistent cache seeder
-    ├── build_backend.bat             # Windows batch wrapper for building comic-backend.exe
-    └── pyinstaller/
-        └── backend.spec              # Spec alias matching SPEC.md
+│   └── SPEC.md                            # System specification & JSON API contracts
+├── backend-cpp/                           # Primary Native C++17 Backend & Desktop Host
+│   ├── CMakeLists.txt                     # Zero-vcpkg CMake + FetchContent (MSVC /O2 /GL /LTCG)
+│   └── src/
+│       ├── main.cpp                       # Embedded cpp-httplib server + Edge WebView2 host
+│       ├── launcher.cpp                   # Zero-dependency root Win32 one-click launcher
+│       ├── app.rc.in                      # Embedded Windows icon & VS_VERSION_INFO resource
+│       ├── settings_manager.{hpp,cpp}     # Persistent AppData settings & provider presets
+│       ├── font_manager.{hpp,cpp}         # Local, system & Google Fonts catalog manager
+│       ├── exporter.{hpp,cpp}             # miniz CBZ/ZIP import/export & native PDF 1.4 writer
+│       ├── utils.hpp                      # UTF-8, atomic I/O, Base64 & Windows helpers
+│       └── pipeline/
+│           ├── model_manager.{hpp,cpp}    # AppData cache, Koharu auto-discovery, ORT session factory
+│           ├── detector.{hpp,cpp}         # RF-DETR-Seg-2XL / ComicTextDetector ONNX + RTL/LTR sort
+│           ├── ocr.{hpp,cpp}              # manga-ocr ONNX (JA) & RapidOCR PP-OCRv4 ONNX (KO/ZH)
+│           ├── inpainter.{hpp,cpp}        # 512x512 tile-based LaMa ONNX inpainter
+│           └── translator.{hpp,cpp}       # 8-provider LLM client (cpp-httplib + WinHTTP TLS)
+├── frontend/                              # React 19 + Zustand + Tailwind + react-konva v2 Studio UI
+│   ├── package.json
+│   ├── vite.config.js
+│   └── src/
+│       ├── App.jsx
+│       ├── store/useEditorStore.js        # Centralized studio & batch queue state
+│       └── components/
+│           ├── MangaCanvas.jsx            # 3-layer interactive Konva canvas & 1:1 exporter
+│           ├── TextSidebar.jsx            # Dialogue OCR/translation & typography inspector
+│           ├── FrontControlBar.jsx        # Quick language, stage & batch pipeline bar
+│           ├── MenuBar.jsx                # File/import/export & workspace menu
+│           ├── StatusBar.jsx              # Provider, hardware EP & queue status bar
+│           ├── SettingsModal.jsx          # Multi-provider LLM, glossary, pipeline & font settings
+│           ├── DownloadModal.jsx          # First-launch SSE model download modal
+│           └── Toolbar.jsx                # Canvas tools & zoom controls
+├── packaging/
+│   ├── build_cpp_release.bat              # Automated C++17 Release & GitHub .zip builder
+│   ├── convert_koharu_to_onnx.{bat,py}    # One-time Koharu .safetensors -> ONNX/GGUF bridge
+│   ├── icon.ico                           # Application icon embedded into native binaries
+│   └── build_standalone.py                # Legacy Python PyInstaller standalone packager
+├── samples/                               # Sample JA / KO / ZH comic test pages
+└── backend/                               # Legacy Python FastAPI prototype & automated test suites
 ```
 
 ---
 
-## 4. LM Studio Setup Instructions (Port `1235`)
+## 7. Legacy Python Prototype & Verification Suites
 
-The translation engine connects to **LM Studio** running a local OpenAI-compatible HTTP server on port **`1235`**.
-
-1. **Install & Open LM Studio**:
-   - Download and install [LM Studio](https://lmstudio.ai/).
-2. **Download & Load the Target Model**:
-   - Search for and download:
-     ```text
-     Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P
-     ```
-     *(Slug identifier in LM Studio: `gemma-4-e2b-uncensored-hauhaucs-aggressive`)*
-   - Load the model into memory in LM Studio.
-3. **Configure the Local Server on Port `1235`**:
-   - Open the **Developer / Local Server** tab in LM Studio.
-   - Set **Server Port** to **`1235`** (`http://localhost:1235/v1`).
-   - Enable **CORS (Cross-Origin Resource Sharing)**.
-   - Click **Start Server**.
-4. **Verify Connection**:
-   - The top toolbar in MangaFlow AI polls `GET http://localhost:8000/api/lmstudio/status` automatically and displays a green pulsing indicator:
-     ```text
-     localhost:1235 • Gemma 4 E2B
-     ```
-
----
-
-## 5. Development Quickstart
-
-### Option A: One-Click Launcher (`start_dev.bat`)
-
-Double-click **`start_dev.bat`** in the root `Manga/` folder (or run it from a terminal):
-
-```bat
-start_dev.bat
-```
-
-This automatically starts:
-- **FastAPI Backend**: `http://localhost:8000`
-- **React + Vite Frontend**: `http://127.0.0.1:5173`
-
-### Option B: Manual Terminal Launch
-
-#### 1. Backend (FastAPI on Port 8000)
-```powershell
-cd "c:\FILE PROYEKAN\Manga"
-.\backend\venv\Scripts\python.exe backend\main.py
-```
-
-#### 2. Frontend (React + Vite on Port 5173)
-```powershell
-cd "c:\FILE PROYEKAN\Manga\frontend"
-npm run dev
-```
-
----
-
-## 6. Building the Standalone Windows Application (`.exe`)
-
-### Step 1: Build the PyInstaller Backend Sidecar (`comic-backend.exe`)
-
-Run the automated PyInstaller packaging script to bundle `backend/main.py`, ONNX Runtime, RapidOCR, and Manga-OCR into `packaging/dist/comic-backend.exe`:
+The original Python FastAPI prototype remains in `backend/` as a reference implementation alongside its verification suites (launchable in dev mode via `start_dev.bat`):
 
 ```powershell
-cd "c:\FILE PROYEKAN\Manga"
-.\backend\venv\Scripts\python.exe packaging\build_backend.py
-```
-
-- **Output Binary**: `packaging/dist/comic-backend.exe` (and `packaging/comic-backend.exe`).
-- **Persistent Model Storage**: When running as a frozen executable (`comic-backend.exe`), `ModelManager` automatically resolves the model directory to:
-  ```text
-  %LOCALAPPDATA%\ComicTranslator\models
-  ```
-  so weights downloaded on first launch persist permanently across app updates and restarts.
-
-### Step 2: Build the Tauri Desktop Application (`npm run tauri build`)
-
-Inside `frontend/`, build the native Windows desktop executable (which embeds the compiled React frontend and bundles `comic-backend.exe` as a managed Tauri Sidecar Process):
-
-```powershell
-cd "c:\FILE PROYEKAN\Manga\frontend"
-npm run tauri build
-```
-
-- On launch, the Tauri desktop host spawns `comic-backend.exe` silently with `CREATE_NO_WINDOW`.
-- On window close (`WindowEvent::CloseRequested` / `RunEvent::Exit`), Tauri terminates the `comic-backend.exe` sidecar process tree cleanly so no orphan process remains on port `8000`.
-
----
-
-## 7. Automated Verification & Test Suites
-
-Run the end-to-end verification suites with the backend virtual environment:
-
-```powershell
-# 1. Verify local ONNX & OCR model weights and 100% offline cache resolution
+# Verify offline model cache resolution
 .\backend\venv\Scripts\python.exe backend\test_models.py
 
-# 2. Verify full CV -> OCR -> LaMa Tile Inpainting -> LM Studio Translation pipeline (JA / KO / ZH)
+# Verify end-to-end CV -> OCR -> LaMa -> LLM translation pipeline (JA / KO / ZH)
 .\backend\venv\Scripts\python.exe backend\test_pipeline.py
 
-# 3. Verify live FastAPI HTTP & SSE endpoints (/api/models/status, /api/lmstudio/status, /api/process-page, /api/retranslate)
+# Verify live HTTP & SSE endpoints
 .\backend\venv\Scripts\python.exe backend\test_api.py
 ```

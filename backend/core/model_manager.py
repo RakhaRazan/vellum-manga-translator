@@ -10,17 +10,19 @@ Once downloaded, all status checks and path resolutions run 100% offline with ze
 """
 
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import sys
-from typing import Literal, NotRequired, TypedDict
+from typing import Literal, NotRequired, Protocol, TypedDict, cast
 
 import onnxruntime as ort  # pyright: ignore[reportMissingTypeStubs]
 import requests
 from huggingface_hub import hf_hub_url
-from huggingface_hub.utils import build_hf_headers  # pyright: ignore[reportUnknownVariableType]
+from huggingface_hub.utils._headers import (
+    build_hf_headers,  # pyright: ignore[reportUnknownVariableType]
+)
 
 
 DownloadStatus = Literal[
@@ -260,14 +262,135 @@ def get_default_models_dir() -> Path:
     return workspace_root / "models"
 
 
-def get_execution_provider() -> str:
+GPU_EXECUTION_PROVIDERS: tuple[str, ...] = (
+    "CUDAExecutionProvider",
+    "DmlExecutionProvider",
+)
+
+
+def get_available_execution_providers() -> list[str]:
+    """Return all ONNX Runtime execution providers registered in the current environment."""
+    try:
+        providers: list[str] = list(
+            ort.get_available_providers()  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+        )
+        return providers if providers else ["CPUExecutionProvider"]
+    except Exception:
+        return ["CPUExecutionProvider"]
+
+
+def get_preferred_execution_providers(force_cpu: bool = False) -> list[str]:
+    """Return prioritized ONNX Runtime execution providers (`CUDA` -> `DirectML` -> `CPU`).
+
+    Auto-detects GPU acceleration (`CUDAExecutionProvider` or `DmlExecutionProvider`
+    via `onnxruntime-directml` when installed) and always ends with `CPUExecutionProvider`
+    as a safe fallback.
+    """
+    if force_cpu or os.environ.get("MANGA_FORCE_CPU") == "1":
+        return ["CPUExecutionProvider"]
+
+    available = get_available_execution_providers()
+    ordered: list[str] = []
+    for gpu_provider in GPU_EXECUTION_PROVIDERS:
+        if gpu_provider in available:
+            ordered.append(gpu_provider)
+    ordered.append("CPUExecutionProvider")
+    return ordered
+
+
+def get_execution_provider(force_cpu: bool = False) -> str:
     """Return the primary ONNX Runtime execution provider available on this machine."""
-    available: list[str] = list(
-        ort.get_available_providers()  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+    return get_preferred_execution_providers(force_cpu=force_cpu)[0]
+
+
+class _OrtSessionOptions(Protocol):
+    """Typed protocol for `onnxruntime.SessionOptions` (pybind11 extension without stubs)."""
+
+    graph_optimization_level: object
+    enable_mem_pattern: bool
+    execution_mode: object
+
+
+class _OrtSessionOptionsFactory(Protocol):
+    """Constructor protocol for `onnxruntime.SessionOptions`."""
+
+    def __call__(self) -> _OrtSessionOptions: ...
+
+
+class _OrtInferenceSessionFactory(Protocol):
+    """Constructor protocol for `onnxruntime.InferenceSession`."""
+
+    def __call__(
+        self,
+        path_or_bytes: str,
+        sess_options: _OrtSessionOptions | None = None,
+        providers: Sequence[str] | None = None,
+    ) -> ort.InferenceSession: ...
+
+
+def _build_session_options(use_dml: bool = False) -> _OrtSessionOptions:
+    """Create ONNX Runtime SessionOptions tuned for RAM efficiency and DirectML compatibility."""
+    session_options_cls = cast(
+        _OrtSessionOptionsFactory,
+        getattr(ort, "SessionOptions"),
     )
-    if "CUDAExecutionProvider" in available:
-        return "CUDAExecutionProvider"
-    return "CPUExecutionProvider"
+    sess_options = session_options_cls()
+
+    opt_level_enum = cast(object, getattr(ort, "GraphOptimizationLevel"))
+    sess_options.graph_optimization_level = cast(
+        object,
+        getattr(opt_level_enum, "ORT_ENABLE_ALL"),
+    )
+
+    if use_dml:
+        # DirectML EP requires sequential execution and mem pattern disabled for stability
+        sess_options.enable_mem_pattern = False
+        exec_mode_enum = cast(object, getattr(ort, "ExecutionMode"))
+        sess_options.execution_mode = cast(
+            object,
+            getattr(exec_mode_enum, "ORT_SEQUENTIAL"),
+        )
+
+    return sess_options
+
+
+def create_onnx_session(
+    model_path: Path | str,
+    force_cpu: bool = False,
+) -> tuple[ort.InferenceSession, str]:
+    """Create an ONNX Runtime `InferenceSession` with automatic CUDA/DirectML -> CPU fallback.
+
+    Returns `(session, active_provider)` where `active_provider` reflects the actual primary
+    execution provider initialized on the created session (`session.get_providers()[0]`).
+    """
+    path_str = str(model_path)
+    preferred = get_preferred_execution_providers(force_cpu=force_cpu)
+    use_dml = "DmlExecutionProvider" in preferred
+    session_cls = cast(
+        _OrtInferenceSessionFactory,
+        getattr(ort, "InferenceSession"),
+    )
+
+    try:
+        sess_options = _build_session_options(use_dml=use_dml)
+        session = session_cls(
+            path_str,
+            sess_options=sess_options,
+            providers=preferred,
+        )
+        active_providers: list[str] = list(session.get_providers())
+        active = active_providers[0] if active_providers else "CPUExecutionProvider"
+        return session, active
+    except Exception:
+        if preferred == ["CPUExecutionProvider"]:
+            raise
+        cpu_options = _build_session_options(use_dml=False)
+        session = session_cls(
+            path_str,
+            sess_options=cpu_options,
+            providers=["CPUExecutionProvider"],
+        )
+        return session, "CPUExecutionProvider"
 
 
 class ModelManager:
@@ -561,3 +684,24 @@ class ModelManager:
             "rec_model_path": self.resolve_path("rapidocr/ch_PP-OCRv4_rec_infer.onnx"),
             "cls_model_path": self.resolve_path("rapidocr/ch_ppocr_mobile_v2.0_cls_infer.onnx"),
         }
+
+
+__all__ = [
+    "DownloadProgressEvent",
+    "DownloadStatus",
+    "GPU_EXECUTION_PROVIDERS",
+    "MODEL_FILE_SPECS",
+    "MODEL_GROUPS_META",
+    "ModelFileSpec",
+    "ModelGroupMeta",
+    "ModelGroupStatus",
+    "ModelManager",
+    "ModelStatusResponse",
+    "RapidOcrPaths",
+    "create_onnx_session",
+    "get_available_execution_providers",
+    "get_default_models_dir",
+    "get_execution_provider",
+    "get_preferred_execution_providers",
+    "is_frozen_executable",
+]

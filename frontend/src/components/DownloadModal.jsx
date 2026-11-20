@@ -9,10 +9,11 @@ import {
   Loader2,
   RefreshCw,
   ShieldCheck,
-  Sparkles,
 } from 'lucide-react';
 
-const API_BASE_URL = 'http://localhost:8000';
+import { DEFAULT_API_BASE_URL } from '../store/useEditorStore.js';
+
+const API_BASE_URL = DEFAULT_API_BASE_URL;
 
 const MODEL_METADATA = {
   comic_text_detector: {
@@ -43,9 +44,9 @@ function formatMegabytes(bytes) {
 }
 
 /**
- * Dark-mode blocking modal overlay that connects to `/api/models/download` via SSE
+ * Blocking desktop studio modal that connects to `/api/models/download` via SSE
  * when local CV/OCR models are incomplete, streaming real-time download progress
- * before unlocking the main editor workspace.
+ * before unlocking the workspace.
  */
 export default function DownloadModal({
   isOpen,
@@ -56,9 +57,9 @@ export default function DownloadModal({
 }) {
   const [modelsState, setModelsState] = useState(initialStatus?.models || {});
   const [executionProvider, setExecutionProvider] = useState(
-    initialStatus?.execution_provider || 'Detecting...'
+    initialStatus?.execution_provider || 'Detecting…'
   );
-  const [streamStatus, setStreamStatus] = useState('idle'); // idle | connecting | downloading | completed | error
+  const [streamStatus, setStreamStatus] = useState('idle');
   const [activeModelKey, setActiveModelKey] = useState(null);
   const [activeFile, setActiveFile] = useState(null);
   const [fileIndex, setFileIndex] = useState(null);
@@ -68,7 +69,7 @@ export default function DownloadModal({
   const [downloadedBytes, setDownloadedBytes] = useState(0);
   const [totalBytes, setTotalBytes] = useState(0);
   const [statusMessage, setStatusMessage] = useState(
-    'Preparing local ONNX & OCR model verification...'
+    'Preparing local ONNX & OCR model verification…'
   );
   const [errorMessage, setErrorMessage] = useState(null);
   const [recentLogs, setRecentLogs] = useState([]);
@@ -136,8 +137,8 @@ export default function DownloadModal({
 
     setErrorMessage(null);
     setStreamStatus('connecting');
-    setStatusMessage('Connecting to /api/models/download SSE stream...');
-    appendLog('Connecting to http://localhost:8000/api/models/download ...');
+    setStatusMessage('Connecting to /api/models/download SSE stream…');
+    appendLog(`Connecting to ${apiBaseUrl}/api/models/download ...`);
 
     const sseUrl = `${apiBaseUrl}/api/models/download`;
     const es = new EventSource(sseUrl);
@@ -194,7 +195,6 @@ export default function DownloadModal({
         }
 
         if (payload.status === 'file_completed' && payload.model_key) {
-          // Optimistically refresh status in background when a file finishes
           fetch(`${apiBaseUrl}/api/models/status`)
             .then((r) => (r.ok ? r.json() : null))
             .then((data) => {
@@ -219,7 +219,6 @@ export default function DownloadModal({
     };
 
     es.onerror = () => {
-      // EventSource fires onerror if connection closes unexpectedly before completion
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
         eventSourceRef.current = null;
@@ -227,7 +226,7 @@ export default function DownloadModal({
       setStreamStatus((prev) => {
         if (prev === 'completed') return prev;
         setErrorMessage(
-          'Lost connection to backend SSE endpoint (http://localhost:8000/api/models/download). Ensure FastAPI server is running.'
+          `Lost connection to backend SSE endpoint (${apiBaseUrl}/api/models/download). Ensure FastAPI server is running.`
         );
         return 'error';
       });
@@ -243,7 +242,6 @@ export default function DownloadModal({
       return;
     }
 
-    // Automatically begin SSE download stream when modal opens and models are incomplete
     if (!initialStatus || !initialStatus.all_ready) {
       startDownloadStream();
     }
@@ -266,113 +264,117 @@ export default function DownloadModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/90 backdrop-blur-md p-4 select-none"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 select-none"
       role="dialog"
       aria-modal="true"
       aria-labelledby="download-modal-title"
     >
-      <div className="w-full max-w-2xl rounded-2xl border border-slate-800 bg-slate-900/95 shadow-2xl shadow-black/80 overflow-hidden">
-        {/* Top Accent Banner */}
-        <div className="h-1.5 w-full bg-slate-800 overflow-hidden">
+      <div className="w-full max-w-2xl rounded-studio-md border border-studio-border bg-studio-panel overflow-hidden">
+        {/* Top 2px Progress Hairline */}
+        <div className="h-0.5 w-full bg-studio-border overflow-hidden">
           <div
-            className="h-full bg-gradient-to-r from-indigo-500 via-violet-500 to-emerald-400 transition-all duration-300 ease-out"
+            className={`h-full transition-all duration-300 ease-out ${
+              streamStatus === 'error'
+                ? 'bg-studio-danger'
+                : streamStatus === 'completed'
+                ? 'bg-studio-success'
+                : 'bg-studio-accent'
+            }`}
             style={{ width: `${Math.min(100, Math.max(2, overallPercent))}%` }}
           />
         </div>
 
         {/* Header */}
-        <div className="px-6 pt-6 pb-4 border-b border-slate-800/80 flex items-start justify-between gap-4">
-          <div className="flex items-start gap-3.5">
-            <div className="mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-indigo-500/15 border border-indigo-500/30 text-indigo-400">
+        <div className="px-5 py-4 border-b border-studio-border flex items-start justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-studio border border-studio-border bg-studio-surface text-studio-accent">
               {streamStatus === 'completed' ? (
-                <ShieldCheck className="h-6 w-6 text-emerald-400" />
+                <ShieldCheck className="h-5 w-5 text-studio-success" />
               ) : streamStatus === 'error' ? (
-                <AlertCircle className="h-6 w-6 text-rose-400" />
+                <AlertCircle className="h-5 w-5 text-studio-danger" />
               ) : (
-                <Download className="h-6 w-6 animate-bounce" />
+                <Download className="h-5 w-5" />
               )}
             </div>
             <div>
-              <div className="flex items-center gap-2.5 flex-wrap">
+              <div className="flex items-center gap-2 flex-wrap">
                 <h2
                   id="download-modal-title"
-                  className="text-lg font-semibold tracking-tight text-slate-100"
+                  className="text-sm font-semibold tracking-tight text-studio-text"
                 >
                   {isAllInstalled
                     ? 'Local AI Models Ready'
                     : 'Initializing Local AI Models'}
                 </h2>
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-800/90 border border-slate-700/80 px-2.5 py-0.5 text-xs font-medium text-slate-300">
-                  <Cpu className="h-3.5 w-3.5 text-indigo-400" />
+                <span className="inline-flex items-center gap-1 rounded-studio-sm bg-studio-surface border border-studio-border px-2 py-0.5 font-mono text-[11px] text-studio-text-secondary">
+                  <Cpu className="h-3 w-3 text-studio-accent" />
                   {executionProvider}
                 </span>
               </div>
-              <p className="mt-1 text-xs text-slate-400">
-                Required ONNX & OCR weights are verified locally in{' '}
-                <code className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[11px] text-indigo-300">
+              <p className="mt-1 text-xs text-studio-text-secondary">
+                Required ONNX &amp; OCR weights are verified locally in{' '}
+                <code className="rounded-studio-sm border border-studio-border bg-studio-surface px-1 py-0.5 font-mono text-[11px] text-studio-accent">
                   models/
                 </code>{' '}
-                before unlocking the translation canvas.
+                before unlocking the studio canvas.
               </p>
             </div>
           </div>
 
           <div className="text-right shrink-0">
-            <span className="inline-flex items-center gap-1.5 rounded-lg bg-slate-800/70 border border-slate-700/60 px-2.5 py-1 text-xs font-mono text-slate-300">
-              <Database className="h-3.5 w-3.5 text-violet-400" />
+            <span className="inline-flex items-center gap-1.5 rounded-studio bg-studio-surface border border-studio-border px-2 py-1 text-[11px] font-mono text-studio-text-secondary tabular-nums">
+              <Database className="h-3.5 w-3.5 text-studio-accent" />
               {installedCount}/{modelKeys.length} Groups
             </span>
           </div>
         </div>
 
         {/* Body */}
-        <div className="p-6 space-y-5">
-          {/* Real-time Overall Progress Section */}
-          <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-4 space-y-3">
+        <div className="p-5 space-y-4">
+          {/* Overall Progress Section */}
+          <div className="rounded-studio border border-studio-border bg-studio-surface p-3.5 space-y-2.5">
             <div className="flex items-center justify-between text-xs">
-              <div className="flex items-center gap-2 font-medium text-slate-200 truncate">
+              <div className="flex items-center gap-2 font-medium text-studio-text truncate">
                 {streamStatus === 'downloading' || streamStatus === 'connecting' ? (
-                  <Loader2 className="h-4 w-4 shrink-0 animate-spin text-indigo-400" />
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-studio-accent" />
                 ) : streamStatus === 'completed' ? (
-                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
+                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-studio-success" />
                 ) : (
-                  <AlertCircle className="h-4 w-4 shrink-0 text-rose-400" />
+                  <AlertCircle className="h-3.5 w-3.5 shrink-0 text-studio-danger" />
                 )}
                 <span className="truncate">{statusMessage}</span>
               </div>
-              <span className="font-mono font-semibold text-indigo-300 shrink-0 ml-3">
+              <span className="font-mono font-semibold text-studio-accent shrink-0 ml-3 tabular-nums">
                 {overallPercent.toFixed(1)}%
               </span>
             </div>
 
-            {/* Overall Progress Bar */}
-            <div className="h-3 w-full rounded-full bg-slate-800/90 overflow-hidden p-0.5 border border-slate-700/50">
+            <div className="h-2 w-full rounded-studio-sm bg-studio-panel overflow-hidden border border-studio-border">
               <div
-                className={`h-full rounded-full transition-all duration-200 ease-out ${
+                className={`h-full transition-all duration-200 ease-out ${
                   streamStatus === 'error'
-                    ? 'bg-rose-500'
+                    ? 'bg-studio-danger'
                     : streamStatus === 'completed'
-                    ? 'bg-emerald-500'
-                    : 'bg-gradient-to-r from-indigo-500 via-violet-500 to-indigo-400'
+                    ? 'bg-studio-success'
+                    : 'bg-studio-accent'
                 }`}
                 style={{ width: `${Math.min(100, Math.max(0, overallPercent))}%` }}
               />
             </div>
 
-            {/* Sub-bar & Byte Counter for Active File */}
-            <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono">
+            <div className="flex items-center justify-between text-[11px] text-studio-text-muted font-mono">
               <div className="truncate">
                 {activeFile ? (
                   <span>
                     File {fileIndex && fileCount ? `[${fileIndex}/${fileCount}]` : ''}:{' '}
-                    <span className="text-slate-300">{activeFile}</span> ({filePercent.toFixed(1)}%)
+                    <span className="text-studio-text">{activeFile}</span> ({filePercent.toFixed(1)}%)
                   </span>
                 ) : (
-                  <span>100% Offline Inference • Zero Cloud Dependency</span>
+                  <span>100% Offline Inference · Zero Cloud Dependency</span>
                 )}
               </div>
               {totalBytes > 0 && (
-                <div className="shrink-0 ml-2 text-slate-300">
+                <div className="shrink-0 ml-2 text-studio-text-secondary tabular-nums">
                   {formatMegabytes(downloadedBytes)} / {formatMegabytes(totalBytes)}
                 </div>
               )}
@@ -380,7 +382,7 @@ export default function DownloadModal({
           </div>
 
           {/* Model Groups Status Grid */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
             {modelKeys.map((key) => {
               const meta = MODEL_METADATA[key];
               const groupStatus = modelsState?.[key];
@@ -393,46 +395,46 @@ export default function DownloadModal({
               return (
                 <div
                   key={key}
-                  className={`rounded-xl border p-3.5 transition-colors ${
+                  className={`rounded-studio border p-3 transition-colors ${
                     isCurrentlyDownloading
-                      ? 'border-indigo-500/60 bg-indigo-950/25'
+                      ? 'border-studio-accent bg-studio-accent/10'
                       : isInstalled
-                      ? 'border-emerald-500/25 bg-slate-950/50'
-                      : 'border-slate-800 bg-slate-950/40'
+                      ? 'border-studio-border bg-studio-surface'
+                      : 'border-studio-border bg-studio-surface/60'
                   }`}
                 >
                   <div className="flex items-start justify-between gap-2">
-                    <div className="font-medium text-xs text-slate-200 leading-snug">
+                    <div className="font-medium text-xs text-studio-text leading-snug">
                       {meta.label}
                     </div>
                     {isInstalled ? (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 text-[10px] font-medium text-emerald-300 shrink-0">
+                      <span className="inline-flex items-center gap-1 rounded-studio-sm bg-studio-success/15 border border-studio-success/40 px-1.5 py-0.5 text-[10px] font-medium text-studio-success shrink-0">
                         <CheckCircle2 className="h-3 w-3" />
                         Ready
                       </span>
                     ) : isCurrentlyDownloading ? (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-indigo-500/20 border border-indigo-500/40 px-2 py-0.5 text-[10px] font-medium text-indigo-300 shrink-0">
+                      <span className="inline-flex items-center gap-1 rounded-studio-sm bg-studio-accent/15 border border-studio-accent/40 px-1.5 py-0.5 text-[10px] font-medium text-studio-accent shrink-0">
                         <Loader2 className="h-3 w-3 animate-spin" />
                         Syncing
                       </span>
                     ) : (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 border border-amber-500/30 px-2 py-0.5 text-[10px] font-medium text-amber-300 shrink-0">
+                      <span className="inline-flex items-center gap-1 rounded-studio-sm bg-studio-warning/15 border border-studio-warning/40 px-1.5 py-0.5 text-[10px] font-medium text-studio-warning shrink-0">
                         Pending
                       </span>
                     )}
                   </div>
 
-                  <p className="mt-1 text-[11px] text-slate-400 line-clamp-2">
+                  <p className="mt-1 text-[11px] text-studio-text-secondary line-clamp-2">
                     {meta.description}
                   </p>
 
-                  <div className="mt-2.5 flex items-center justify-between text-[11px] font-mono text-slate-400">
+                  <div className="mt-2 flex items-center justify-between text-[11px] font-mono text-studio-text-muted tabular-nums">
                     <span className="inline-flex items-center gap-1">
-                      <HardDrive className="h-3 w-3 text-slate-500" />
+                      <HardDrive className="h-3 w-3" />
                       {isInstalled ? `${downloadedMb} MB` : `~${sizeMb} MB`}
                     </span>
                     {groupStatus?.missing_files?.length > 0 && (
-                      <span className="text-amber-400/90">
+                      <span className="text-studio-warning">
                         {groupStatus.missing_files.length} file(s) missing
                       </span>
                     )}
@@ -444,10 +446,10 @@ export default function DownloadModal({
 
           {/* Live SSE Activity Log */}
           {recentLogs.length > 0 && (
-            <div className="rounded-xl border border-slate-800/80 bg-slate-950/90 px-3.5 py-2.5 font-mono text-[11px] text-slate-400 space-y-1 max-h-24 overflow-y-auto">
+            <div className="rounded-studio border border-studio-border bg-studio-canvas px-3 py-2 font-mono text-[11px] text-studio-text-secondary space-y-1 max-h-24 overflow-y-auto">
               {recentLogs.map((logItem, idx) => (
                 <div key={idx} className="truncate">
-                  <span className="text-indigo-400 mr-1.5">&gt;</span>
+                  <span className="text-studio-accent mr-1.5">&gt;</span>
                   {logItem}
                 </div>
               ))}
@@ -456,51 +458,50 @@ export default function DownloadModal({
 
           {/* Error Banner */}
           {errorMessage && (
-            <div className="rounded-xl border border-rose-500/40 bg-rose-950/40 px-4 py-3 flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2.5 text-xs text-rose-200">
-                <AlertCircle className="h-4 w-4 shrink-0 text-rose-400" />
+            <div className="rounded-studio border border-studio-danger/50 bg-studio-danger/10 px-3.5 py-2.5 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-xs text-studio-danger">
+                <AlertCircle className="h-4 w-4 shrink-0" />
                 <span>{errorMessage}</span>
               </div>
               <button
                 type="button"
                 onClick={startDownloadStream}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 px-3 py-1.5 text-xs font-medium text-white transition-colors shrink-0"
+                className="studio-btn h-7 px-2.5 text-xs font-medium border-studio-danger/50 text-studio-danger hover:bg-studio-danger/15 shrink-0"
               >
                 <RefreshCw className="h-3.5 w-3.5" />
-                Retry Download
+                Retry
               </button>
             </div>
           )}
         </div>
 
         {/* Footer */}
-        <div className="px-6 py-4 bg-slate-950/80 border-t border-slate-800/80 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-2 text-xs text-slate-400">
-            <Sparkles className="h-4 w-4 text-indigo-400" />
-            <span>
-              {isAllInstalled
-                ? 'All models verified in local storage.'
-                : 'Workspace will unlock automatically once all weights are verified.'}
-            </span>
+        <div className="px-5 py-3 bg-studio-surface border-t border-studio-border flex items-center justify-between gap-4">
+          <div className="text-xs text-studio-text-secondary">
+            {isAllInstalled
+              ? 'All local weights verified in storage.'
+              : 'Workspace unlocks automatically once all weights are verified.'}
           </div>
 
-          <div className="flex items-center gap-2.5">
-            {streamStatus !== 'downloading' && streamStatus !== 'connecting' && !isAllInstalled && (
-              <button
-                type="button"
-                onClick={startDownloadStream}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-indigo-600/30 transition-all"
-              >
-                <Download className="h-3.5 w-3.5" />
-                Download Missing Models
-              </button>
-            )}
+          <div className="flex items-center gap-2">
+            {streamStatus !== 'downloading' &&
+              streamStatus !== 'connecting' &&
+              !isAllInstalled && (
+                <button
+                  type="button"
+                  onClick={startDownloadStream}
+                  className="studio-btn-accent h-7 px-3 text-xs"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  Download Missing Models
+                </button>
+              )}
 
             {isAllInstalled && onClose && (
               <button
                 type="button"
                 onClick={onClose}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-emerald-600/25 transition-all"
+                className="studio-btn-accent h-7 px-3 text-xs"
               >
                 <CheckCircle2 className="h-3.5 w-3.5" />
                 Enter Workspace

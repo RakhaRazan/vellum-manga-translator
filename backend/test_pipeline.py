@@ -61,6 +61,9 @@ def run_pipeline_test() -> int:
         det_result = detector.detect(input_path, source_language=lang)
         detected_bubbles = det_result["bubbles"]
         text_mask = det_result["mask"]
+        if detector.is_loaded:
+            print(f"[ERROR] Detector ONNX session still loaded after {lang} page!", file=sys.stderr)
+            all_passed = False
 
         # Stage 2: Multi-Language OCR Router (manga-ocr for ja, RapidOCR PP-OCRv4 for ko/zh)
         ocr_bubbles = ocr_router.recognize_bubbles(
@@ -68,6 +71,9 @@ def run_pipeline_test() -> int:
             bubbles=detected_bubbles,
             source_lang=lang,
         )
+        if ocr_router.is_loaded:
+            print(f"[ERROR] OCR session still loaded after {lang} page!", file=sys.stderr)
+            all_passed = False
 
         # Stage 3: Tile-Based LaMa Inpainting (512x512 ROI patches)
         bboxes = [b["bbox"] for b in detected_bubbles]
@@ -76,6 +82,9 @@ def run_pipeline_test() -> int:
             mask=text_mask,
             bboxes=bboxes,
         )
+        if inpainter.is_loaded:
+            print(f"[ERROR] LaMa ONNX session still loaded after {lang} page!", file=sys.stderr)
+            all_passed = False
         clean_rgb: NDArrayU8 = inpaint_res["image"]
 
         output_path.parent.mkdir(parents=True, exist_ok=True)

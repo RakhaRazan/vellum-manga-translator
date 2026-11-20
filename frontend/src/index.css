@@ -2,27 +2,243 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ============================================================================
+ * Native Desktop Studio Palettes
+ *  - Dark:  Sumi Graphite (#111214 canvas, #181A1D panels, #2A2D32 borders,
+ *                          #ECEEF2 text, Warm Amber #E59A3C accent)
+ *  - Light: Manga Paper   (#E5E7EB canvas, #F7F7F5 panels, #D4D6DC borders,
+ *                          #16181D text, Warm Amber #C97A16 accent)
+ * ============================================================================ */
+
+:root,
+.dark,
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  /* RGB triplets for Tailwind alpha-aware utility classes */
+  --studio-canvas: 17 18 20;            /* #111214 */
+  --studio-panel: 24 26 29;             /* #181A1D */
+  --studio-surface: 31 34 38;           /* #1F2226 */
+  --studio-hover: 37 40 46;             /* #25282E */
+  --studio-border: 42 45 50;            /* #2A2D32 */
+  --studio-border-strong: 58 62 69;     /* #3A3E45 */
+  --studio-text: 236 238 242;           /* #ECEEF2 */
+  --studio-text-secondary: 161 166 176; /* #A1A6B0 */
+  --studio-text-muted: 110 116 128;     /* #6E7480 */
+  --studio-accent: 229 154 60;          /* #E59A3C Warm Amber */
+  --studio-accent-hover: 238 168 78;    /* #EEA84E */
+  --studio-accent-active: 208 134 43;   /* #D0862B */
+  --studio-accent-fg: 17 18 20;         /* #111214 */
+  --studio-success: 52 168 107;         /* #34A86B */
+  --studio-danger: 223 85 85;           /* #DF5555 */
+  --studio-warning: 229 154 60;         /* #E59A3C */
+  --studio-info: 91 155 213;            /* #5B9BD5 */
+
+  /* Direct CSS color tokens */
+  --color-canvas: #111214;
+  --color-panel: #181A1D;
+  --color-surface: #1F2226;
+  --color-border: #2A2D32;
+  --color-text: #ECEEF2;
+  --color-accent: #E59A3C;
+
+  --studio-scrollbar-track: #141619;
+  --studio-scrollbar-thumb: #2F3339;
+  --studio-scrollbar-thumb-hover: #454A53;
+}
+
+.light,
+[data-theme='light'] {
+  color-scheme: light;
+
+  /* RGB triplets for Tailwind alpha-aware utility classes */
+  --studio-canvas: 229 231 235;         /* #E5E7EB */
+  --studio-panel: 247 247 245;          /* #F7F7F5 */
+  --studio-surface: 255 255 255;        /* #FFFFFF */
+  --studio-hover: 236 236 232;          /* #ECECE8 */
+  --studio-border: 212 214 220;         /* #D4D6DC */
+  --studio-border-strong: 185 189 199;  /* #B9BDC7 */
+  --studio-text: 22 24 29;              /* #16181D */
+  --studio-text-secondary: 75 80 92;    /* #4B505C */
+  --studio-text-muted: 118 124 138;     /* #767C8A */
+  --studio-accent: 201 122 22;          /* #C97A16 Warm Amber */
+  --studio-accent-hover: 179 107 17;    /* #B36B11 */
+  --studio-accent-active: 156 92 14;    /* #9C5C0E */
+  --studio-accent-fg: 255 255 255;      /* #FFFFFF */
+  --studio-success: 30 126 78;          /* #1E7E4E */
+  --studio-danger: 198 54 54;           /* #C63636 */
+  --studio-warning: 201 122 22;         /* #C97A16 */
+  --studio-info: 45 109 163;            /* #2D6DA3 */
+
+  /* Direct CSS color tokens */
+  --color-canvas: #E5E7EB;
+  --color-panel: #F7F7F5;
+  --color-surface: #FFFFFF;
+  --color-border: #D4D6DC;
+  --color-text: #16181D;
+  --color-accent: #C97A16;
+
+  --studio-scrollbar-track: #EFEFED;
+  --studio-scrollbar-thumb: #C6C9D0;
+  --studio-scrollbar-thumb-hover: #A4A8B2;
+}
+
+/* ============================================================================
+ * Accent Color Presets (Amber, Teal, Crimson, Slate)
+ * ============================================================================ */
+
+:root[data-accent='amber'],
+.dark[data-accent='amber'],
+[data-theme='dark'][data-accent='amber'] {
+  --studio-accent: 229 154 60;          /* #E59A3C Warm Amber */
+  --studio-accent-hover: 238 168 78;    /* #EEA84E */
+  --studio-accent-active: 208 134 43;   /* #D0862B */
+  --studio-accent-fg: 17 18 20;         /* #111214 */
+  --color-accent: #E59A3C;
+}
+
+.light[data-accent='amber'],
+[data-theme='light'][data-accent='amber'] {
+  --studio-accent: 201 122 22;          /* #C97A16 Warm Amber */
+  --studio-accent-hover: 179 107 17;    /* #B36B11 */
+  --studio-accent-active: 156 92 14;    /* #9C5C0E */
+  --studio-accent-fg: 255 255 255;      /* #FFFFFF */
+  --color-accent: #C97A16;
+}
+
+:root[data-accent='teal'],
+.dark[data-accent='teal'],
+[data-theme='dark'][data-accent='teal'] {
+  --studio-accent: 20 184 166;          /* #14B8A6 Teal */
+  --studio-accent-hover: 45 212 191;    /* #2DD4BF */
+  --studio-accent-active: 13 148 136;   /* #0D9488 */
+  --studio-accent-fg: 17 18 20;         /* #111214 */
+  --color-accent: #14B8A6;
+}
+
+.light[data-accent='teal'],
+[data-theme='light'][data-accent='teal'] {
+  --studio-accent: 13 148 136;          /* #0D9488 Teal */
+  --studio-accent-hover: 15 118 110;    /* #0F766E */
+  --studio-accent-active: 17 94 89;     /* #115E59 */
+  --studio-accent-fg: 255 255 255;      /* #FFFFFF */
+  --color-accent: #0D9488;
+}
+
+:root[data-accent='crimson'],
+.dark[data-accent='crimson'],
+[data-theme='dark'][data-accent='crimson'] {
+  --studio-accent: 225 29 72;           /* #E11D48 Crimson */
+  --studio-accent-hover: 244 63 94;     /* #F43F5E */
+  --studio-accent-active: 190 18 60;    /* #BE123C */
+  --studio-accent-fg: 255 255 255;      /* #FFFFFF */
+  --color-accent: #E11D48;
+}
+
+.light[data-accent='crimson'],
+[data-theme='light'][data-accent='crimson'] {
+  --studio-accent: 190 18 60;           /* #BE123C Crimson */
+  --studio-accent-hover: 159 18 57;     /* #9F1239 */
+  --studio-accent-active: 136 19 55;    /* #881337 */
+  --studio-accent-fg: 255 255 255;      /* #FFFFFF */
+  --color-accent: #BE123C;
+}
+
+:root[data-accent='slate'],
+.dark[data-accent='slate'],
+[data-theme='dark'][data-accent='slate'] {
+  --studio-accent: 91 155 213;          /* #5B9BD5 Slate Blue */
+  --studio-accent-hover: 118 175 227;   /* #76AFE3 */
+  --studio-accent-active: 68 132 191;   /* #4484BF */
+  --studio-accent-fg: 17 18 20;         /* #111214 */
+  --color-accent: #5B9BD5;
+}
+
+.light[data-accent='slate'],
+[data-theme='light'][data-accent='slate'] {
+  --studio-accent: 59 118 176;          /* #3B76B0 Slate Blue */
+  --studio-accent-hover: 45 100 156;    /* #2D649C */
+  --studio-accent-active: 35 83 133;    /* #235385 */
+  --studio-accent-fg: 255 255 255;      /* #FFFFFF */
+  --color-accent: #3B76B0;
+}
+
+/* ============================================================================
+ * UI Density Modes (Compact vs Comfortable)
+ * ============================================================================ */
+
+:root,
+:root[data-density='compact'] {
+  --studio-row-py: 0.375rem;
+  --studio-control-h: 1.75rem;
+}
+
+:root[data-density='comfortable'] {
+  --studio-row-py: 0.625rem;
+  --studio-control-h: 2.125rem;
+}
+
+:root[data-density='comfortable'] .studio-btn,
+:root[data-density='comfortable'] .studio-btn-accent {
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+
 @layer base {
+  html,
   body {
-    @apply bg-slate-950 text-slate-100 font-sans;
+    background-color: var(--color-canvas);
+    color: var(--color-text);
+    @apply font-sans antialiased;
+  }
+
+  /* Ensure native select dropdown menus respect active color-scheme */
+  select,
+  option {
+    background-color: var(--color-panel);
+    color: var(--color-text);
   }
 }
 
-/* Custom subtle dark scrollbars */
+@layer components {
+  .studio-panel {
+    background-color: var(--color-panel);
+    border: 1px solid var(--color-border);
+  }
+
+  .studio-input {
+    @apply rounded-studio border border-studio-border bg-studio-surface text-studio-text placeholder:text-studio-text-muted focus:border-studio-accent focus:outline-none transition-colors;
+  }
+
+  .studio-btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-studio border border-studio-border bg-studio-surface hover:bg-studio-hover text-studio-text transition-colors cursor-pointer disabled:opacity-40 disabled:pointer-events-none;
+  }
+
+  .studio-btn-accent {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-studio border border-studio-accent bg-studio-accent hover:bg-studio-accent-hover active:bg-studio-accent-active text-studio-accent-fg font-semibold transition-colors cursor-pointer disabled:opacity-40 disabled:pointer-events-none;
+  }
+}
+
+/* Crisp compact desktop studio scrollbars (Firefox + Chromium/WebView2) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--studio-scrollbar-thumb) var(--studio-scrollbar-track);
+}
+
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.6);
+  background: var(--studio-scrollbar-track);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(71, 85, 105, 0.6);
-  border-radius: 9999px;
+  background: var(--studio-scrollbar-thumb);
+  border-radius: 2px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(100, 116, 139, 0.9);
+  background: var(--studio-scrollbar-thumb-hover);
 }

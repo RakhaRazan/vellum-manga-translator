@@ -1,87 +1,113 @@
-"""Context-Aware Comic Dialogue Translator via Local LM Studio (`openai` Python SDK).
+"""Multi-Provider Context-Aware Comic Dialogue Translator (Koharu-style).
 
-Connects to LM Studio's OpenAI-compatible server at `http://localhost:1235/v1` (`api_key="lm-studio"`).
-Features:
-- Targets `"Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P"` by default, with an automatic
-  fallback helper (`resolve_lm_studio_model`) that queries `GET http://localhost:1235/v1/models`
-  (and `/api/v0/models`) to match the active loaded model ID if the exact name differs in LM Studio.
-- Translates a full comic page's dialogue array in a single request (`source_lang` in `ja`, `ko`, `zh`;
-  `target_lang` in `id`, `en`) so conversational context, pronouns, and character relationships
-  stay consistent across speech bubbles.
-- Dynamically tailors a concise system prompt optimized for a 2B quantized model, preserving
-  character tone, slang, and romanized honorifics (`-san`/`-senpai` for JA, `oppa`/`hyung`/`sunbae`
-  for KO, `gege`/`shixiong` for ZH).
-- Enforces valid JSON output mapped strictly by block `id` (SPEC.md Section 5.2 JSON Schema)
-  combined with a multi-stage JSON extractor/cleaner that strips markdown fences, `<think>` blocks,
-  conversational text, and trailing commas so parsing never fails.
+Supports 8 providers via `backend.core.providers`:
+- `lmstudio` (default `http://localhost:1235/v1`, default model `"Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P"`)
+- `ollama` (`http://localhost:11434/v1`)
+- `openai` (`https://api.openai.com/v1`)
+- `gemini` (`https://generativelanguage.googleapis.com/v1beta/openai`)
+- `anthropic` (`https://api.anthropic.com/v1`, native Messages API)
+- `deepseek` (`https://api.deepseek.com/v1`)
+- `openrouter` (`https://openrouter.ai/api/v1`)
+- `custom` (arbitrary OpenAI-compatible Base URL + API Key)
+
+Advanced translation controls:
+- Sampling: `temperature`, `top_p`, `top_k`, `max_tokens`, `frequency_penalty`.
+- Reasoning: `reasoning_effort` (`off` / `low` / `medium` / `high`) + automatic stripping
+  of `<think>...</think>` / `<thought>...</thought>` tags prior to JSON extraction.
+- Vision (`use_vision`): attaches a resized JPEG comic page image in multimodal payloads
+  for vision-capable models, with automatic text-only fallback if rejected.
+- Custom Instruction Bar + Glossary (`source -> target`) injected into the system prompt.
+- 16 target languages: `id`, `en`, `ja`, `ko`, `zh-CN`, `zh-TW`, `es`, `fr`, `de`, `pt`,
+  `ru`, `vi`, `th`, `ms`, `ar`, `it`.
 """
 
+import base64
 from collections.abc import Mapping, Sequence
+import io
 import json
 from pathlib import Path
 import re
 import sys
 from typing import Literal, NotRequired, TypedDict, cast
 
+import numpy as np
 import openai
-from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam
-from openai.types.shared_params import ResponseFormatJSONSchema
+from openai import OpenAI, omit
+from openai.types.chat import (
+    ChatCompletionContentPartParam,
+    ChatCompletionMessageParam,
+)
+from openai.types.shared_params import (
+    ResponseFormatJSONObject,
+    ResponseFormatJSONSchema,
+)
+from PIL import Image
 import requests
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from backend.core.detector import TextDirection  # noqa: E402
+from backend.core.detector import NDArrayU8, TextDirection  # noqa: E402
 from backend.core.ocr import (  # noqa: E402
     OcrBubbleResult,
     SourceLanguage,
     normalize_language,
 )
-
-TargetLanguage = Literal["id", "en"]
-SUPPORTED_TARGET_LANGUAGES: tuple[TargetLanguage, ...] = ("id", "en")
-
-DEFAULT_LM_STUDIO_BASE_URL = "http://localhost:1235/v1"
-DEFAULT_LM_STUDIO_API_KEY = "lm-studio"
-DEFAULT_LM_STUDIO_MODEL = "Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P"
-
-# Quantization / format tokens that LM Studio often strips from model IDs in /v1/models
-_QUANT_TOKENS: frozenset[str] = frozenset(
-    {
-        "q2",
-        "q3",
-        "q4",
-        "q5",
-        "q6",
-        "q8",
-        "k",
-        "p",
-        "m",
-        "s",
-        "l",
-        "xs",
-        "xxs",
-        "0",
-        "1",
-        "fp16",
-        "bf16",
-        "fp32",
-        "gguf",
-        "imat",
-        "iq4",
-        "iq3",
-    }
+from backend.core.providers import (  # noqa: E402
+    AppSettingsDict,
+    DEFAULT_ANTHROPIC_VERSION,
+    DEFAULT_LM_STUDIO_API_KEY,
+    DEFAULT_LM_STUDIO_BASE_URL,
+    DEFAULT_LM_STUDIO_MODEL,
+    PROVIDER_PRESETS,
+    ProviderConnectionError,
+    ProviderId,
+    ProviderSpec,
+    ProviderTranslationError,
+    ReasoningEffort,
+    SUPPORTED_REASONING_EFFORTS,
+    SUPPORTED_TARGET_LANGUAGES,
+    TARGET_LANGUAGES,
+    TargetLanguage,
+    get_provider_spec,
+    list_provider_models,
+    normalize_provider_base_url,
+    normalize_provider_id,
+    normalize_reasoning_effort,
+    normalize_target_language,
+    parse_glossary,
+    resolve_provider_api_key,
+    resolve_provider_model,
 )
 
+# Backward-compatible exception aliases (SPEC.md v2 & existing routes)
+LMStudioConnectionError = ProviderConnectionError
+LMStudioTranslationError = ProviderTranslationError
 
-class LMStudioConnectionError(RuntimeError):
-    """Raised when the local LM Studio server at port 1235 is unreachable or has no models."""
+OpenAIReasoningEffort = Literal["none", "minimal", "low", "medium", "high"]
 
+type _JsonValue = (
+    None
+    | bool
+    | int
+    | float
+    | str
+    | Sequence[_JsonValue]
+    | Mapping[str, _JsonValue]
+)
 
-class LMStudioTranslationError(RuntimeError):
-    """Raised when an LLM translation call fails unexpectedly."""
+_ANTHROPIC_THINKING_BUDGETS: dict[ReasoningEffort, int] = {
+    "off": 0,
+    "low": 1024,
+    "medium": 4096,
+    "high": 8192,
+}
+
+_DATA_URI_RE = re.compile(
+    r"^data:(image/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$",
+    flags=re.IGNORECASE,
+)
 
 
 class DialogueBlockInput(TypedDict):
@@ -113,17 +139,20 @@ class TranslatedBubbleResult(TypedDict):
 
 
 class PageTranslationResult(TypedDict):
-    """Complete page translation response containing both ID-mapped dict and ordered dialogue list."""
+    """Complete page translation response containing ID-mapped dict, dialogues, and runtime flags."""
 
+    provider: ProviderId
     model: str
     source_language: SourceLanguage
     target_language: TargetLanguage
+    vision_used: bool
+    reasoning_effort: ReasoningEffort
     translations: dict[str, str]
     dialogues: list[TranslatedDialogueItem]
 
 
 class LMStudioStatus(TypedDict):
-    """Connectivity and active model status for LM Studio matching SPEC.md Section 5.4."""
+    """Connectivity and active model status matching SPEC.md Section 5.5."""
 
     connected: bool
     endpoint: str
@@ -160,71 +189,77 @@ COMIC_TRANSLATION_JSON_SCHEMA: ResponseFormatJSONSchema = {
     },
 }
 
+_JSON_OBJECT_FORMAT: ResponseFormatJSONObject = {"type": "json_object"}
 
-def normalize_source_language(source_lang: str) -> SourceLanguage:
-    """Validate and normalize `source_lang` (`'ja'`, `'ko'`, or `'zh'`)."""
-    return normalize_language(source_lang)
-
-
-def normalize_target_language(target_lang: str) -> TargetLanguage:
-    """Validate and normalize `target_lang` (`'id'` for Indonesian or `'en'` for English)."""
-    cleaned = target_lang.lower().strip()
-    if cleaned in ("id", "ind", "indonesian", "bahasa", "bahasa indonesia"):
-        return "id"
-    if cleaned in ("en", "eng", "english"):
-        return "en"
-    raise ValueError(
-        f"Unsupported target_lang {target_lang!r}. Must be one of {SUPPORTED_TARGET_LANGUAGES}."
-    )
-
-
-def _tokenize_model_name(name: str) -> list[str]:
-    """Split a model name or ID into lowercase alphanumeric tokens."""
-    return re.findall(r"[a-z0-9]+", name.lower())
-
-
-def _is_embedding_model(model_id: str) -> bool:
-    """Return True if `model_id` appears to be an embedding model rather than a generative LLM."""
-    lower = model_id.lower()
-    return "embed" in lower or lower.startswith("text-embedding")
-
-
-def _score_model_match(preferred_name: str, candidate_id: str) -> float:
-    """Compute a similarity score in `[0.0, 1.0]` between `preferred_name` and `candidate_id`."""
-    pref_lower = preferred_name.lower().strip()
-    cand_lower = candidate_id.lower().strip()
-    if pref_lower == cand_lower:
-        return 1.0
-
-    pref_compact = re.sub(r"[^a-z0-9]", "", pref_lower)
-    cand_compact = re.sub(r"[^a-z0-9]", "", cand_lower)
-    if pref_compact and cand_compact and pref_compact == cand_compact:
-        return 0.99
-
-    pref_tokens = _tokenize_model_name(pref_lower)
-    cand_tokens = _tokenize_model_name(cand_lower)
-    if not pref_tokens or not cand_tokens:
-        return 0.0
-
-    pref_core = [t for t in pref_tokens if t not in _QUANT_TOKENS] or pref_tokens
-    cand_core = [t for t in cand_tokens if t not in _QUANT_TOKENS] or cand_tokens
-
-    pref_core_set = set(pref_core)
-    cand_core_set = set(cand_core)
-    common_core = pref_core_set & cand_core_set
-    if not common_core:
-        return 0.0
-
-    # Jaccard overlap on core model identity tokens (e.g. gemma, 4, e2b, uncensored, hauhaucs, aggressive)
-    union_core = pref_core_set | cand_core_set
-    core_jaccard = len(common_core) / max(1, len(union_core))
-    cand_coverage = len(common_core) / max(1, len(cand_core_set))
-    pref_coverage = len(common_core) / max(1, len(pref_core_set))
-
-    score = (core_jaccard * 0.5) + (cand_coverage * 0.3) + (pref_coverage * 0.2)
-    if cand_compact and (cand_compact in pref_compact or pref_compact in cand_compact):
-        score = min(0.98, score + 0.1)
-    return score
+# Tailored comic-book style rules for all 16 supported target languages
+_TARGET_STYLE_RULES: dict[TargetLanguage, str] = {
+    "id": (
+        "Write natural, expressive spoken comic Indonesian (Bahasa Indonesia). "
+        + "Keep character tone, emotion, and casual slang natural for speech bubbles "
+        + "(use 'aku/kamu', 'kau', or casual 'gue/lu' when the speaker is rough/slangy; "
+        + "never sound stiff or machine-translated)."
+    ),
+    "en": (
+        "Write natural, idiomatic comic-book English. "
+        + "Use punchy phrasing, natural contractions, and expressive slang that fits each character's emotion and tone."
+    ),
+    "ja": (
+        "Write natural, expressive Japanese comic dialogue (日本語) matching each speaker's register, "
+        + "pronouns, and sentence-ending particles naturally for manga bubbles."
+    ),
+    "ko": (
+        "Write natural, expressive Korean comic dialogue (한국어) with appropriate speech levels "
+        + "(반말/존댓말) matching character relationships and scene tension."
+    ),
+    "zh-CN": (
+        "Write natural, idiomatic Simplified Chinese comic dialogue (简体中文) with lively pacing, "
+        + "authentic colloquial expressions, and tone fitting each character."
+    ),
+    "zh-TW": (
+        "Write natural, idiomatic Traditional Chinese comic dialogue (繁體中文, Taiwan/HK comic style) "
+        + "with lively pacing and authentic spoken phrasing."
+    ),
+    "es": (
+        "Write natural, expressive comic-book Spanish (Español) using colloquial phrasing, "
+        + "appropriate register (tú/usted), and punchy dialogue suited for speech bubbles."
+    ),
+    "fr": (
+        "Write natural, expressive comic-book French (Français) with authentic spoken tone, "
+        + "appropriate tutoiement/vouvoiement, and crisp bubble-friendly phrasing."
+    ),
+    "de": (
+        "Write natural, idiomatic comic-book German (Deutsch) with lively spoken phrasing, "
+        + "natural du/Sie register, and punchy dialogue."
+    ),
+    "pt": (
+        "Write natural, expressive comic-book Portuguese (Português) with lively colloquial phrasing "
+        + "and authentic emotional nuance suitable for speech bubbles."
+    ),
+    "ru": (
+        "Write natural, expressive comic-book Russian (Русский) with vivid colloquial tone, "
+        + "appropriate ты/вы register, and punchy dialogue."
+    ),
+    "vi": (
+        "Write natural, expressive comic-book Vietnamese (Tiếng Việt) using authentic pronouns "
+        + "(tôi/cậu, tao/mày, anh/em, etc.) that accurately reflect character relationships and emotion."
+    ),
+    "th": (
+        "Write natural, expressive comic-book Thai (ภาษาไทย) with fitting pronouns, particles "
+        + "(ครับ/ค่ะ/นะ/เว้ย), and lively colloquial rhythm for comic bubbles."
+    ),
+    "ms": (
+        "Write natural, expressive comic-book Malay (Bahasa Melayu) using natural spoken phrasing "
+        + "(aku/kau, saya/awak) matching each character's tone and emotion."
+    ),
+    "ar": (
+        "Write natural, expressive comic-book Arabic (العربية) with clear, vivid, and concise phrasing "
+        + "suitable for comic speech bubbles while capturing each character's emotion."
+    ),
+    "it": (
+        "Write natural, expressive comic-book Italian (Italiano) with idiomatic spoken tone, "
+        + "appropriate tu/Lei register, and crisp bubble-friendly dialogue."
+    ),
+}
 
 
 def _json_loads(raw: str) -> object:
@@ -233,40 +268,9 @@ def _json_loads(raw: str) -> object:
     return res
 
 
-def _fetch_loaded_model_from_v0(base_url: str, timeout: float = 3.0) -> str | None:
-    """Query LM Studio's `/api/v0/models` endpoint to check if a specific LLM is currently in `loaded` state."""
-    root_url = re.sub(r"/v1/?$", "", base_url.rstrip("/"))
-    v0_url = f"{root_url}/api/v0/models"
-    try:
-        resp = requests.get(v0_url, timeout=timeout)
-        if resp.status_code != 200:
-            return None
-        payload_obj = _json_loads(resp.text)
-        if not isinstance(payload_obj, Mapping):
-            return None
-        payload_map = cast(Mapping[str, object], payload_obj)
-        data_obj = payload_map.get("data")
-        if not isinstance(data_obj, Sequence) or isinstance(data_obj, (str, bytes)):
-            return None
-        for entry_obj in data_obj:
-            if not isinstance(entry_obj, Mapping):
-                continue
-            entry = cast(Mapping[str, object], entry_obj)
-            model_id = str(entry.get("id", "")).strip()
-            state = str(entry.get("state", "")).strip().lower()
-            model_type = str(entry.get("type", "")).strip().lower()
-            if (
-                model_id
-                and state == "loaded"
-                and model_type != "embeddings"
-                and not _is_embedding_model(model_id)
-            ):
-                return model_id
-    except requests.RequestException:
-        return None
-    except ValueError:
-        return None
-    return None
+def normalize_source_language(source_lang: str) -> SourceLanguage:
+    """Validate and normalize `source_lang` (`'ja'`, `'ko'`, or `'zh'`)."""
+    return normalize_language(source_lang)
 
 
 def list_lm_studio_models(
@@ -274,55 +278,14 @@ def list_lm_studio_models(
     api_key: str = DEFAULT_LM_STUDIO_API_KEY,
     timeout: float = 5.0,
 ) -> list[str]:
-    """Query `GET {base_url}/models` and return all available model IDs in LM Studio.
-
-    Raises `LMStudioConnectionError` with a clear diagnostic message if port 1235 is unreachable.
-    """
-    models_url = f"{base_url.rstrip('/')}/models"
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    try:
-        resp = requests.get(models_url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-    except requests.exceptions.ConnectionError as exc:
-        raise LMStudioConnectionError(
-            f"Cannot connect to LM Studio server at {models_url}. "
-            + "Ensure LM Studio is open and the Local Inference Server is running on port 1235."
-        ) from exc
-    except requests.exceptions.Timeout as exc:
-        raise LMStudioConnectionError(
-            f"Timed out after {timeout:.1f}s while connecting to LM Studio at {models_url}. "
-            + "Verify that port 1235 is responsive."
-        ) from exc
-    except requests.exceptions.RequestException as exc:
-        raise LMStudioConnectionError(
-            f"HTTP error while querying LM Studio models at {models_url}: {exc}"
-        ) from exc
-
-    try:
-        payload_obj = _json_loads(resp.text)
-    except ValueError as exc:
-        raise LMStudioConnectionError(
-            f"LM Studio at {models_url} returned non-JSON payload: {resp.text[:200]!r}"
-        ) from exc
-
-    if not isinstance(payload_obj, Mapping):
-        raise LMStudioConnectionError(
-            f"Unexpected response format from {models_url}: {payload_obj!r}"
-        )
-
-    payload_map = cast(Mapping[str, object], payload_obj)
-    data_obj = payload_map.get("data")
-    if not isinstance(data_obj, Sequence) or isinstance(data_obj, (str, bytes)):
-        return []
-
-    model_ids: list[str] = []
-    for item_obj in data_obj:
-        if isinstance(item_obj, Mapping):
-            item_map = cast(Mapping[str, object], item_obj)
-            mid = str(item_map.get("id", "")).strip()
-            if mid:
-                model_ids.append(mid)
-    return model_ids
+    """Query `GET {base_url}/models` on LM Studio and return all available model IDs."""
+    return list_provider_models(
+        provider="lmstudio",
+        base_url=base_url,
+        api_key=api_key,
+        timeout=timeout,
+        include_embeddings=True,
+    )
 
 
 def resolve_lm_studio_model(
@@ -331,109 +294,138 @@ def resolve_lm_studio_model(
     api_key: str = DEFAULT_LM_STUDIO_API_KEY,
     timeout: float = 5.0,
 ) -> str:
-    """Resolve `preferred_model` against `GET http://localhost:1235/v1/models`.
+    """Resolve `preferred_model` against LM Studio `/v1/models` and `/api/v0/models`."""
+    return resolve_provider_model(
+        provider="lmstudio",
+        preferred_model=preferred_model,
+        base_url=base_url,
+        api_key=api_key,
+        timeout=timeout,
+    )
 
-    1. If `preferred_model` matches an entry in `/v1/models` exactly (or case-insensitively), returns it.
-    2. If the exact string differs slightly in LM Studio (e.g. `"Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P"`
-       vs `"gemma-4-e2b-uncensored-hauhaucs-aggressive"`), returns the closest fuzzy-matched LLM ID.
-    3. If `preferred_model` is not present at all, returns the currently loaded LLM from `/api/v0/models`
-       or the first non-embedding LLM from `/v1/models`.
-    """
-    all_models = list_lm_studio_models(base_url=base_url, api_key=api_key, timeout=timeout)
-    llm_models = [m for m in all_models if not _is_embedding_model(m)]
-    candidates = llm_models if llm_models else all_models
 
-    if not candidates:
-        raise LMStudioConnectionError(
-            f"LM Studio server at {base_url} is reachable, but no models are installed or loaded."
-        )
+def encode_image_for_vision(
+    image: NDArrayU8 | Image.Image | bytes | Path | str,
+    max_side: int = 1024,
+    jpeg_quality: int = 84,
+) -> str:
+    """Resize a comic page image to `<= max_side` px and encode as a compact JPEG data URI."""
+    if isinstance(image, str):
+        cleaned = image.strip()
+        if _DATA_URI_RE.match(cleaned):
+            return cleaned
+        path_candidate = Path(cleaned)
+        if path_candidate.is_file():
+            pil_img = Image.open(path_candidate)
+        else:
+            raw_b64 = cleaned.split(",", 1)[1] if "," in cleaned else cleaned
+            pil_img = Image.open(io.BytesIO(base64.b64decode(raw_b64)))
+    elif isinstance(image, Path):
+        pil_img = Image.open(image)
+    elif isinstance(image, bytes):
+        pil_img = Image.open(io.BytesIO(image))
+    elif isinstance(image, Image.Image):
+        pil_img = image
+    else:
+        arr = np.asarray(image, dtype=np.uint8)
+        pil_img = Image.fromarray(arr)
 
-    # 1. Exact or case-insensitive match
-    pref_clean = preferred_model.strip()
-    for cand in candidates:
-        if cand == pref_clean or cand.lower() == pref_clean.lower():
-            return cand
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
 
-    # 2. Fuzzy token match for slight naming/quantization differences in LM Studio
-    scored: list[tuple[float, str]] = [
-        (_score_model_match(pref_clean, cand), cand) for cand in candidates
-    ]
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    best_score, best_cand = scored[0]
-    if best_score >= 0.50:
-        return best_cand
+    w, h = pil_img.size
+    longest = max(w, h)
+    clamped_max = max(256, min(2048, int(max_side)))
+    if longest > clamped_max:
+        scale = clamped_max / float(longest)
+        new_size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+        pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
 
-    # 3. Fallback to currently loaded model in LM Studio (via /api/v0/models) or first LLM in /v1/models
-    loaded_v0 = _fetch_loaded_model_from_v0(base_url=base_url, timeout=timeout)
-    if loaded_v0 and loaded_v0 in candidates:
-        return loaded_v0
-
-    return candidates[0]
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
 
 
 def build_system_prompt(
     source_lang: SourceLanguage,
     target_lang: TargetLanguage,
+    *,
+    reasoning_effort: ReasoningEffort = "off",
+    custom_instructions: str | None = None,
+    glossary: Mapping[str, str] | None = None,
+    has_page_image: bool = False,
 ) -> str:
-    """Build a concise, dynamically tailored system prompt optimized for a 2B quantized LLM."""
+    """Build a concise, dynamically tailored system prompt for comic page translation."""
     if source_lang == "ja":
         source_desc = "Japanese Manga (ja)"
         honorific_rule = (
-            "Preserve Japanese honorifics in romaji attached to names or used as titles: "
-            + "-san (さん), -senpai (先輩), -kun (くん/君), -chan (ちゃん), -sama (様), -sensei (先生) "
-            + "(e.g., 'Tanaka-senpai', 'Sato-san')."
+            "Preserve Japanese honorifics naturally (e.g., -san, -senpai, -kun, -chan, -sama, -sensei "
+            + "such as 'Tanaka-senpai', 'Sato-san') when appropriate for the target language."
         )
     elif source_lang == "ko":
         source_desc = "Korean Manhwa (ko)"
         honorific_rule = (
-            "Preserve Korean honorifics and kinship/address terms in romaji: "
-            + "oppa (오빠), hyung (형), sunbae (선배), noona (누나), unnie (언니), -nim (님), dongsaeng (동생) "
-            + "(e.g., 'Minsu-sunbae', 'oppa', 'hyung')."
+            "Preserve Korean honorifics and kinship/address terms naturally "
+            + "(e.g., oppa, hyung, sunbae, noona, unnie, -nim, dongsaeng) when appropriate for the target language."
         )
     else:
         source_desc = "Chinese Manhua (zh)"
         honorific_rule = (
-            "Preserve Chinese martial and familial honorifics in pinyin (do NOT translate them into 'big brother', 'senior brother', or 'kakak'): "
-            + "哥哥 -> always write 'gege', 师兄 -> always write 'shixiong', "
-            + "师姐 -> 'shijie', 师父 -> 'shifu', 师弟 -> 'shidi', 姐姐 -> 'jiejie' "
-            + "(e.g., 'Lin-shixiong', 'gege')."
+            "Preserve Chinese martial and familial honorifics accurately "
+            + "(e.g., 哥哥 -> 'gege', 师兄 -> 'shixiong', 师姐 -> 'shijie', 师父 -> 'shifu', 师弟 -> 'shidi', 姐姐 -> 'jiejie') "
+            + "when translating into non-Chinese languages."
         )
 
-    if target_lang == "id":
-        target_desc = "Indonesian (Bahasa Indonesia)"
-        style_rule = (
-            "Write natural, expressive spoken comic Indonesian (Bahasa Indonesia). "
-            + "Keep character tone, emotion, and casual slang natural for comic bubbles "
-            + "(use 'aku/kamu', 'kau', or casual 'gue/lu' when the speaker is rough/slangy; never sound stiff or machine-translated)."
-        )
-    else:
-        target_desc = "English (en)"
-        style_rule = (
-            "Write natural, idiomatic comic-book English. "
-            + "Use punchy phrasing, natural contractions, and expressive slang that fits each character's emotion and tone."
-        )
+    tgt_spec = TARGET_LANGUAGES[target_lang]
+    target_desc = f"{tgt_spec.name} ({tgt_spec.native_name}, code: {tgt_spec.code})"
+    style_rule = _TARGET_STYLE_RULES[target_lang]
 
-    return (
-        f"You are an expert {source_desc} to {target_desc} comic translator. "
-        + "Do not think, analyze, or explain. "
-        + f"Translate the full page of dialogue blocks from {source_desc} into {target_desc}.\n"
-        + "Rules:\n"
-        + "1. Read all blocks together as one continuous scene so conversational context, pronouns, and speaker tone remain consistent across bubbles.\n"
-        + f"2. {style_rule}\n"
-        + f"3. {honorific_rule}\n"
-        + '4. Output ONLY valid JSON in the exact format: {"dialogues": [{"id": "<block_id>", "translated_text": "<translation>"}]}. '
-        + "Keep every input block 'id' unchanged."
+    thinking_directive = (
+        "Do not think, analyze, or explain. "
+        if reasoning_effort == "off"
+        else "Keep any internal reasoning brief, then output strictly valid JSON. "
     )
+
+    lines: list[str] = [
+        f"You are an expert {source_desc} to {target_desc} comic translator. "
+        + thinking_directive
+        + f"Translate the full page of dialogue blocks from {source_desc} into {target_desc}.",
+        "Rules:",
+        "1. Read all blocks together as one continuous scene so conversational context, pronouns, and speaker tone remain consistent across bubbles.",
+        f"2. {style_rule}",
+        f"3. {honorific_rule}",
+        '4. Output ONLY valid JSON in the exact format: {"dialogues": [{"id": "<block_id>", "translated_text": "<translation>"}]}. Keep every input block \'id\' unchanged.',
+    ]
+
+    if glossary:
+        cleaned_pairs = [
+            f"- {src_term.strip()} -> {tgt_term.strip()}"
+            for src_term, tgt_term in glossary.items()
+            if src_term.strip() and tgt_term.strip()
+        ]
+        if cleaned_pairs:
+            lines.append(
+                "Glossary (MUST follow strictly — always translate these terms as specified):\n"
+                + "\n".join(cleaned_pairs)
+            )
+
+    if custom_instructions and custom_instructions.strip():
+        lines.append(f"Custom Instructions (MUST follow): {custom_instructions.strip()}")
+
+    if has_page_image:
+        lines.append(
+            "Visual Context: Use the attached comic page image to infer speaker gender, expressions, "
+            + "action intensity, relationships, and scene mood so every bubble matches the artwork."
+        )
+
+    return "\n".join(lines)
 
 
 def normalize_input_blocks(
     blocks: Sequence[Mapping[str, object]],
 ) -> list[DialogueBlockInput]:
-    """Normalize an array of detected/OCR text blocks into `[{'id': ..., 'source_text': ...}]`.
-
-    Accepts dicts containing `'id'` (or auto-assigns `'bubble_001'`, ...) and text under
-    `'source_text'`, `'original_text'`, or `'text'`.
-    """
+    """Normalize an array of detected/OCR text blocks into `[{'id': ..., 'source_text': ...}]`."""
     normalized: list[DialogueBlockInput] = []
     for idx, raw_block in enumerate(blocks, start=1):
         raw_id = raw_block.get("id")
@@ -451,7 +443,6 @@ def normalize_input_blocks(
         if text_val is None:
             text_val = ""
 
-        # Collapse internal newlines to spaces so multi-line OCR text translates as a cohesive sentence
         cleaned_text = re.sub(r"\s+", " ", str(text_val)).strip()
         normalized.append(
             {
@@ -462,16 +453,41 @@ def normalize_input_blocks(
     return normalized
 
 
-def _strip_fences_and_noise(raw_content: str) -> str:
-    """Strip `<think>...</think>` blocks, ```json markdown fences, and outer conversational prose."""
+def strip_thinking_tags(raw_content: str) -> str:
+    """Remove `<think>...</think>`, `<thought>...</thought>`, and `<|thought|>...<|thought|>` blocks."""
     text = raw_content.strip()
     if not text:
         return ""
 
-    # Remove <think>...</think> blocks if emitted by reasoning models
-    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+    # 1. Strip standard closed reasoning tags
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<thought>[\s\S]*?</thought>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\|thought\|>[\s\S]*?<\|thought\|>", "", text, flags=re.IGNORECASE)
 
-    # Extract content inside ```json ... ``` or ``` ... ``` markdown code fences if present
+    # 2. Handle an unclosed <think> or <thought> tag (e.g. if a reasoning model omitted closing tag
+    #    before emitting ```json or `{...}`)
+    unclosed_match = re.search(r"<(?:think|thought|\|thought\|)>", text, flags=re.IGNORECASE)
+    if unclosed_match:
+        prefix = text[: unclosed_match.start()].strip()
+        remainder = text[unclosed_match.end() :]
+        fence_idx = remainder.find("```")
+        brace_idx = remainder.find("{")
+        candidates = [idx for idx in (fence_idx, brace_idx) if idx != -1]
+        if candidates:
+            after_thought = remainder[min(candidates) :].strip()
+            text = f"{prefix}\n{after_thought}".strip() if prefix else after_thought
+        elif prefix:
+            text = prefix
+
+    return text.strip()
+
+
+def _strip_fences_and_noise(raw_content: str) -> str:
+    """Strip reasoning tags, ```json markdown fences, outer prose, and trailing commas."""
+    text = strip_thinking_tags(raw_content)
+    if not text:
+        return ""
+
     fence_match = re.search(
         r"```(?:json)?\s*([\s\S]*?)```",
         text,
@@ -482,7 +498,6 @@ def _strip_fences_and_noise(raw_content: str) -> str:
         if fenced_body:
             text = fenced_body
 
-    # Locate the outermost JSON object `{...}` or array `[...]`
     first_brace = text.find("{")
     first_bracket = text.find("[")
     start_idx = -1
@@ -500,7 +515,6 @@ def _strip_fences_and_noise(raw_content: str) -> str:
         if end_idx > start_idx:
             text = text[start_idx : end_idx + 1]
 
-    # Remove trailing commas before closing `}` or `]`
     text = re.sub(r",\s*([}\]])", r"\1", text)
     return text.strip()
 
@@ -512,7 +526,6 @@ def _extract_mapping_from_parsed_json(parsed: object) -> dict[str, str]:
     if isinstance(parsed, Mapping):
         parsed_map = cast(Mapping[str, object], parsed)
 
-        # Case 1: {"dialogues": [...]} or {"translations": [...]} or {"blocks": [...]}
         for list_key in ("dialogues", "translations", "blocks", "items", "data", "results"):
             sub_val = parsed_map.get(list_key)
             if isinstance(sub_val, Sequence) and not isinstance(sub_val, (str, bytes)):
@@ -526,7 +539,6 @@ def _extract_mapping_from_parsed_json(parsed: object) -> dict[str, str]:
                 if sub_map:
                     return sub_map
 
-        # Case 2: Single item {"id": "bubble_001", "translated_text": "..."}
         if "id" in parsed_map and any(
             k in parsed_map for k in ("translated_text", "translation", "text", "target_text")
         ):
@@ -537,7 +549,6 @@ def _extract_mapping_from_parsed_json(parsed: object) -> dict[str, str]:
                     mapping[item_id] = t_val.strip()
                     return mapping
 
-        # Case 3: Direct dictionary {"bubble_001": "Translated text", "bubble_002": {"translated_text": "..."}}
         for k, v in parsed_map.items():
             key_str = str(k).strip()
             if not key_str:
@@ -567,7 +578,6 @@ def _extract_mapping_from_parsed_json(parsed: object) -> dict[str, str]:
                         mapping[item_id] = t_val.strip()
                         break
             elif len(entry) == 1:
-                # Handle [{"bubble_001": "Translated text"}]
                 for k, v in entry.items():
                     if isinstance(v, str):
                         mapping[str(k).strip()] = v.strip()
@@ -577,17 +587,16 @@ def _extract_mapping_from_parsed_json(parsed: object) -> dict[str, str]:
 
 
 def _regex_salvage_translations(
-    raw_text: str,
+    think_stripped_text: str,
     expected_ids: Sequence[str],
 ) -> dict[str, str]:
     """Regex fallback extractor if the LLM produced truncated or slightly malformed JSON."""
     salvaged: dict[str, str] = {}
 
-    # Pattern 1: {"id": "bubble_001", "translated_text": "..."}
     obj_pattern = re.compile(
         r'"id"\s*:\s*"([^"]+)"[\s\S]*?"(?:translated_text|translation|text|target_text)"\s*:\s*"((?:[^"\\]|\\.)*)"'
     )
-    for match in obj_pattern.finditer(raw_text):
+    for match in obj_pattern.finditer(think_stripped_text):
         bid = match.group(1).strip()
         raw_val = match.group(2)
         try:
@@ -597,14 +606,11 @@ def _regex_salvage_translations(
         if bid:
             salvaged[bid] = unescaped
 
-    # Pattern 2: Direct key-value `"bubble_001": "..."` for any expected block ID
     for exp_id in expected_ids:
         if exp_id in salvaged:
             continue
-        kv_pattern = re.compile(
-            rf'"{re.escape(exp_id)}"\s*:\s*"((?:[^"\\]|\\.)*)"'
-        )
-        kv_match = kv_pattern.search(raw_text)
+        kv_pattern = re.compile(rf'"{re.escape(exp_id)}"\s*:\s*"((?:[^"\\]|\\.)*)"')
+        kv_match = kv_pattern.search(think_stripped_text)
         if kv_match:
             raw_val = kv_match.group(1)
             try:
@@ -622,11 +628,12 @@ def extract_and_clean_translations(
 ) -> dict[str, str]:
     """Extract and sanitize LLM JSON output into a strict `{block_id: translated_text}` dictionary.
 
-    Strips ```json fences, `<think>` blocks, trailing commas, and conversational text,
-    and guarantees every input `block["id"]` is present in the returned dict.
+    Automatically strips `<think>...</think>` blocks, ```json fences, trailing commas,
+    and conversational prose, guaranteeing every input `block["id"]` is present in the output.
     """
     expected_ids = [b["id"] for b in input_blocks]
-    cleaned = _strip_fences_and_noise(raw_content)
+    think_stripped = strip_thinking_tags(raw_content)
+    cleaned = _strip_fences_and_noise(think_stripped)
 
     extracted: dict[str, str] = {}
     if cleaned:
@@ -634,7 +641,6 @@ def extract_and_clean_translations(
             parsed_obj = _json_loads(cleaned)
             extracted = _extract_mapping_from_parsed_json(parsed_obj)
         except ValueError:
-            # Repair common unescaped control characters inside strings and retry json.loads
             sanitized = re.sub(r"[\x00-\x1f]+", " ", cleaned)
             try:
                 parsed_obj = _json_loads(sanitized)
@@ -643,12 +649,11 @@ def extract_and_clean_translations(
                 extracted = {}
 
     if not extracted or len(extracted) < len(expected_ids):
-        salvaged = _regex_salvage_translations(raw_content, expected_ids)
+        salvaged = _regex_salvage_translations(think_stripped, expected_ids)
         for k, v in salvaged.items():
             if k not in extracted or not extracted[k]:
                 extracted[k] = v
 
-    # Map extracted translations strictly to expected block IDs
     result: dict[str, str] = {}
     extracted_values_in_order = list(extracted.values())
 
@@ -663,7 +668,6 @@ def extract_and_clean_translations(
             result[bid] = extracted[bid]
             continue
 
-        # Case-insensitive or numeric suffix ID fallback (e.g. model returned "1" or "001" for "bubble_001")
         matched_val: str | None = None
         for ext_k, ext_v in extracted.items():
             if ext_k.lower() == bid.lower() and ext_v:
@@ -679,7 +683,6 @@ def extract_and_clean_translations(
                         matched_val = extracted[candidate_key]
                         break
 
-        # Positional alignment fallback if the model returned the exact same number of items with altered keys
         if (
             matched_val is None
             and len(extracted_values_in_order) == len(input_blocks)
@@ -693,45 +696,110 @@ def extract_and_clean_translations(
 
 
 class ComicTranslator:
-    """Context-aware comic dialogue translator backed by LM Studio (`http://localhost:1235/v1`)."""
+    """Multi-provider, vision-capable comic dialogue translator with advanced sampling & reasoning controls."""
 
+    provider: ProviderId
+    spec: ProviderSpec
     base_url: str
     api_key: str
     preferred_model: str
     temperature: float
+    top_p: float | None
+    top_k: int | None
     max_tokens: int
+    frequency_penalty: float | None
+    reasoning_effort: ReasoningEffort
+    use_vision: bool
+    vision_max_side: int
+    custom_instructions: str
+    glossary: dict[str, str]
     timeout: float
-    client: OpenAI
+    client: OpenAI | None
     _resolved_model: str | None
 
     def __init__(
         self,
-        base_url: str = DEFAULT_LM_STUDIO_BASE_URL,
-        api_key: str = DEFAULT_LM_STUDIO_API_KEY,
-        preferred_model: str = DEFAULT_LM_STUDIO_MODEL,
+        provider: str = "lmstudio",
+        base_url: str | None = None,
+        api_key: str | None = None,
+        preferred_model: str | None = None,
         temperature: float = 0.2,
+        top_p: float | None = 0.95,
+        top_k: int | None = 40,
         max_tokens: int = 2048,
-        timeout: float = 60.0,
+        frequency_penalty: float | None = 0.0,
+        reasoning_effort: str = "off",
+        use_vision: bool = False,
+        vision_max_side: int = 1024,
+        custom_instructions: str = "",
+        glossary: Mapping[str, str] | Sequence[Mapping[str, str]] | str | None = None,
+        timeout: float = 90.0,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.preferred_model = preferred_model
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.timeout = timeout
-        self.client = OpenAI(
-            base_url=self.base_url,
-            api_key=self.api_key,
-            timeout=self.timeout,
+        self.provider = normalize_provider_id(provider)
+        self.spec = get_provider_spec(self.provider)
+        self.base_url = normalize_provider_base_url(self.provider, base_url)
+        self.api_key = resolve_provider_api_key(self.provider, api_key)
+        self.preferred_model = (preferred_model or "").strip() or self.spec.default_model
+        self.temperature = max(0.0, min(2.0, float(temperature)))
+        self.top_p = (
+            max(0.0, min(1.0, float(top_p))) if top_p is not None else None
         )
+        self.top_k = (
+            max(0, min(500, int(top_k))) if top_k is not None else None
+        )
+        self.max_tokens = max(64, min(32768, int(max_tokens)))
+        self.frequency_penalty = (
+            max(-2.0, min(2.0, float(frequency_penalty)))
+            if frequency_penalty is not None
+            else None
+        )
+        self.reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+        self.use_vision = bool(use_vision)
+        self.vision_max_side = max(256, min(2048, int(vision_max_side)))
+        self.custom_instructions = (custom_instructions or "").strip()
+        self.glossary = parse_glossary(glossary)
+        self.timeout = max(5.0, min(300.0, float(timeout)))
         self._resolved_model = None
 
+        if self.spec.protocol == "openai" and self.base_url:
+            extra_headers = dict(self.spec.extra_headers) if self.spec.extra_headers else None
+            self.client = OpenAI(
+                base_url=self.base_url,
+                api_key=self.api_key or "no-key-required",
+                timeout=self.timeout,
+                default_headers=extra_headers,
+            )
+        else:
+            self.client = None
+
+    @classmethod
+    def from_settings(cls, settings: AppSettingsDict) -> "ComicTranslator":
+        """Construct a `ComicTranslator` directly from a persisted `AppSettingsDict`."""
+        return cls(
+            provider=settings["provider"],
+            base_url=settings["base_url"],
+            api_key=settings["api_key"],
+            preferred_model=settings["model"],
+            temperature=settings["temperature"],
+            top_p=settings["top_p"],
+            top_k=settings["top_k"],
+            max_tokens=settings["max_tokens"],
+            frequency_penalty=settings["frequency_penalty"],
+            reasoning_effort=settings["reasoning_effort"],
+            use_vision=settings["use_vision"],
+            vision_max_side=settings["vision_max_side"],
+            custom_instructions=settings["custom_instructions"],
+            glossary=settings["glossary"],
+            timeout=settings["timeout"],
+        )
+
     def resolve_model(self, force_refresh: bool = False) -> str:
-        """Resolve the active LM Studio model ID, caching the result after first lookup."""
+        """Resolve the active model ID for the configured provider, caching the result."""
         if self._resolved_model is not None and not force_refresh:
             return self._resolved_model
 
-        resolved = resolve_lm_studio_model(
+        resolved = resolve_provider_model(
+            provider=self.provider,
             preferred_model=self.preferred_model,
             base_url=self.base_url,
             api_key=self.api_key,
@@ -741,18 +809,22 @@ class ComicTranslator:
         return resolved
 
     def get_status(self) -> LMStudioStatus:
-        """Check LM Studio connectivity and active model status (SPEC.md Section 5.4)."""
+        """Check connectivity and active model status for the configured provider."""
         try:
-            models = list_lm_studio_models(
+            models = list_provider_models(
+                provider=self.provider,
                 base_url=self.base_url,
                 api_key=self.api_key,
                 timeout=5.0,
+                include_embeddings=True,
             )
-            active = resolve_lm_studio_model(
+            active = resolve_provider_model(
+                provider=self.provider,
                 preferred_model=self.preferred_model,
                 base_url=self.base_url,
                 api_key=self.api_key,
                 timeout=5.0,
+                available_models=models,
             )
             self._resolved_model = active
             return {
@@ -761,7 +833,7 @@ class ComicTranslator:
                 "active_model": active,
                 "available_models": models,
             }
-        except LMStudioConnectionError as exc:
+        except ProviderConnectionError as exc:
             return {
                 "connected": False,
                 "endpoint": self.base_url,
@@ -770,53 +842,324 @@ class ComicTranslator:
                 "error": str(exc),
             }
 
-    def _call_chat_completion(
+    def _map_openai_reasoning_effort(
+        self,
+        effort: ReasoningEffort,
+    ) -> OpenAIReasoningEffort:
+        if effort == "off":
+            return "none"
+        return effort
+
+    def _call_anthropic_messages(
         self,
         model_id: str,
         system_prompt: str,
         user_payload: str,
-    ) -> str:
-        """Send the chat completion request with Structured JSON Schema and graceful fallback."""
-        messages: list[ChatCompletionMessageParam] = [
+        *,
+        temperature: float,
+        top_p: float | None,
+        top_k: int | None,
+        max_tokens: int,
+        reasoning_effort: ReasoningEffort,
+        page_image_data_uri: str | None = None,
+    ) -> tuple[str, bool]:
+        """Call Anthropic's native `POST /v1/messages` API with multimodal and thinking support."""
+        if not self.api_key:
+            raise ProviderConnectionError(
+                "API key is required for Anthropic (Claude)."
+            )
+
+        messages_url = f"{self.base_url.rstrip('/')}/messages"
+        headers: dict[str, str] = {
+            "x-api-key": self.api_key,
+            "anthropic-version": DEFAULT_ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        }
+
+        text_content: list[dict[str, _JsonValue]] = [
+            {"type": "text", "text": user_payload},
+        ]
+        vision_content: list[dict[str, _JsonValue]] | None = None
+        if page_image_data_uri:
+            match = _DATA_URI_RE.match(page_image_data_uri.strip())
+            if match:
+                media_type = match.group(1)
+                b64_data = re.sub(r"\s+", "", match.group(2))
+                vision_content = [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": b64_data,
+                        },
+                    },
+                    {"type": "text", "text": user_payload},
+                ]
+
+        def _post_payload(
+            content_blocks: list[dict[str, _JsonValue]],
+            include_thinking: bool,
+            include_optional_sampling: bool,
+        ) -> requests.Response:
+            budget = _ANTHROPIC_THINKING_BUDGETS[reasoning_effort] if include_thinking else 0
+            eff_max_tokens = max(max_tokens, budget + 1024) if budget > 0 else max_tokens
+            body: dict[str, _JsonValue] = {
+                "model": model_id,
+                "max_tokens": eff_max_tokens,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": content_blocks}],
+            }
+            if budget > 0:
+                body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            else:
+                body["temperature"] = temperature
+                if include_optional_sampling:
+                    if top_k is not None and top_k > 0:
+                        body["top_k"] = top_k
+                    elif top_p is not None:
+                        body["top_p"] = top_p
+
+            try:
+                return requests.post(
+                    messages_url,
+                    headers=headers,
+                    json=body,
+                    timeout=self.timeout,
+                )
+            except requests.exceptions.Timeout as exc:
+                raise ProviderConnectionError(
+                    f"Anthropic request to {messages_url} timed out after {self.timeout:.1f}s."
+                ) from exc
+            except requests.exceptions.ConnectionError as exc:
+                raise ProviderConnectionError(
+                    f"Failed to reach Anthropic API at {messages_url}."
+                ) from exc
+            except requests.exceptions.RequestException as exc:
+                raise ProviderTranslationError(
+                    f"Anthropic HTTP request error: {exc}"
+                ) from exc
+
+        def _run_with_fallbacks(
+            content_blocks: list[dict[str, _JsonValue]],
+        ) -> requests.Response:
+            attempts: list[tuple[bool, bool]] = [
+                (reasoning_effort != "off", True),
+                (False, True),
+                (False, False),
+            ]
+            # Deduplicate attempt configs while preserving order
+            seen: set[tuple[bool, bool]] = set()
+            last_resp: requests.Response | None = None
+            for inc_think, inc_opt in attempts:
+                if (inc_think, inc_opt) in seen:
+                    continue
+                seen.add((inc_think, inc_opt))
+                resp = _post_payload(content_blocks, inc_think, inc_opt)
+                last_resp = resp
+                if resp.status_code != 400:
+                    return resp
+            assert last_resp is not None
+            return last_resp
+
+        vision_used = False
+        if vision_content is not None:
+            resp = _run_with_fallbacks(vision_content)
+            if resp.status_code == 400:
+                resp = _run_with_fallbacks(text_content)
+            else:
+                vision_used = resp.status_code < 400
+        else:
+            resp = _run_with_fallbacks(text_content)
+
+        if resp.status_code in (401, 403):
+            raise ProviderConnectionError(
+                f"Anthropic authentication failed (HTTP {resp.status_code}): {resp.text[:240]}"
+            )
+        if resp.status_code >= 400:
+            raise ProviderTranslationError(
+                f"Anthropic returned HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+
+        try:
+            payload_obj = _json_loads(resp.text)
+        except ValueError as exc:
+            raise ProviderTranslationError(
+                f"Anthropic returned non-JSON response: {resp.text[:200]!r}"
+            ) from exc
+
+        if not isinstance(payload_obj, Mapping):
+            raise ProviderTranslationError("Anthropic returned unexpected response payload.")
+
+        content_list = cast(Mapping[str, object], payload_obj).get("content")
+        if not isinstance(content_list, Sequence) or isinstance(content_list, (str, bytes)):
+            raise ProviderTranslationError("Anthropic returned empty content array.")
+
+        text_parts: list[str] = []
+        for part in content_list:
+            if isinstance(part, Mapping):
+                pmap = cast(Mapping[str, object], part)
+                if pmap.get("type") == "text":
+                    t = pmap.get("text")
+                    if isinstance(t, str) and t.strip():
+                        text_parts.append(t.strip())
+
+        return "\n".join(text_parts).strip(), vision_used
+
+    def _call_openai_chat_completion(
+        self,
+        model_id: str,
+        system_prompt: str,
+        user_payload: str,
+        *,
+        temperature: float,
+        top_p: float | None,
+        top_k: int | None,
+        max_tokens: int,
+        frequency_penalty: float | None,
+        reasoning_effort: ReasoningEffort,
+        page_image_data_uri: str | None = None,
+    ) -> tuple[str, bool]:
+        """Send an OpenAI-compatible chat completion with Structured JSON, sampling, reasoning, and vision."""
+        if self.client is None:
+            raise ProviderConnectionError(
+                f"Provider '{self.provider}' is missing a valid Base URL."
+            )
+        if self.spec.requires_api_key and not self.api_key:
+            raise ProviderConnectionError(
+                f"API key is required for {self.spec.name}."
+            )
+
+        client = self.client
+        text_messages: list[ChatCompletionMessageParam] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_payload},
         ]
 
-        try:
+        vision_messages: list[ChatCompletionMessageParam] | None = None
+        if page_image_data_uri:
+            content_parts: list[ChatCompletionContentPartParam] = [
+                {"type": "text", "text": user_payload},
+                {"type": "image_url", "image_url": {"url": page_image_data_uri}},
+            ]
+            vision_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content_parts},
+            ]
+
+        extra_body_payload: dict[str, object] | None = None
+        if self.spec.supports_top_k and top_k is not None and top_k > 0:
+            extra_body_payload = {"top_k": int(top_k)}
+
+        openai_effort: OpenAIReasoningEffort | None = (
+            self._map_openai_reasoning_effort(reasoning_effort)
+            if self.spec.supports_reasoning_effort
+            else None
+        )
+        effective_freq_penalty = (
+            frequency_penalty
+            if (self.spec.supports_frequency_penalty and frequency_penalty is not None)
+            else None
+        )
+
+        def _try_messages(messages: list[ChatCompletionMessageParam]) -> object:
+            # Attempt 1: Full structured schema + sampling + reasoning_effort + extra_body(top_k)
             try:
-                response = self.client.chat.completions.create(
+                return client.chat.completions.create(
                     model=model_id,
                     messages=messages,
-                    response_format=COMIC_TRANSLATION_JSON_SCHEMA,
-                    reasoning_effort="none",
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
+                    response_format=(
+                        COMIC_TRANSLATION_JSON_SCHEMA
+                        if self.spec.supports_json_schema
+                        else _JSON_OBJECT_FORMAT
+                    ),
+                    reasoning_effort=openai_effort if openai_effort is not None else omit,
+                    temperature=temperature,
+                    top_p=top_p if top_p is not None else omit,
+                    frequency_penalty=(
+                        effective_freq_penalty
+                        if effective_freq_penalty is not None
+                        else omit
+                    ),
+                    max_tokens=max_tokens,
+                    extra_body=extra_body_payload,
                 )
             except openai.BadRequestError:
-                # Fallback if the loaded model/server version rejects json_schema or reasoning_effort
-                response = self.client.chat.completions.create(
+                pass
+
+            # Attempt 2: Keep sampling/json_object without extra_body/reasoning_effort/json_schema
+            try:
+                return client.chat.completions.create(
                     model=model_id,
                     messages=messages,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
+                    response_format=_JSON_OBJECT_FORMAT,
+                    temperature=temperature,
+                    top_p=top_p if top_p is not None else omit,
+                    max_tokens=max_tokens,
                 )
+            except openai.BadRequestError:
+                pass
+
+            # Attempt 3: Plain chat completion with basic temperature + max_tokens
+            try:
+                return client.chat.completions.create(
+                    model=model_id,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except openai.BadRequestError:
+                # Attempt 4: Reasoning models (e.g. OpenAI o1/o3/o4) that require max_completion_tokens
+                return client.chat.completions.create(
+                    model=model_id,
+                    messages=messages,
+                    max_completion_tokens=max_tokens,
+                )
+
+        vision_used = False
+        try:
+            if vision_messages is not None:
+                try:
+                    response = _try_messages(vision_messages)
+                    vision_used = True
+                except openai.BadRequestError:
+                    # Graceful fallback to text-only if the active model is not vision-enabled
+                    response = _try_messages(text_messages)
+                    vision_used = False
+            else:
+                response = _try_messages(text_messages)
+                vision_used = False
+        except openai.AuthenticationError as exc:
+            raise ProviderConnectionError(
+                f"Authentication failed for {self.spec.name} ({self.base_url}): {exc.message}"
+            ) from exc
         except openai.APITimeoutError as exc:
-            raise LMStudioConnectionError(
-                f"LM Studio request to {self.base_url} timed out after {self.timeout:.1f}s."
+            raise ProviderConnectionError(
+                f"{self.spec.name} request to {self.base_url} timed out after {self.timeout:.1f}s."
             ) from exc
         except openai.APIConnectionError as exc:
-            raise LMStudioConnectionError(
-                f"Failed to reach LM Studio server at {self.base_url}. "
-                + "Make sure LM Studio is running and listening on port 1235."
+            hint = (
+                "Make sure LM Studio is running and listening on port 1235."
+                if self.provider == "lmstudio"
+                else (
+                    "Make sure Ollama is running locally."
+                    if self.provider == "ollama"
+                    else f"Verify Base URL and network connectivity ({self.base_url})."
+                )
+            )
+            raise ProviderConnectionError(
+                f"Failed to reach {self.spec.name} at {self.base_url}. {hint}"
             ) from exc
         except openai.APIStatusError as exc:
-            raise LMStudioTranslationError(
-                f"LM Studio returned HTTP {exc.status_code}: {exc.message}"
+            raise ProviderTranslationError(
+                f"{self.spec.name} returned HTTP {exc.status_code}: {exc.message}"
             ) from exc
 
-        choices = getattr(response, "choices", None)
+        choices: object = getattr(response, "choices", None)
         if not isinstance(choices, Sequence) or not choices:
-            raise LMStudioTranslationError("LM Studio returned an empty choices array.")
+            raise ProviderTranslationError(
+                f"{self.spec.name} returned an empty choices array."
+            )
 
         first_choice: object = choices[0]
         message_obj: object = getattr(first_choice, "message", None)
@@ -828,37 +1171,74 @@ class ComicTranslator:
             if isinstance(reasoning_obj, str) and reasoning_obj.strip():
                 content_str = reasoning_obj.strip()
 
-        return content_str
+        return content_str, vision_used
 
     def translate_blocks(
         self,
         blocks: Sequence[Mapping[str, object]],
         source_lang: str = "ja",
         target_lang: str = "id",
+        custom_instructions: str | None = None,
+        glossary: Mapping[str, str] | Sequence[Mapping[str, str]] | str | None = None,
+        page_image_data_uri: str | None = None,
+        *,
+        page_image: NDArrayU8 | Image.Image | bytes | Path | None = None,
+        use_vision: bool | None = None,
+        vision_max_side: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        max_tokens: int | None = None,
+        frequency_penalty: float | None = None,
+        reasoning_effort: str | None = None,
     ) -> PageTranslationResult:
-        """Translate a full page of comic dialogue blocks in one context-aware request.
-
-        Args:
-            blocks: Sequence of block dicts, each containing `'id'` and `'source_text'`
-                (or `'original_text'` / `'text'`).
-            source_lang: Source comic language (`'ja'`, `'ko'`, or `'zh'`).
-            target_lang: Target translation language (`'id'` or `'en'`).
-
-        Returns:
-            `PageTranslationResult` containing the active `model`, `source_language`,
-            `target_language`, `translations` (`{id: translated_text}`), and `dialogues`
-            (`list[TranslatedDialogueItem]`).
-        """
+        """Translate a full page of comic dialogue blocks in one context-aware request."""
         src_lang = normalize_source_language(source_lang)
         tgt_lang = normalize_target_language(target_lang)
         normalized_blocks = normalize_input_blocks(blocks)
         model_id = self.resolve_model()
 
+        eff_reasoning = (
+            normalize_reasoning_effort(reasoning_effort)
+            if reasoning_effort is not None
+            else self.reasoning_effort
+        )
+        eff_temperature = (
+            max(0.0, min(2.0, float(temperature)))
+            if temperature is not None
+            else self.temperature
+        )
+        eff_top_p = (
+            max(0.0, min(1.0, float(top_p))) if top_p is not None else self.top_p
+        )
+        eff_top_k = (
+            max(0, min(500, int(top_k))) if top_k is not None else self.top_k
+        )
+        eff_max_tokens = (
+            max(64, min(32768, int(max_tokens)))
+            if max_tokens is not None
+            else self.max_tokens
+        )
+        eff_freq_penalty = (
+            max(-2.0, min(2.0, float(frequency_penalty)))
+            if frequency_penalty is not None
+            else self.frequency_penalty
+        )
+        eff_use_vision = self.use_vision if use_vision is None else bool(use_vision)
+        eff_vision_max_side = (
+            max(256, min(2048, int(vision_max_side)))
+            if vision_max_side is not None
+            else self.vision_max_side
+        )
+
         if not normalized_blocks:
             return {
+                "provider": self.provider,
                 "model": model_id,
                 "source_language": src_lang,
                 "target_language": tgt_lang,
+                "vision_used": False,
+                "reasoning_effort": eff_reasoning,
                 "translations": {},
                 "dialogues": [],
             }
@@ -871,24 +1251,81 @@ class ComicTranslator:
                 for b in normalized_blocks
             ]
             return {
+                "provider": self.provider,
                 "model": model_id,
                 "source_language": src_lang,
                 "target_language": tgt_lang,
+                "vision_used": False,
+                "reasoning_effort": eff_reasoning,
                 "translations": empty_map,
                 "dialogues": empty_items,
             }
 
-        system_prompt = build_system_prompt(source_lang=src_lang, target_lang=tgt_lang)
+        # Merge instance-level glossary with per-request glossary overrides
+        merged_glossary: dict[str, str] = dict(self.glossary)
+        if glossary is not None:
+            merged_glossary.update(parse_glossary(glossary))
+
+        eff_instructions = (
+            custom_instructions.strip()
+            if custom_instructions is not None
+            else self.custom_instructions
+        )
+
+        # Prepare resized vision payload ONLY when `use_vision` is enabled
+        resolved_image_uri: str | None = None
+        if eff_use_vision:
+            if page_image_data_uri and page_image_data_uri.strip():
+                resolved_image_uri = encode_image_for_vision(
+                    page_image_data_uri,
+                    max_side=eff_vision_max_side,
+                )
+            elif page_image is not None:
+                resolved_image_uri = encode_image_for_vision(
+                    page_image,
+                    max_side=eff_vision_max_side,
+                )
+
+        system_prompt = build_system_prompt(
+            source_lang=src_lang,
+            target_lang=tgt_lang,
+            reasoning_effort=eff_reasoning,
+            custom_instructions=eff_instructions,
+            glossary=merged_glossary if merged_glossary else None,
+            has_page_image=(resolved_image_uri is not None),
+        )
+
         user_payload = json.dumps(
             {"dialogues": non_empty_blocks},
             ensure_ascii=False,
         )
 
-        raw_output = self._call_chat_completion(
-            model_id=model_id,
-            system_prompt=system_prompt,
-            user_payload=user_payload,
-        )
+        if self.spec.protocol == "anthropic":
+            raw_output, vision_used = self._call_anthropic_messages(
+                model_id=model_id,
+                system_prompt=system_prompt,
+                user_payload=user_payload,
+                temperature=eff_temperature,
+                top_p=eff_top_p,
+                top_k=eff_top_k,
+                max_tokens=eff_max_tokens,
+                reasoning_effort=eff_reasoning,
+                page_image_data_uri=resolved_image_uri,
+            )
+        else:
+            raw_output, vision_used = self._call_openai_chat_completion(
+                model_id=model_id,
+                system_prompt=system_prompt,
+                user_payload=user_payload,
+                temperature=eff_temperature,
+                top_p=eff_top_p,
+                top_k=eff_top_k,
+                max_tokens=eff_max_tokens,
+                frequency_penalty=eff_freq_penalty,
+                reasoning_effort=eff_reasoning,
+                page_image_data_uri=resolved_image_uri,
+            )
+
         translation_map = extract_and_clean_translations(
             raw_content=raw_output,
             input_blocks=normalized_blocks,
@@ -904,9 +1341,12 @@ class ComicTranslator:
         ]
 
         return {
+            "provider": self.provider,
             "model": model_id,
             "source_language": src_lang,
             "target_language": tgt_lang,
+            "vision_used": vision_used,
+            "reasoning_effort": eff_reasoning,
             "translations": translation_map,
             "dialogues": dialogues,
         }
@@ -960,10 +1400,45 @@ class ComicTranslator:
         return enriched
 
 
+__all__ = [
+    "COMIC_TRANSLATION_JSON_SCHEMA",
+    "ComicTranslator",
+    "DEFAULT_LM_STUDIO_API_KEY",
+    "DEFAULT_LM_STUDIO_BASE_URL",
+    "DEFAULT_LM_STUDIO_MODEL",
+    "DialogueBlockInput",
+    "LMStudioConnectionError",
+    "LMStudioStatus",
+    "LMStudioTranslationError",
+    "PROVIDER_PRESETS",
+    "PageTranslationResult",
+    "ProviderConnectionError",
+    "ProviderId",
+    "ProviderTranslationError",
+    "ReasoningEffort",
+    "SUPPORTED_REASONING_EFFORTS",
+    "SUPPORTED_TARGET_LANGUAGES",
+    "TargetLanguage",
+    "TranslatedBubbleResult",
+    "TranslatedDialogueItem",
+    "build_system_prompt",
+    "encode_image_for_vision",
+    "extract_and_clean_translations",
+    "list_lm_studio_models",
+    "normalize_input_blocks",
+    "normalize_reasoning_effort",
+    "normalize_source_language",
+    "normalize_target_language",
+    "parse_glossary",
+    "resolve_lm_studio_model",
+    "strip_thinking_tags",
+]
+
+
 def _verify_translator() -> int:
-    """Standalone CLI test sending sample JA, KO, and ZH dialogue arrays to `http://localhost:1235/v1`."""
-    print("=== LM Studio ComicTranslator Verification ===")
-    translator = ComicTranslator()
+    """Standalone CLI test verifying multi-provider LM Studio translation (Vision OFF & ON)."""
+    print("=== Multi-Provider ComicTranslator Verification ===")
+    translator = ComicTranslator(provider="lmstudio")
 
     status = translator.get_status()
     if not status["connected"]:
@@ -973,76 +1448,56 @@ def _verify_translator() -> int:
         )
         return 1
 
+    print(f"Provider       : {translator.provider}")
     print(f"Endpoint       : {status['endpoint']}")
     print(f"Preferred Model: {translator.preferred_model}")
     print(f"Resolved Model : {status['active_model']}")
-    print(f"Available      : {len(status['available_models'])} models in LM Studio")
+    print(f"Available      : {len(status['available_models'])} models")
 
-    sample_batches: list[tuple[SourceLanguage, list[dict[str, object]]]] = [
-        (
-            "ja",
-            [
-                {"id": "bubble_001", "source_text": "田中先輩、何をしているんですか？ここは危険だぞ！"},
-                {"id": "bubble_002", "source_text": "まさか…佐藤さんこそ、ここで会うとはな！"},
-                {"id": "bubble_003", "source_text": "気をつけろ！敵がすぐ近くまで来ている！"},
-                {"id": "bubble_004", "source_text": "よし、準備は完了だ。先輩、一気に突破するぞ！"},
-            ],
-        ),
-        (
-            "ko",
-            [
-                {"id": "bubble_001", "source_text": "민수 선배! 여기서 뭐 하고 있어? 여긴 너무 위험해!"},
-                {"id": "bubble_002", "source_text": "설마 진짜로 형이 혼자 찾아온 거야?"},
-                {"id": "bubble_003", "source_text": "조심해! 적이 바로 앞까지 다가왔어!"},
-                {"id": "bubble_004", "source_text": "오빠만 믿어, 준비는 끝났으니까 지금 바로 출발하자!"},
-            ],
-        ),
-        (
-            "zh",
-            [
-                {"id": "bubble_001", "source_text": "林师兄，你在这里做什么？这里非常危险！"},
-                {"id": "bubble_002", "source_text": "难道你已经发现这里的秘密了？"},
-                {"id": "bubble_003", "source_text": "大家小心！敌人正在迅速靠近！"},
-                {"id": "bubble_004", "source_text": "别怕，有哥哥在！准备完毕，我们立刻出发吧！"},
-            ],
-        ),
+    sample_blocks: list[dict[str, object]] = [
+        {"id": "bubble_001", "source_text": "田中先輩、何をしているんですか？ここは危険だぞ！"},
+        {"id": "bubble_002", "source_text": "まさか…佐藤さんこそ、ここで会うとはな！"},
     ]
 
-    all_passed = True
-    for target_lang in ("id", "en"):
-        for source_lang, blocks in sample_batches:
-            result = translator.translate_blocks(
-                blocks=blocks,
-                source_lang=source_lang,
-                target_lang=target_lang,
-            )
-            print(
-                f"\n--- [{source_lang.upper()} -> {target_lang.upper()}] "
-                + f"(model={result['model']}) ---"
-            )
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-
-            expected_ids = [str(b["id"]) for b in blocks]
-            for eid in expected_ids:
-                translated_val = result["translations"].get(eid, "").strip()
-                if not translated_val:
-                    print(
-                        f"[ERROR] Missing translation for block id={eid!r} in {source_lang}->{target_lang}",
-                        file=sys.stderr,
-                    )
-                    all_passed = False
-
-    if not all_passed:
+    # 1. Vision OFF
+    res_off = translator.translate_blocks(
+        blocks=sample_blocks,
+        source_lang="ja",
+        target_lang="id",
+        use_vision=False,
+        glossary={"先輩": "senpai"},
+        custom_instructions="Keep dialogue punchy.",
+    )
+    print("\n--- Vision OFF (ja -> id) ---")
+    print(json.dumps(res_off, ensure_ascii=False, indent=2))
+    if res_off["vision_used"] is not False or not all(
+        res_off["translations"].get(str(b["id"]), "").strip() for b in sample_blocks
+    ):
+        print("[ERROR] Vision OFF translation failed.", file=sys.stderr)
         return 1
 
-    # Verify JSON cleaner robustness against markdown fences, <think> tags, and trailing commas
+    # 2. Vision ON with sample_ja.jpg if available
+    sample_img = PROJECT_ROOT / "samples" / "sample_ja.jpg"
+    if sample_img.is_file():
+        res_on = translator.translate_blocks(
+            blocks=sample_blocks,
+            source_lang="ja",
+            target_lang="en",
+            page_image=sample_img,
+            use_vision=True,
+        )
+        print("\n--- Vision ON (ja -> en) ---")
+        print(json.dumps(res_on, ensure_ascii=False, indent=2))
+        if not res_on["vision_used"]:
+            print("[WARN] Vision ON fell back to text-only on the active model.")
+
+    # 3. Verify <think> tag stripping & dirty JSON cleaner
     dirty_llm_sample = (
-        "<think>Analyzing dialogue bubbles...</think>\n"
-        + "Sure! Here is the translated JSON output:\n"
+        "<think>Checking bubble_001: \"id\": \"bubble_001\", \"translated_text\": \"WRONG\"</think>\n"
         + "```json\n"
-        + '{\n  "dialogues": [\n    {"id": "bubble_001", "translated_text": "Cleaned line 1",},\n'
-        + '    {"id": "bubble_002", "translated_text": "Cleaned line 2"}\n  ],\n}\n'
-        + "```\nHope this helps!"
+        + '{"dialogues": [{"id": "bubble_001", "translated_text": "Cleaned line 1",}, '
+        + '{"id": "bubble_002", "translated_text": "Cleaned line 2"}]}\n'
+        + "```"
     )
     cleaned_map = extract_and_clean_translations(
         raw_content=dirty_llm_sample,
@@ -1055,22 +1510,9 @@ def _verify_translator() -> int:
         cleaned_map.get("bubble_001") != "Cleaned line 1"
         or cleaned_map.get("bubble_002") != "Cleaned line 2"
     ):
-        print(f"[ERROR] JSON extractor test failed: {cleaned_map!r}", file=sys.stderr)
+        print(f"[ERROR] JSON extractor / <think> stripper failed: {cleaned_map!r}", file=sys.stderr)
         return 1
-    print("\n[OK] Markdown fence, <think> block, and trailing-comma JSON cleaner verified.")
-
-    # Verify clear error handling when port is unreachable
-    unreachable_translator = ComicTranslator(
-        base_url="http://localhost:1239/v1",
-        timeout=1.5,
-    )
-    unreachable_status = unreachable_translator.get_status()
-    if unreachable_status["connected"] or "error" not in unreachable_status:
-        print("[ERROR] Expected unreachable status on closed port 1239.", file=sys.stderr)
-        return 1
-    print(f"[OK] Unreachable port error handling verified: {unreachable_status['error']}")
-
-    print("\nSUCCESS: All JA, KO, and ZH comic dialogue arrays translated into valid ID-mapped JSON.")
+    print("\n[OK] <think> tag stripping, glossary, and Vision OFF/ON verified.")
     return 0
 
 

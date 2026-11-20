@@ -10,6 +10,7 @@ Outputs:
 
 import base64
 from collections.abc import Sequence
+import gc
 import io
 from pathlib import Path
 import sys
@@ -17,7 +18,6 @@ from typing import Literal, Protocol, TypedDict, cast
 
 import cv2
 import numpy as np
-import onnxruntime as ort  # pyright: ignore[reportMissingTypeStubs]
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from backend.core.model_manager import (  # noqa: E402
     ModelManager,
+    create_onnx_session,
     get_execution_provider,
 )
 
@@ -236,7 +237,7 @@ def sort_bubbles_reading_order(
 
 
 class ComicTextDetector:
-    """ONNX Comic Text Detector wrapper with lazy session loading and hardware fallback."""
+    """ONNX Comic Text Detector wrapper with lazy session loading, GPU/DirectML -> CPU fallback, and clean unload."""
 
     INPUT_SIZE: int = 1024
 
@@ -248,8 +249,10 @@ class ComicTextDetector:
     mask_threshold: float
     box_padding: int
     dilate_kernel_size: int
+    force_cpu: bool
     _session: _OrtSession | None
     _active_provider: str | None
+    _last_provider: str | None
 
     def __init__(
         self,
@@ -260,6 +263,7 @@ class ComicTextDetector:
         mask_threshold: float = 0.35,
         box_padding: int = 6,
         dilate_kernel_size: int = 5,
+        force_cpu: bool = False,
     ) -> None:
         self.model_manager = model_manager or ModelManager()
         self._custom_model_path = (
@@ -277,13 +281,18 @@ class ComicTextDetector:
         self.mask_threshold = mask_threshold
         self.box_padding = box_padding
         self.dilate_kernel_size = dilate_kernel_size
+        self.force_cpu = force_cpu
         self._session = None
         self._active_provider = None
+        self._last_provider = None
 
-    def _get_session(self) -> _OrtSession:
-        """Lazily initialize the ONNX Runtime session with CUDA -> CPU fallback."""
-        if self._session is not None:
+    def _get_session(self, fallback_cpu: bool = False) -> _OrtSession:
+        """Lazily initialize the ONNX Runtime session with CUDA / DirectML -> CPU fallback."""
+        if self._session is not None and not fallback_cpu:
             return self._session
+
+        if fallback_cpu and self._session is not None:
+            self.unload()
 
         self.model_path = (
             self._custom_model_path
@@ -296,36 +305,35 @@ class ComicTextDetector:
                 + "Run ModelManager.download_missing_models() first."
             )
 
-        primary_provider = get_execution_provider()
-        preferred_providers: list[str] = (
-            ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if primary_provider == "CUDAExecutionProvider"
-            else ["CPUExecutionProvider"]
+        raw_session, active_provider = create_onnx_session(
+            self.model_path,
+            force_cpu=(self.force_cpu or fallback_cpu),
         )
-
-        try:
-            raw_session = ort.InferenceSession(
-                str(self.model_path),
-                providers=preferred_providers,
-            )
-            self._active_provider = primary_provider
-        except Exception:
-            raw_session = ort.InferenceSession(
-                str(self.model_path),
-                providers=["CPUExecutionProvider"],
-            )
-            self._active_provider = "CPUExecutionProvider"
-
         session = cast(_OrtSession, cast(object, raw_session))
         self._session = session
+        self._active_provider = active_provider
+        self._last_provider = active_provider
         return session
 
     @property
+    def is_loaded(self) -> bool:
+        """Return True if the Comic Text Detector ONNX session is currently resident in memory."""
+        return self._session is not None
+
+    @property
     def execution_provider(self) -> str:
-        """Return the active ONNX Runtime execution provider."""
-        if self._active_provider is None:
-            _ = self._get_session()
-        return self._active_provider or "CPUExecutionProvider"
+        """Return the active or most recently used ONNX Runtime execution provider."""
+        if self._active_provider is not None:
+            return self._active_provider
+        if self._last_provider is not None:
+            return self._last_provider
+        return get_execution_provider(force_cpu=self.force_cpu)
+
+    def unload(self) -> None:
+        """Release the ONNX Runtime session from RAM/VRAM and run garbage collection."""
+        self._session = None
+        self._active_provider = None
+        _ = gc.collect()
 
     def _preprocess(
         self,
@@ -507,6 +515,7 @@ class ComicTextDetector:
         box_padding: int | None = None,
         dilate_kernel_size: int | None = None,
         restrict_mask_to_bboxes: bool = True,
+        auto_unload: bool = True,
     ) -> DetectionResult:
         """Run Comic Text Detector on `image` and return sorted bounding boxes and binary text mask."""
         rgb = load_rgb_image(image)
@@ -522,17 +531,34 @@ class ComicTextDetector:
             else dilate_kernel_size
         )
 
-        session = self._get_session()
-        input_name = session.get_inputs()[0].name
-
         input_tensor, scale, new_w, new_h = self._preprocess(rgb)
-        raw_outputs = session.run(
-            None,
-            {input_name: input_tensor},
-        )
-        blk_output = np.asarray(raw_outputs[0], dtype=np.float32)
-        seg_output = np.asarray(raw_outputs[1], dtype=np.float32)
-        det_output = np.asarray(raw_outputs[2], dtype=np.float32)
+
+        try:
+            session = self._get_session()
+            input_name = session.get_inputs()[0].name
+            try:
+                raw_outputs = session.run(
+                    None,
+                    {input_name: input_tensor},
+                )
+            except Exception:
+                if self._active_provider == "CPUExecutionProvider":
+                    raise
+                # Automatic safe CPU fallback if CUDA/DirectML fails during inference
+                session = self._get_session(fallback_cpu=True)
+                input_name = session.get_inputs()[0].name
+                raw_outputs = session.run(
+                    None,
+                    {input_name: input_tensor},
+                )
+
+            provider_used = self._active_provider or "CPUExecutionProvider"
+            blk_output = np.asarray(raw_outputs[0], dtype=np.float32)
+            seg_output = np.asarray(raw_outputs[1], dtype=np.float32)
+            det_output = np.asarray(raw_outputs[2], dtype=np.float32)
+        finally:
+            if auto_unload:
+                self.unload()
 
         raw_boxes = self._decode_blocks(
             blk_output=blk_output,
@@ -565,7 +591,7 @@ class ComicTextDetector:
 
         return {
             "dimensions": {"width": orig_w, "height": orig_h},
-            "execution_provider": self.execution_provider,
+            "execution_provider": provider_used,
             "bubbles": bubbles,
             "mask": binary_mask,
         }

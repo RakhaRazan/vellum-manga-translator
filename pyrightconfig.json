@@ -1,0 +1,25 @@
+{
+  "include": [
+    "backend",
+    "packaging"
+  ],
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.*",
+    "backend/venv",
+    ".venv",
+    "frontend",
+    "models",
+    "samples",
+    "packaging/build",
+    "packaging/dist"
+  ],
+  "extraPaths": [
+    "."
+  ],
+  "venvPath": "backend",
+  "venv": "venv",
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "recommended"
+}
