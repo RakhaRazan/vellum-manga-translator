@@ -5,7 +5,7 @@
 [![React 19 + Konva](https://img.shields.io/badge/Frontend-React%2019%20%2B%20Konva%20v2-61DAFB?logo=react&logoColor=black)](frontend/package.json)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20x64-0078D6?logo=windows&logoColor=white)](packaging/build_cpp_release.bat)
 
-A **100% local-first, offline-capable** native Windows desktop studio for detecting, OCR-ing, inpainting, translating, and typesetting **Japanese Manga (`ja`)**, **Korean Manhwa (`ko`)**, and **Chinese Manhua (`zh`)** into **16 target languages** (including Indonesian, English, and more).
+A **local & offline** native Windows desktop studio for detecting, OCR-ing, inpainting, translating, and typesetting **Japanese Manga (`ja`)**, **Korean Manhwa (`ko`)**, and **Chinese Manhua (`zh`)** into **16 target languages** (including Indonesian, English, and more).
 
 Built with a **pure modern C++17 native desktop backend** (`cpp-httplib` + `webview.h` Edge WebView2 + ONNX Runtime C++ SDK) paired with an interactive **React 19 + Zustand + `react-konva` v2 typesetting studio** — delivering **<1s cold startup**, **~20.5 MB standalone disk footprint (~7.7 MB `.zip`)**, and **<100 MB idle backend RAM** with zero Python, PyTorch, OpenCV, Tauri/Rust, or Electron runtime bloat.
 
