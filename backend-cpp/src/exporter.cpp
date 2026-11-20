@@ -16,9 +16,11 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -30,9 +32,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr size_t kMaxArchivePages = 500;
-constexpr size_t kMaxArchiveUncompressedBytes = 1024ULL * 1024ULL * 1024ULL;  // 1 GiB
-constexpr size_t kMaxSingleImageBytes = 64ULL * 1024ULL * 1024ULL;            // 64 MiB
+constexpr size_t kMaxArchivePages = 10000;
+constexpr size_t kMaxArchiveUncompressedBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;  // 8 GiB
+constexpr size_t kMaxSingleImageBytes = 64ULL * 1024ULL * 1024ULL;                   // 64 MiB
 
 struct StbiDeleter {
     void operator()(unsigned char* ptr) const noexcept {
@@ -411,8 +413,7 @@ fs::path get_image_cache_dir() {
     if (auto env_cache = util::get_env_wide(L"MANGA_CACHE_DIR")) {
         dir = fs::path(*env_cache);
     } else {
-        std::error_code ec;
-        dir = fs::temp_directory_path(ec) / L"mangaflow_cache" / L"images";
+        dir = util::get_comic_translator_app_dir() / L"cache" / L"images";
     }
     std::error_code ec;
     fs::create_directories(dir, ec);
@@ -420,7 +421,20 @@ fs::path get_image_cache_dir() {
     return ec ? dir : canon;
 }
 
+fs::path get_export_sessions_dir() {
+    fs::path dir = get_image_cache_dir().parent_path() / L"exports";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    fs::path canon = fs::weakly_canonical(dir, ec);
+    return ec ? dir : canon;
+}
+
 void prune_image_cache(const fs::path& cache_dir, size_t max_files) {
+    // Throttle directory scans during high-volume multi-thousand-page batches
+    static std::atomic<uint64_t> s_prune_calls{0};
+    if ((s_prune_calls.fetch_add(1, std::memory_order_relaxed) & 63ULL) != 0ULL) {
+        return;
+    }
     std::error_code ec;
     std::vector<std::pair<fs::file_time_type, fs::path>> files;
     for (const auto& entry : fs::directory_iterator(cache_dir, ec)) {
@@ -710,7 +724,7 @@ std::vector<ExtractedArchivePage> extract_archive_pages(
     for (const auto& c : candidates) {
         declared_total += c.uncompressed_size;
         if (declared_total > kMaxArchiveUncompressedBytes) {
-            throw ArchiveImportError("Archive uncompressed size exceeds the 1 GiB safety limit.");
+            throw ArchiveImportError("Archive uncompressed size exceeds the 8 GiB safety limit.");
         }
     }
 
@@ -738,7 +752,7 @@ std::vector<ExtractedArchivePage> extract_archive_pages(
         }
         cumulative_bytes += raw_bytes.size();
         if (cumulative_bytes > kMaxArchiveUncompressedBytes) {
-            throw ArchiveImportError("Archive extracted payload exceeds the 1 GiB safety limit.");
+            throw ArchiveImportError("Archive extracted payload exceeds the 8 GiB safety limit.");
         }
 
         const DetectedImageFormat fmt = detect_image_magic(raw_bytes);
@@ -1159,6 +1173,340 @@ std::vector<uint8_t> build_pdf_bytes(const std::vector<ExportPageInput>& pages) 
         std::to_string(xref_offset) + "\n%%EOF\n");
 
     return pdf;
+}
+
+// -----------------------------------------------------------------------------
+// Disk-Backed O(1)-RAM CBZ & PDF Writers (Supports 1,500 - 10,000+ Pages)
+// -----------------------------------------------------------------------------
+
+void build_cbz_to_file(
+    const std::vector<DiskExportPageEntry>& pages,
+    const fs::path& output_path,
+    ExportImageFormat image_format,
+    int jpeg_quality) {
+    if (pages.empty()) {
+        throw ComicExportError("At least one page image is required to export a .cbz archive.");
+    }
+    if (pages.size() > kMaxArchivePages) {
+        throw ComicExportError(
+            "Cannot export " + std::to_string(pages.size()) +
+            " pages; maximum is " + std::to_string(kMaxArchivePages) + ".");
+    }
+
+    const size_t pad_width = std::max<size_t>(4, std::to_string(pages.size()).size());
+
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, output_path.c_str(), L"wb") != 0 || !fp) {
+        throw ComicExportError("Failed to create output CBZ file on disk.");
+    }
+    struct FileGuard {
+        FILE* f = nullptr;
+        ~FileGuard() {
+            if (f) std::fclose(f);
+        }
+    } file_guard{fp};
+
+    mz_zip_archive zip{};
+    if (!mz_zip_writer_init_cfile(&zip, fp, 0)) {
+        throw ComicExportError("Failed to initialize disk-backed CBZ writer.");
+    }
+    bool finalized = false;
+    struct ZipWriterGuard {
+        mz_zip_archive* z;
+        bool* done;
+        ~ZipWriterGuard() {
+            if (!*done) {
+                mz_zip_writer_end(z);
+            }
+        }
+    } zip_guard{&zip, &finalized};
+
+    for (size_t i = 0; i < pages.size(); ++i) {
+        const int page_num = static_cast<int>(i + 1);
+        const auto raw_opt = util::read_file_bytes(pages[i].file_path);
+        if (!raw_opt.has_value() || raw_opt->empty()) {
+            throw ComicExportError("Page " + std::to_string(page_num) + " image file is missing or empty.");
+        }
+        const auto& raw = *raw_opt;
+        if (raw.size() > kMaxSingleImageBytes) {
+            throw ComicExportError("Page " + std::to_string(page_num) + " exceeds maximum allowed image size.");
+        }
+
+        const DetectedImageFormat fmt = detect_image_magic(raw);
+        const uint8_t* write_ptr = raw.data();
+        size_t write_size = raw.size();
+        std::vector<uint8_t> reencoded;
+        std::string ext;
+
+        // Zero-copy passthrough when target format matches source (avoids 1,500+ full pixel decodes)
+        if (image_format == ExportImageFormat::Original && fmt == DetectedImageFormat::Webp) {
+            int w = 0, h = 0;
+            if (!parse_webp_dimensions(raw, w, h)) {
+                throw ComicExportError("Page " + std::to_string(page_num) + " is not a valid WebP image.");
+            }
+            ext = "webp";
+        } else if ((image_format == ExportImageFormat::Original &&
+                    (fmt == DetectedImageFormat::Png || fmt == DetectedImageFormat::Jpeg)) ||
+                   (image_format == ExportImageFormat::Png && fmt == DetectedImageFormat::Png)) {
+            int w = 0, h = 0, c = 0;
+            if (!stbi_info_from_memory(raw.data(), static_cast<int>(raw.size()), &w, &h, &c) ||
+                w <= 0 || h <= 0) {
+                throw ComicExportError("Page " + std::to_string(page_num) + " is not a valid image.");
+            }
+            ext = (fmt == DetectedImageFormat::Jpeg) ? "jpg" : "png";
+        } else {
+            int w = 0, h = 0, channels = 0;
+            StbiBuffer decoded(stbi_load_from_memory(
+                raw.data(), static_cast<int>(raw.size()), &w, &h, &channels, 0));
+            if (!decoded || w <= 0 || h <= 0) {
+                throw ComicExportError("Page " + std::to_string(page_num) + " is not a valid image.");
+            }
+            const auto rgb = flatten_pixels_to_rgb(decoded.get(), w, h, channels);
+            if (image_format == ExportImageFormat::Jpg) {
+                reencoded = encode_rgb_jpg(rgb.data(), w, h, jpeg_quality);
+                ext = "jpg";
+            } else {
+                reencoded = encode_rgb_png(rgb.data(), w, h);
+                ext = "png";
+            }
+            write_ptr = reencoded.data();
+            write_size = reencoded.size();
+        }
+
+        std::ostringstream prefix_ss;
+        prefix_ss << std::setw(static_cast<int>(pad_width)) << std::setfill('0') << page_num;
+        const std::string prefix = prefix_ss.str();
+        const std::string stem = sanitize_page_stem(pages[i].filename);
+        const std::string entry_name =
+            (!stem.empty() && stem.rfind(prefix, 0) != 0)
+            ? (prefix + "_" + stem + "." + ext)
+            : (prefix + "." + ext);
+
+        if (!mz_zip_writer_add_mem(
+                &zip,
+                entry_name.c_str(),
+                write_ptr,
+                write_size,
+                MZ_NO_COMPRESSION)) {
+            throw ComicExportError("Failed to add '" + entry_name + "' to CBZ archive.");
+        }
+    }
+
+    if (!mz_zip_writer_finalize_archive(&zip)) {
+        throw ComicExportError("Failed to finalize disk-backed CBZ archive.");
+    }
+    mz_zip_writer_end(&zip);
+    finalized = true;
+}
+
+void build_pdf_to_file(
+    const std::vector<DiskExportPageEntry>& pages,
+    const fs::path& output_path) {
+    if (pages.empty()) {
+        throw ComicExportError("At least one page image is required to export a .pdf document.");
+    }
+    if (pages.size() > kMaxArchivePages) {
+        throw ComicExportError(
+            "Cannot export " + std::to_string(pages.size()) +
+            " pages; maximum is " + std::to_string(kMaxArchivePages) + ".");
+    }
+
+    std::ofstream ofs(output_path, std::ios::binary | std::ios::trunc);
+    if (!ofs.is_open()) {
+        throw ComicExportError("Failed to create output PDF file on disk.");
+    }
+
+    const size_t page_count = pages.size();
+    const size_t total_objects = 2 + page_count * 3;
+    std::vector<uint64_t> obj_offsets(total_objects + 1, 0);
+    uint64_t bytes_written = 0;
+
+    auto write_raw = [&](const void* data, size_t len) {
+        if (len == 0) return;
+        ofs.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(len));
+        if (!ofs.good()) {
+            throw ComicExportError("Disk write error while building PDF document.");
+        }
+        bytes_written += static_cast<uint64_t>(len);
+    };
+    auto write_str = [&](std::string_view s) {
+        write_raw(s.data(), s.size());
+    };
+    auto begin_obj = [&](size_t obj_id) {
+        obj_offsets[obj_id] = bytes_written;
+        write_str(std::to_string(obj_id) + " 0 obj\n");
+    };
+
+    // PDF 1.4 Header + binary comment marker
+    write_str("%PDF-1.4\n");
+    const uint8_t bin_hdr[6] = {'%', 0xE2, 0xE3, 0xCF, 0xD3, '\n'};
+    write_raw(bin_hdr, sizeof(bin_hdr));
+
+    // Object 1: Document Catalog
+    begin_obj(1);
+    write_str("<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    // Object 2: Pages Tree (object IDs are deterministic: 5 + i*3)
+    begin_obj(2);
+    {
+        std::ostringstream kids;
+        kids << "<< /Type /Pages /Kids [";
+        for (size_t i = 0; i < page_count; ++i) {
+            if (i > 0) kids << ' ';
+            kids << (5 + i * 3) << " 0 R";
+        }
+        kids << "] /Count " << page_count << " >>\nendobj\n";
+        write_str(kids.str());
+    }
+
+    // Stream each page from disk one at a time -> O(1) RAM regardless of page count
+    for (size_t i = 0; i < page_count; ++i) {
+        const int page_num = static_cast<int>(i + 1);
+        const auto raw_opt = util::read_file_bytes(pages[i].file_path);
+        if (!raw_opt.has_value() || raw_opt->empty()) {
+            throw ComicExportError("Page " + std::to_string(page_num) + " image file is missing or empty.");
+        }
+        const auto& raw = *raw_opt;
+        if (raw.size() > kMaxSingleImageBytes) {
+            throw ComicExportError("Page " + std::to_string(page_num) + " exceeds maximum allowed image size.");
+        }
+
+        const DetectedImageFormat fmt = detect_image_magic(raw);
+        int img_w = 0;
+        int img_h = 0;
+        std::string color_space;
+        std::string filter;
+        bool invert_cmyk = false;
+        const uint8_t* stream_ptr = nullptr;
+        size_t stream_len = 0;
+        std::vector<uint8_t> compressed_buf;
+
+        JpegHeaderInfo jpeg_info{};
+        int probe_w = 0, probe_h = 0, probe_c = 0;
+        if (fmt == DetectedImageFormat::Jpeg &&
+            parse_jpeg_header(raw, jpeg_info) &&
+            stbi_info_from_memory(raw.data(), static_cast<int>(raw.size()), &probe_w, &probe_h, &probe_c)) {
+            img_w = jpeg_info.width;
+            img_h = jpeg_info.height;
+            filter = "/DCTDecode";
+            if (jpeg_info.components == 1) {
+                color_space = "/DeviceGray";
+            } else if (jpeg_info.components == 4) {
+                color_space = "/DeviceCMYK";
+                invert_cmyk = jpeg_info.is_adobe_cmyk;
+            } else {
+                color_space = "/DeviceRGB";
+            }
+            stream_ptr = raw.data();
+            stream_len = raw.size();
+        } else {
+            int w = 0, h = 0, channels = 0;
+            StbiBuffer decoded(stbi_load_from_memory(
+                raw.data(), static_cast<int>(raw.size()), &w, &h, &channels, 0));
+            if (!decoded || w <= 0 || h <= 0) {
+                throw ComicExportError("Page " + std::to_string(page_num) + " is not a valid image.");
+            }
+            std::vector<uint8_t> raw_pixels;
+            if (channels == 1) {
+                color_space = "/DeviceGray";
+                raw_pixels.assign(decoded.get(), decoded.get() + static_cast<size_t>(w) * static_cast<size_t>(h));
+            } else if (channels == 2) {
+                color_space = "/DeviceGray";
+                const size_t px_count = static_cast<size_t>(w) * static_cast<size_t>(h);
+                raw_pixels.resize(px_count);
+                for (size_t p = 0; p < px_count; ++p) {
+                    const uint32_t g = decoded.get()[p * 2 + 0];
+                    const uint32_t a = decoded.get()[p * 2 + 1];
+                    raw_pixels[p] = static_cast<uint8_t>((g * a + 255U * (255U - a) + 127U) / 255U);
+                }
+            } else {
+                color_space = "/DeviceRGB";
+                raw_pixels = flatten_pixels_to_rgb(decoded.get(), w, h, channels);
+            }
+
+            mz_ulong comp_bound = mz_compressBound(static_cast<mz_ulong>(raw_pixels.size()));
+            compressed_buf.resize(static_cast<size_t>(comp_bound));
+            const int zres = mz_compress2(
+                compressed_buf.data(),
+                &comp_bound,
+                raw_pixels.data(),
+                static_cast<mz_ulong>(raw_pixels.size()),
+                MZ_BEST_SPEED);
+            if (zres != MZ_OK) {
+                throw ComicExportError("Failed to Flate-compress page " + std::to_string(page_num) + " for PDF.");
+            }
+            compressed_buf.resize(static_cast<size_t>(comp_bound));
+            img_w = w;
+            img_h = h;
+            filter = "/FlateDecode";
+            stream_ptr = compressed_buf.data();
+            stream_len = compressed_buf.size();
+        }
+
+        const size_t img_obj_id = 3 + i * 3;
+        const size_t content_obj_id = 4 + i * 3;
+        const size_t page_obj_id = 5 + i * 3;
+
+        const std::string pt_w = format_pdf_number(static_cast<double>(img_w) * 72.0 / 96.0);
+        const std::string pt_h = format_pdf_number(static_cast<double>(img_h) * 72.0 / 96.0);
+
+        begin_obj(img_obj_id);
+        {
+            std::ostringstream dict;
+            dict << "<< /Type /XObject /Subtype /Image"
+                 << " /Width " << img_w
+                 << " /Height " << img_h
+                 << " /ColorSpace " << color_space
+                 << " /BitsPerComponent 8"
+                 << " /Filter " << filter;
+            if (invert_cmyk) {
+                dict << " /Decode [1 0 1 0 1 0 1 0]";
+            }
+            dict << " /Length " << stream_len << " >>\nstream\n";
+            write_str(dict.str());
+            write_raw(stream_ptr, stream_len);
+            write_str("\nendstream\nendobj\n");
+        }
+
+        const std::string content_stream =
+            "q\n" + pt_w + " 0 0 " + pt_h + " 0 0 cm\n/Im0 Do\nQ\n";
+        begin_obj(content_obj_id);
+        write_str(
+            "<< /Length " + std::to_string(content_stream.size()) +
+            " >>\nstream\n" + content_stream + "endstream\nendobj\n");
+
+        begin_obj(page_obj_id);
+        {
+            std::ostringstream page_dict;
+            page_dict << "<< /Type /Page /Parent 2 0 R"
+                      << " /MediaBox [0 0 " << pt_w << " " << pt_h << "]"
+                      << " /Resources << /XObject << /Im0 " << img_obj_id << " 0 R >> >>"
+                      << " /Contents " << content_obj_id << " 0 R"
+                      << " >>\nendobj\n";
+            write_str(page_dict.str());
+        }
+    }
+
+    // Cross-reference table
+    const uint64_t xref_offset = bytes_written;
+    write_str("xref\n0 " + std::to_string(total_objects + 1) + "\n");
+    write_str("0000000000 65535 f \n");
+    for (size_t obj_id = 1; obj_id <= total_objects; ++obj_id) {
+        char line[32]{};
+        std::snprintf(
+            line, sizeof(line), "%010llu 00000 n \n",
+            static_cast<unsigned long long>(obj_offsets[obj_id]));
+        write_str(line);
+    }
+
+    write_str(
+        "trailer\n<< /Size " + std::to_string(total_objects + 1) +
+        " /Root 1 0 R >>\nstartxref\n" +
+        std::to_string(xref_offset) + "\n%%EOF\n");
+    ofs.flush();
+    if (!ofs.good()) {
+        throw ComicExportError("Failed to flush PDF file to disk.");
+    }
 }
 
 }  // namespace mangaflow

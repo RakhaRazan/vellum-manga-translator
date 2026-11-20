@@ -1327,7 +1327,7 @@ json FontManager::download_catalog_fonts(
 
         try {
             const std::string binary_url = resolve_google_font_binary_url(family_name, weight);
-            const auto dl_resp = winhttp_get(binary_url, L"MangaFlowAI/2.0", 30000);
+            const auto dl_resp = winhttp_get(binary_url, L"Vellum/2.0", 30000);
             if (!dl_resp.error.empty()) {
                 throw std::runtime_error("Download failed: " + dl_resp.error);
             }

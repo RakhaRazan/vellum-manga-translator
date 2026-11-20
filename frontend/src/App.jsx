@@ -55,6 +55,29 @@ async function resolvePageImageFile(pageItem) {
   });
 }
 
+async function saveBlobWithPicker(blob, filename, { description, accept } = {}) {
+  if (typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function') {
+    try {
+      const opts = { suggestedName: filename };
+      if (accept) {
+        opts.types = [{ description: description || 'File', accept }];
+      }
+      const handle = await window.showSaveFilePicker(opts);
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return { saved: true, filename: handle.name || filename };
+    } catch (err) {
+      if (err?.name === 'AbortError') {
+        return { saved: false, cancelled: true };
+      }
+      // Fall back to standard download if File System Access API is blocked
+    }
+  }
+  triggerBlobDownload(blob, filename);
+  return { saved: true, filename };
+}
+
 function triggerBlobDownload(blob, filename) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -148,6 +171,10 @@ export default function App() {
   const [isWorkspaceUnlocked, setIsWorkspaceUnlocked] = useState(false);
   const [isDownloadModalOpen, setIsDownloadModalOpen] = useState(false);
   const [isPipelineRunning, setIsPipelineRunning] = useState(false);
+  const [pipelineProgress, setPipelineProgress] = useState(null);
+  const [liveBackendStage, setLiveBackendStage] = useState(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [importBaseName, setImportBaseName] = useState('');
   const [busyLayerAction, setBusyLayerAction] = useState(null); // { blockId, stage: 'ocr' | 'translate' } | null
   const [isPollingLlm, setIsPollingLlm] = useState(false);
   const [statusBanner, setStatusBanner] = useState(null);
@@ -380,6 +407,14 @@ export default function App() {
         );
       if (validFiles.length === 0) return;
 
+      const firstRel = validFiles[0].webkitRelativePath || '';
+      const folderPart = firstRel.includes('/') ? firstRel.split('/')[0] : '';
+      const firstStem = (validFiles[0].name || '').replace(/\.[^/.]+$/, '');
+      const inferredName = folderPart || firstStem;
+      if (inferredName) {
+        setImportBaseName(inferredName);
+      }
+
       const timestamp = Date.now();
       const newPages = validFiles.map((file, idx) => ({
         id: `page_${timestamp}_${idx}_${Math.random().toString(36).slice(2, 7)}`,
@@ -432,6 +467,12 @@ export default function App() {
         const extracted = data.pages || [];
         if (extracted.length === 0) {
           throw new Error('Archive contained no supported comic page images.');
+        }
+
+        const archiveLabel = data.archive_name || archiveFile.name || '';
+        const archiveStem = archiveLabel.replace(/\.[^/.]+$/, '');
+        if (archiveStem) {
+          setImportBaseName(archiveStem);
         }
 
         const timestamp = Date.now();
@@ -508,7 +549,7 @@ export default function App() {
 
   // Process a full page in one call via POST /api/process-page
   const processSinglePage = useCallback(
-    async (pageItem, overrideSourceLang, overrideTargetLang) => {
+    async (pageItem, overrideSourceLang, overrideTargetLang, batchOpts = null) => {
       const src = overrideSourceLang || pageItem.sourceLang || sourceLang;
       const tgt = overrideTargetLang || pageItem.targetLang || targetLang;
 
@@ -524,29 +565,58 @@ export default function App() {
           throw new Error(`No source image available for ${pageItem.name}`);
         }
 
+        const cfg = useEditorStore.getState().pipelineConfig;
         const formData = new FormData();
         formData.append('image', imageFile, pageItem.name || 'page.png');
         formData.append('source_lang', src);
         formData.append('target_lang', tgt);
+        formData.append('translation_tone', cfg.translationTone || 'standard');
+        if (batchOpts) {
+          formData.append('keep_alive', batchOpts.keepAlive ? 'true' : 'false');
+          formData.append('batch_is_last', batchOpts.isLastPage ? 'true' : 'false');
+        }
 
-        const response = await fetch(`${apiBaseUrl}/api/process-page`, {
-          method: 'POST',
-          body: formData,
-        });
-
-        if (!response.ok) {
-          let errDetail = `HTTP ${response.status}`;
+        let response = null;
+        let lastErrDetail = '';
+        const maxAttempts = batchOpts?.isBatch ? 3 : 1;
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
           try {
-            const errJson = await response.json();
-            if (errJson?.detail) errDetail = errJson.detail;
-          } catch {
-            // ignore JSON parse failure
+            response = await fetch(`${apiBaseUrl}/api/process-page`, {
+              method: 'POST',
+              body: formData,
+            });
+            if (response.ok) break;
+            lastErrDetail = `HTTP ${response.status}`;
+            try {
+              const errJson = await response.json();
+              if (errJson?.detail) lastErrDetail = errJson.detail;
+            } catch {
+              // ignore JSON parse failure
+            }
+            const isTransient =
+              response.status === 502 ||
+              response.status === 503 ||
+              response.status === 504 ||
+              response.status === 429;
+            if (!isTransient || attempt === maxAttempts - 1) {
+              throw new Error(lastErrDetail);
+            }
+          } catch (netErr) {
+            if (attempt === maxAttempts - 1) {
+              throw netErr;
+            }
           }
-          throw new Error(errDetail);
+          await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
         }
 
         const data = await response.json();
-        const normalizedBlocks = normalizeBlocks(data.blocks || data.bubbles || []);
+        const normalizedBlocks = normalizeBlocks(data.blocks || data.bubbles || [], {
+          imgWidth: data.dimensions?.width || pageItem.dimensions?.width,
+          imgHeight: data.dimensions?.height || pageItem.dimensions?.height,
+          targetLang: data.target_lang || tgt,
+          layoutBubbles: data.layout_bubbles || [],
+          panels: data.panels || [],
+        });
         const rawCleaned =
           data.cleaned_image_url ||
           data.inpainted_image_url ||
@@ -576,15 +646,19 @@ export default function App() {
             model: data.model || null,
             tilesInpainted: data.tiles_inpainted ?? 0,
           },
-          { recordHistory: true }
+          { recordHistory: !batchOpts?.isBatch }
         );
+        return { ok: true };
       } catch (err) {
         const msg = err?.message || 'Failed to process comic page.';
         setPageStatus(pageItem.id, 'error', { activeStage: null, error: msg });
-        setStatusBanner({
-          type: 'error',
-          message: `Error processing ${pageItem.name}: ${msg}`,
-        });
+        if (!batchOpts?.isBatch) {
+          setStatusBanner({
+            type: 'error',
+            message: `Error processing ${pageItem.name}: ${msg}`,
+          });
+        }
+        return { ok: false, error: msg };
       }
     },
     [apiBaseUrl, sourceLang, targetLang, setPageStatus, updatePage]
@@ -592,7 +666,7 @@ export default function App() {
 
   // Granular single-stage runner (`detect` | `ocr` | `inpaint` | `translate`)
   const runSingleStageOnPage = useCallback(
-    async (pageId, stage, restrictedLayerIds = null) => {
+    async (pageId, stage, restrictedLayerIds = null, batchOpts = null) => {
       const currentPage = useEditorStore
         .getState()
         .pages.find((p) => p.id === pageId);
@@ -611,6 +685,10 @@ export default function App() {
 
           const formData = new FormData();
           formData.append('image', imageFile, currentPage.name || 'page.png');
+          if (batchOpts) {
+            formData.append('keep_alive', batchOpts.keepAlive ? 'true' : 'false');
+            formData.append('batch_is_last', batchOpts.isLastPage ? 'true' : 'false');
+          }
           formData.append('source_lang', src);
 
           const resp = await fetch(`${apiBaseUrl}/api/stage/detect`, {
@@ -622,7 +700,13 @@ export default function App() {
             throw new Error(errJson?.detail || `HTTP ${resp.status}`);
           }
           const data = await resp.json();
-          const detectedBlocks = normalizeBlocks(data.blocks || data.bubbles || []);
+          const detectedBlocks = normalizeBlocks(data.blocks || data.bubbles || [], {
+            imgWidth: data.dimensions?.width || currentPage.dimensions?.width,
+            imgHeight: data.dimensions?.height || currentPage.dimensions?.height,
+            targetLang: tgt,
+            layoutBubbles: data.layout_bubbles || [],
+            panels: data.panels || [],
+          });
           updatePage(
             pageId,
             {
@@ -635,7 +719,7 @@ export default function App() {
               blocks: detectedBlocks,
               sourceLang: data.source_lang || src,
             },
-            { recordHistory: true }
+            { recordHistory: !batchOpts?.isBatch }
           );
           return;
         }
@@ -673,6 +757,10 @@ export default function App() {
 
           const formData = new FormData();
           formData.append('image', imageFile, currentPage.name || 'page.png');
+          if (batchOpts) {
+            formData.append('keep_alive', batchOpts.keepAlive ? 'true' : 'false');
+            formData.append('batch_is_last', batchOpts.isLastPage ? 'true' : 'false');
+          }
           formData.append('source_lang', src);
           formData.append('bboxes', JSON.stringify(liveOcrBlocks));
 
@@ -702,7 +790,7 @@ export default function App() {
                 return { ...b, original_text: text, source_text: text };
               }),
             }),
-            { recordHistory: true }
+            { recordHistory: !batchOpts?.isBatch }
           );
           return;
         }
@@ -713,6 +801,10 @@ export default function App() {
 
           const formData = new FormData();
           formData.append('image', imageFile, currentPage.name || 'page.png');
+          if (batchOpts) {
+            formData.append('keep_alive', batchOpts.keepAlive ? 'true' : 'false');
+            formData.append('batch_is_last', batchOpts.isLastPage ? 'true' : 'false');
+          }
           if (currentPage.maskId) {
             formData.append('mask_id', currentPage.maskId);
           } else if (currentPage.maskUrl) {
@@ -753,7 +845,7 @@ export default function App() {
               dimensions: data.dimensions || currentPage.dimensions || null,
               tilesInpainted: data.tiles_inpainted ?? currentPage.tilesInpainted,
             },
-            { recordHistory: true }
+            { recordHistory: !batchOpts?.isBatch }
           );
           return;
         }
@@ -765,6 +857,7 @@ export default function App() {
           const payload = {
             source_lang: src,
             target_lang: tgt,
+            translation_tone: cfg.translationTone || 'standard',
             blocks: targetBlocks.map((b) => ({
               id: b.id,
               order: b.order,
@@ -782,6 +875,7 @@ export default function App() {
               max_tokens: cfg.maxTokens,
               frequency_penalty: cfg.frequencyPenalty ?? undefined,
               reasoning_effort: cfg.reasoningEffort || undefined,
+              translation_tone: cfg.translationTone || 'standard',
               custom_instructions: cfg.customInstructions || undefined,
               glossary: cfg.glossary,
               use_vision: cfg.useVision,
@@ -821,7 +915,7 @@ export default function App() {
                 return { ...b, translated_text: updated };
               }),
             }),
-            { recordHistory: true }
+            { recordHistory: !batchOpts?.isBatch }
           );
         }
       } catch (err) {
@@ -850,37 +944,119 @@ export default function App() {
           stagesToRun.includes(s)
         );
 
+      const startedAt = Date.now();
+      const totalPages = targetPageIds.length;
+      const totalStages = allFourStages && !restrictedLayerIds ? 1 : stagesToRun.length;
+
+      setPipelineProgress({
+        currentPageIndex: 1,
+        totalPages,
+        stage: allFourStages && !restrictedLayerIds ? 'pipeline' : stagesToRun[0],
+        stageIndex: 1,
+        totalStages,
+        startedAt,
+      });
+
+      const isMultiPageBatch = totalPages > 1;
+      let completedFinalPage = false;
+      let succeededCount = 0;
+      let failedCount = 0;
+
       try {
-        for (const pageId of targetPageIds) {
+        for (let pageIdx = 0; pageIdx < targetPageIds.length; pageIdx += 1) {
+          const pageId = targetPageIds[pageIdx];
           const liveState = useEditorStore.getState();
           const pageObj = liveState.pages.find((p) => p.id === pageId);
           if (!pageObj) continue;
 
+          const isLastPage = pageIdx === targetPageIds.length - 1;
+          const keepAlive = isMultiPageBatch && !isLastPage;
+
           if (allFourStages && !restrictedLayerIds) {
-            await processSinglePage(
+            setPipelineProgress({
+              currentPageIndex: pageIdx + 1,
+              totalPages,
+              stage: 'pipeline',
+              stageIndex: 1,
+              totalStages: 1,
+              startedAt,
+            });
+            const pageRes = await processSinglePage(
               pageObj,
               liveState.pipelineConfig.sourceLang,
-              liveState.pipelineConfig.targetLang
+              liveState.pipelineConfig.targetLang,
+              { keepAlive, isLastPage, isBatch: isMultiPageBatch }
             );
+            if (pageRes?.ok) {
+              succeededCount += 1;
+            } else {
+              failedCount += 1;
+            }
           } else {
-            for (const stage of stagesToRun) {
-              await runSingleStageOnPage(pageId, stage, restrictedLayerIds);
+            let pageFailed = false;
+            for (let stageIdx = 0; stageIdx < stagesToRun.length; stageIdx += 1) {
+              const stage = stagesToRun[stageIdx];
+              const isFinalCall = isLastPage && stageIdx === stagesToRun.length - 1;
+              setPipelineProgress({
+                currentPageIndex: pageIdx + 1,
+                totalPages,
+                stage,
+                stageIndex: stageIdx + 1,
+                totalStages,
+                startedAt,
+              });
+              try {
+                await runSingleStageOnPage(pageId, stage, restrictedLayerIds, {
+                  keepAlive: isMultiPageBatch && !isFinalCall,
+                  isLastPage: isFinalCall,
+                  isBatch: isMultiPageBatch,
+                });
+              } catch {
+                pageFailed = true;
+                if (!isMultiPageBatch) {
+                  throw new Error('Single-page stage failed');
+                }
+                break;
+              }
+            }
+            if (pageFailed) {
+              failedCount += 1;
+            } else {
+              succeededCount += 1;
             }
           }
+          if (isLastPage) {
+            completedFinalPage = true;
+          }
         }
-        setStatusBanner({
-          type: 'success',
-          message: `Completed ${stagesToRun.join(' → ')} on ${targetPageIds.length} page${
-            targetPageIds.length === 1 ? '' : 's'
-          }.`,
-        });
+        if (failedCount > 0) {
+          setStatusBanner({
+            type: 'warning',
+            message: `Completed ${succeededCount}/${totalPages} pages (${failedCount} failed — inspect error badges to retry).`,
+          });
+        } else {
+          setStatusBanner({
+            type: 'success',
+            message: `Completed ${stagesToRun.join(' → ')} on ${totalPages} page${
+              totalPages === 1 ? '' : 's'
+            }.`,
+          });
+        }
       } catch {
         // Error banner already reported by stage handler
       } finally {
+        if (
+          isMultiPageBatch &&
+          (!completedFinalPage || failedCount > 0) &&
+          useEditorStore.getState().pipelineConfig.autoUnloadVram
+        ) {
+          fetch(`${apiBaseUrl}/api/pipeline/unload`, { method: 'POST' }).catch(() => {});
+        }
         setIsPipelineRunning(false);
+        setPipelineProgress(null);
       }
     },
-    [processSinglePage, runSingleStageOnPage]
+    [apiBaseUrl, processSinglePage, runSingleStageOnPage]
   );
 
   // FrontControlBar primary Run handler
@@ -1025,21 +1201,23 @@ export default function App() {
       const dataUrl = canvasRef.current.exportImage(normalizedFmt, 0.98);
       if (!dataUrl) return;
 
-      const baseName = activePage.name.replace(/\.[^/.]+$/, '') || 'comic_page';
+      const baseName = activePage.name.replace(/\.[^/.]+$/, '') || importBaseName || 'comic_page';
       const filename = `${baseName}_${targetLang}_translated.${normalizedFmt}`;
-      const link = document.createElement('a');
-      link.download = filename;
-      link.href = dataUrl;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      const mimeType = normalizedFmt === 'jpg' ? 'image/jpeg' : 'image/png';
+      const resp = await fetch(dataUrl);
+      const blob = await resp.blob();
+      const saveRes = await saveBlobWithPicker(blob, filename, {
+        description: normalizedFmt === 'jpg' ? 'JPEG Image' : 'PNG Image',
+        accept: { [mimeType]: [`.${normalizedFmt}`] },
+      });
+      if (saveRes?.cancelled) return;
 
       setStatusBanner({
         type: 'success',
-        message: `Exported ${filename} (${activePage.dimensions?.width || ''}×${activePage.dimensions?.height || ''}px).`,
+        message: `Exported ${saveRes.filename || filename} (${activePage.dimensions?.width || ''}×${activePage.dimensions?.height || ''}px).`,
       });
     },
-    [activePage, apiBaseUrl, targetLang]
+    [activePage, apiBaseUrl, targetLang, importBaseName]
   );
 
   // Export multi-page project as 1:1 native-resolution .cbz or .pdf via FastAPI exporter endpoints
@@ -1048,7 +1226,8 @@ export default function App() {
       if (pages.length === 0) return;
       setStatusBanner(null);
       try {
-        const exportStem = `mangaflow_${targetLang}`;
+        const cleanBase = (importBaseName || '').trim();
+        const exportStem = cleanBase ? `${cleanBase}_${targetLang}` : `vellum_${targetLang}`;
         let result = null;
 
         if (canvasRef.current?.exportArchive) {
@@ -1056,6 +1235,15 @@ export default function App() {
             filename: exportStem,
             imageFormat: 'png',
             quality: 0.98,
+            onProgress: ({ current, total, phase }) => {
+              setStatusBanner({
+                type: 'info',
+                message:
+                  phase === 'finalizing'
+                    ? `Finalizing ${total}-page .${format.toUpperCase()} archive on disk...`
+                    : `Exporting .${format.toUpperCase()}: rendering & uploading page ${current} / ${total}...`,
+              });
+            },
           });
         } else {
           const formData = new FormData();
@@ -1097,12 +1285,22 @@ export default function App() {
           };
         }
 
-        triggerBlobDownload(result.blob, result.filename);
+        const fmtLower = String(format).toLowerCase() === 'pdf' ? 'pdf' : 'cbz';
+        const mimeType =
+          fmtLower === 'pdf' ? 'application/pdf' : 'application/vnd.comicbook+zip';
+        const saveRes = await saveBlobWithPicker(result.blob, result.filename, {
+          description: fmtLower === 'pdf' ? 'PDF Document' : 'CBZ Comic Archive',
+          accept: { [mimeType]: [`.${fmtLower}`] },
+        });
+        if (saveRes?.cancelled) {
+          setStatusBanner(null);
+          return;
+        }
         setStatusBanner({
           type: 'success',
           message: `Exported ${result.pageCount} page${
             result.pageCount === 1 ? '' : 's'
-          } at 1:1 native resolution to ${result.filename}.`,
+          } at 1:1 native resolution to ${saveRes.filename || result.filename}.`,
         });
       } catch (err) {
         setStatusBanner({
@@ -1111,15 +1309,15 @@ export default function App() {
         });
       }
     },
-    [pages, apiBaseUrl, targetLang]
+    [pages, apiBaseUrl, targetLang, importBaseName]
   );
 
   // Save Project (.mflow.json)
-  const handleSaveProject = useCallback(() => {
+  const handleSaveProject = useCallback(async () => {
     if (pages.length === 0) return;
     const { apiKey: _redactedKey, ...safePipelineConfig } = pipelineConfig;
     const projectPayload = {
-      format: 'mangaflow-project',
+      format: 'vellum-project',
       version: 2,
       savedAt: new Date().toISOString(),
       activePageId,
@@ -1152,12 +1350,17 @@ export default function App() {
     const blob = new Blob([JSON.stringify(projectPayload, null, 2)], {
       type: 'application/json',
     });
-    triggerBlobDownload(blob, `mangaflow-project.mflow.json`);
+    const projectFilename = `${(importBaseName || '').trim() || 'vellum-project'}.vellum.json`;
+    const saveRes = await saveBlobWithPicker(blob, projectFilename, {
+      description: 'Vellum Project',
+      accept: { 'application/json': ['.json'] },
+    });
+    if (saveRes?.cancelled) return;
     setStatusBanner({
       type: 'success',
-      message: `Saved project (${pages.length} page${pages.length === 1 ? '' : 's'}) to mangaflow-project.mflow.json.`,
+      message: `Saved project (${pages.length} page${pages.length === 1 ? '' : 's'}) to ${saveRes.filename || projectFilename}.`,
     });
-  }, [pages, activePageId, viewLayers, pipelineConfig]);
+  }, [pages, activePageId, viewLayers, pipelineConfig, importBaseName]);
 
   // Open Project (.mflow.json)
   const handleOpenProject = useCallback(
@@ -1202,6 +1405,12 @@ export default function App() {
         const file = new File([blob], filename, {
           type: blob.type || 'image/jpeg',
         });
+
+        const archiveLabel = data.archive_name || archiveFile.name || '';
+        const archiveStem = archiveLabel.replace(/\.[^/.]+$/, '');
+        if (archiveStem) {
+          setImportBaseName(archiveStem);
+        }
 
         const timestamp = Date.now();
         const newPage = {
@@ -1257,6 +1466,138 @@ export default function App() {
 
   const isAnyProcessing =
     isPipelineRunning || pages.some((p) => p.status === 'processing');
+
+  useEffect(() => {
+    if (!isAnyProcessing) {
+      setElapsedSeconds(0);
+      setLiveBackendStage(null);
+      return;
+    }
+    const baseTime = pipelineProgress?.startedAt || Date.now();
+    setElapsedSeconds(Math.max(0, Math.floor((Date.now() - baseTime) / 1000)));
+    const timer = window.setInterval(() => {
+      setElapsedSeconds(Math.max(0, Math.floor((Date.now() - baseTime) / 1000)));
+    }, 1000);
+
+    let cancelled = false;
+    const pollStage = async () => {
+      try {
+        const res = await fetch(`${apiBaseUrl}/api/pipeline/status`);
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (!cancelled) {
+          setLiveBackendStage(data?.active ? data : null);
+        }
+      } catch {
+        // ignore transient poll errors
+      }
+    };
+    pollStage();
+    const stageTimer = window.setInterval(pollStage, 350);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.clearInterval(stageTimer);
+    };
+  }, [isAnyProcessing, pipelineProgress?.startedAt, apiBaseUrl]);
+
+  const activeProgressMeta = useMemo(() => {
+    if (!isAnyProcessing) return null;
+    const processingIdx = pages.findIndex((p) => p.status === 'processing');
+    const processingPage = processingIdx >= 0 ? pages[processingIdx] : activePage;
+    const currentPageIndex =
+      pipelineProgress?.currentPageIndex ||
+      (processingIdx >= 0 ? processingIdx + 1 : 1);
+    const totalPages =
+      pipelineProgress?.totalPages || Math.max(1, pages.length);
+    const baseStageKey =
+      pipelineProgress?.stage || processingPage?.activeStage || 'pipeline';
+    const hasLiveStage =
+      baseStageKey === 'pipeline' &&
+      liveBackendStage?.active &&
+      typeof liveBackendStage?.stage === 'string' &&
+      liveBackendStage.stage.length > 0;
+    const stageKey = hasLiveStage ? liveBackendStage.stage : baseStageKey;
+    const stageIndex = hasLiveStage
+      ? liveBackendStage.stage_index || 1
+      : pipelineProgress?.stageIndex || 1;
+    const totalStages = hasLiveStage
+      ? liveBackendStage.total_stages || 4
+      : pipelineProgress?.totalStages || 1;
+
+    const totalSteps = Math.max(1, totalPages * totalStages);
+    const completedSteps = (currentPageIndex - 1) * totalStages + (stageIndex - 0.5);
+    const percent = Math.min(99, Math.max(6, Math.round((completedSteps / totalSteps) * 100)));
+
+    const stageLabels = {
+      detect: 'Detecting',
+      ocr: 'OCR',
+      inpaint: 'Inpainting',
+      inpaint_translate: 'Inpaint + TL',
+      translate: 'Translating',
+      pipeline: 'Full Pipeline',
+    };
+    const stageLabel = stageLabels[stageKey] || String(stageKey).toUpperCase();
+
+    const m = modelsStatus?.models;
+    const lm = modelsStatus?.lm_studio;
+    let modelName = '';
+    if (hasLiveStage && liveBackendStage?.detail) {
+      modelName = liveBackendStage.detail;
+    } else if (stageKey === 'detect') {
+      modelName =
+        pipelineConfig.detectionModel ||
+        m?.comic_text_detector?.active_filename ||
+        m?.comic_text_detector?.files?.[0] ||
+        m?.comic_text_detector?.active_model ||
+        m?.comic_text_detector?.model_id ||
+        'rfdetr-seg-2xl';
+    } else if (stageKey === 'ocr') {
+      modelName =
+        sourceLang === 'ja'
+          ? m?.manga_ocr?.active_filename ||
+            m?.manga_ocr?.files?.[0] ||
+            m?.manga_ocr?.active_model ||
+            'manga-ocr-base'
+          : m?.rapid_ocr_ko_zh?.active_filename ||
+            m?.rapid_ocr_ko_zh?.files?.[0] ||
+            m?.rapid_ocr_ko_zh?.active_model ||
+            'RapidOCR PP-OCRv4';
+    } else if (stageKey === 'inpaint') {
+      modelName =
+        pipelineConfig.inpaintingModel ||
+        m?.lama_inpaint?.active_filename ||
+        m?.lama_inpaint?.files?.[0] ||
+        m?.lama_inpaint?.active_model ||
+        'lama-manga';
+    } else {
+      modelName =
+        lm?.active_model ||
+        lm?.resolved_model_id ||
+        pipelineConfig.model ||
+        'LM Studio';
+    }
+
+    return {
+      currentPageIndex,
+      totalPages,
+      stageLabel,
+      modelName,
+      percent,
+    };
+  }, [
+    isAnyProcessing,
+    pages,
+    activePage,
+    pipelineProgress,
+    liveBackendStage,
+    modelsStatus,
+    pipelineConfig.detectionModel,
+    pipelineConfig.inpaintingModel,
+    pipelineConfig.model,
+    sourceLang,
+  ]);
 
   return (
     <div className="min-h-screen h-screen w-screen flex flex-col bg-studio-canvas text-studio-text overflow-hidden select-none">
@@ -1460,6 +1801,45 @@ export default function App() {
             onLoadSample={handleLoadSample}
             isProcessing={activePage?.status === 'processing'}
           />
+
+          {/* Bottom-Right Live Progress Bar (Koharu-style, non-blocking) */}
+          {activeProgressMeta && (
+            <div
+              data-testid="bottom-right-progress-bar"
+              className="absolute bottom-3 right-3 z-30 w-72 rounded-studio-md border border-studio-border bg-studio-panel/95 backdrop-blur-md px-3 py-2 shadow-2xl pointer-events-none select-none"
+            >
+              <div className="flex items-center justify-between gap-2 text-[11px]">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-studio-accent shrink-0" />
+                  <span className="font-semibold text-studio-text truncate">
+                    Page {activeProgressMeta.currentPageIndex} / {activeProgressMeta.totalPages}
+                  </span>
+                </div>
+                <span className="font-mono text-[10px] text-studio-text-muted tabular-nums shrink-0">
+                  {elapsedSeconds}s
+                </span>
+              </div>
+
+              <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-studio-text-secondary">
+                <span className="font-medium text-studio-accent shrink-0">
+                  {activeProgressMeta.stageLabel}
+                </span>
+                <span
+                  className="font-mono truncate text-studio-text-muted"
+                  title={activeProgressMeta.modelName}
+                >
+                  {activeProgressMeta.modelName}
+                </span>
+              </div>
+
+              <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-studio-surface border border-studio-border">
+                <div
+                  className="h-full bg-studio-accent transition-all duration-300 ease-out"
+                  style={{ width: `${activeProgressMeta.percent}%` }}
+                />
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Right Sidebar: Text Layers & Typography Inspector (collapsed in Zen Mode) */}

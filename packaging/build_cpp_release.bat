@@ -2,14 +2,14 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================================
-REM MangaFlow AI - Standalone C++17 Desktop Release Builder (Phase 11.1)
+REM Vellum - Standalone C++17 Desktop Release Builder (Phase 11.1)
 REM
 REM 1. Builds production React v2 UI (`frontend/dist`) via `npm run build`
 REM 2. Configures & compiles `backend-cpp` in Release mode (MSVC /O2 /GL /LTCG)
-REM 3. Stages `MangaFlow-Cpp.exe`, ONNX Runtime DLLs, and `frontend/dist` into
-REM    `Manga/MangaFlow_Cpp/` and installs the root one-click launcher
-REM    `Manga/MangaFlow-Cpp.exe`
-REM 4. Packages `release/MangaFlow-Cpp-Windows-x64.zip` for GitHub Releases
+REM 3. Stages `Vellum.exe`, ONNX Runtime DLLs, and `frontend/dist` into
+REM    `Manga/Vellum_Runtime/` and installs the root one-click launcher
+REM    `Manga/Vellum.exe`
+REM 4. Packages `release/Vellum-Windows-x64.zip` for GitHub Releases
 REM ============================================================================
 
 pushd "%~dp0.." >nul 2>&1
@@ -24,13 +24,13 @@ set "FRONTEND_DIR=%ROOT_DIR%\frontend"
 set "FRONTEND_DIST=%FRONTEND_DIR%\dist"
 set "CPP_DIR=%ROOT_DIR%\backend-cpp"
 set "CPP_RELEASE_BIN=%CPP_DIR%\build\Release"
-set "STAGE_DIR=%ROOT_DIR%\MangaFlow_Cpp"
-set "ROOT_LAUNCHER=%ROOT_DIR%\MangaFlow-Cpp.exe"
+set "STAGE_DIR=%ROOT_DIR%\Vellum_Runtime"
+set "ROOT_LAUNCHER=%ROOT_DIR%\Vellum.exe"
 set "RELEASE_DIR=%ROOT_DIR%\release"
-set "ZIP_PATH=%RELEASE_DIR%\MangaFlow-Cpp-Windows-x64.zip"
+set "ZIP_PATH=%RELEASE_DIR%\Vellum-Windows-x64.zip"
 
 echo ============================================================================
-echo   MangaFlow AI - Standalone C++17 Desktop Release Builder
+echo   Vellum - Standalone C++17 Desktop Release Builder
 echo ============================================================================
 echo   Project Root   : %ROOT_DIR%
 echo   C++ Backend    : %CPP_DIR%
@@ -143,12 +143,12 @@ if not "!STEP_ERR!"=="0" (
     exit /b !STEP_ERR!
 )
 
-if not exist "%CPP_RELEASE_BIN%\MangaFlow-Cpp.exe" (
-    echo [ERROR] Expected native binary not found: "%CPP_RELEASE_BIN%\MangaFlow-Cpp.exe"
+if not exist "%CPP_RELEASE_BIN%\Vellum.exe" (
+    echo [ERROR] Expected native binary not found: "%CPP_RELEASE_BIN%\Vellum.exe"
     exit /b 1
 )
-if not exist "%CPP_RELEASE_BIN%\MangaFlow-Cpp-Launcher.exe" (
-    echo [ERROR] Expected native launcher not found: "%CPP_RELEASE_BIN%\MangaFlow-Cpp-Launcher.exe"
+if not exist "%CPP_RELEASE_BIN%\Vellum-Launcher.exe" (
+    echo [ERROR] Expected native launcher not found: "%CPP_RELEASE_BIN%\Vellum-Launcher.exe"
     exit /b 1
 )
 if not exist "%CPP_RELEASE_BIN%\onnxruntime.dll" (
@@ -159,13 +159,13 @@ echo       Compiled C++17 Release binaries ready : %CPP_RELEASE_BIN%
 echo.
 
 REM ----------------------------------------------------------------------------
-REM Step 3/4: Stage `Manga/MangaFlow_Cpp/` and Root Launcher `Manga/MangaFlow-Cpp.exe`
+REM Step 3/4: Stage `Manga/Vellum_Runtime/` and Root Launcher `Manga/Vellum.exe`
 REM ----------------------------------------------------------------------------
-echo [3/4] Staging standalone bundle (`MangaFlow_Cpp/`) and root launcher (`MangaFlow-Cpp.exe`) ...
+echo [3/4] Staging standalone bundle (`Vellum_Runtime/`) and root launcher (`Vellum.exe`) ...
 if exist "%STAGE_DIR%" (
     rmdir /s /q "%STAGE_DIR%" >nul 2>&1
     if exist "%STAGE_DIR%" (
-        echo [ERROR] Could not clean "%STAGE_DIR%". Please close any running MangaFlow-Cpp.exe and retry.
+        echo [ERROR] Could not clean "%STAGE_DIR%". Please close any running Vellum.exe and retry.
         exit /b 1
     )
 )
@@ -181,9 +181,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-copy /y "%CPP_RELEASE_BIN%\MangaFlow-Cpp.exe" "%STAGE_DIR%\MangaFlow-Cpp.exe" >nul
+copy /y "%CPP_RELEASE_BIN%\Vellum.exe" "%STAGE_DIR%\Vellum.exe" >nul
 if errorlevel 1 (
-    echo [ERROR] Failed to copy MangaFlow-Cpp.exe into "%STAGE_DIR%".
+    echo [ERROR] Failed to copy Vellum.exe into "%STAGE_DIR%".
     exit /b 1
 )
 
@@ -199,15 +199,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
-copy /y "%CPP_RELEASE_BIN%\MangaFlow-Cpp-Launcher.exe" "%ROOT_LAUNCHER%" >nul
+copy /y "%CPP_RELEASE_BIN%\Vellum-Launcher.exe" "%ROOT_LAUNCHER%" >nul
 if errorlevel 1 (
     echo [ERROR] Failed to install root one-click launcher "%ROOT_LAUNCHER%".
-    echo         Please close any running MangaFlow-Cpp.exe and retry.
+    echo         Please close any running Vellum.exe and retry.
     exit /b 1
 )
 
-if not exist "%STAGE_DIR%\MangaFlow-Cpp.exe" (
-    echo [ERROR] Staging verification failed: missing "%STAGE_DIR%\MangaFlow-Cpp.exe"
+if not exist "%STAGE_DIR%\Vellum.exe" (
+    echo [ERROR] Staging verification failed: missing "%STAGE_DIR%\Vellum.exe"
     exit /b 1
 )
 if not exist "%STAGE_DIR%\onnxruntime.dll" (
@@ -227,9 +227,9 @@ echo       Installed root launcher  : %ROOT_LAUNCHER%
 echo.
 
 REM ----------------------------------------------------------------------------
-REM Step 4/4: Package Clean GitHub Release Archive (`release/MangaFlow-Cpp-Windows-x64.zip`)
+REM Step 4/4: Package Clean GitHub Release Archive (`release/Vellum-Windows-x64.zip`)
 REM ----------------------------------------------------------------------------
-echo [4/4] Packaging GitHub Releases archive (`release/MangaFlow-Cpp-Windows-x64.zip`) ...
+echo [4/4] Packaging GitHub Releases archive (`release/Vellum-Windows-x64.zip`) ...
 if not exist "%RELEASE_DIR%" mkdir "%RELEASE_DIR%"
 if exist "%ZIP_PATH%" del /f /q "%ZIP_PATH%"
 
@@ -249,10 +249,10 @@ if not exist "%ZIP_PATH%" (
 
 echo.
 echo ============================================================================
-echo   [SUCCESS] MangaFlow AI C++17 Standalone Release Ready.
+echo   [SUCCESS] Vellum C++17 Standalone Release Ready.
 echo ============================================================================
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$exe = Get-Item -LiteralPath (Join-Path $env:MF_STAGE_DIR 'MangaFlow-Cpp.exe');" ^
+    "$exe = Get-Item -LiteralPath (Join-Path $env:MF_STAGE_DIR 'Vellum.exe');" ^
     "$launcher = Get-Item -LiteralPath $env:MF_ROOT_LAUNCHER;" ^
     "$zip = Get-Item -LiteralPath $env:MF_ZIP_PATH;" ^
     "$dllBytes = (Get-ChildItem -LiteralPath $env:MF_STAGE_DIR -Filter '*.dll' | Measure-Object -Property Length -Sum).Sum;" ^

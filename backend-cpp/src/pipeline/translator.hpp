@@ -97,9 +97,10 @@ struct TranslatorConfig {
     double temperature = 0.2;
     std::optional<double> top_p = 0.95;
     std::optional<int> top_k = 40;
-    int max_tokens = 2048;
+    int max_tokens = 1024;
     std::optional<double> frequency_penalty = 0.0;
     std::string reasoning_effort = "off";
+    std::string translation_tone = "standard";  // "standard" | "casual" | "adult"
     bool strip_thinking = true;
     bool use_vision = false;
     int vision_max_side = 1024;
@@ -116,6 +117,7 @@ struct TranslatorConfig {
 struct TranslateRequestOptions {
     std::string source_lang = "ja";
     std::string target_lang = "id";
+    std::optional<std::string> translation_tone;
     std::optional<std::string> custom_instructions;
     std::optional<std::map<std::string, std::string>> glossary;
     std::optional<std::string> page_image_data_uri;
@@ -192,6 +194,7 @@ public:
     static std::string normalize_target_language(const std::string& raw);
     static const TargetLanguageSpec& get_target_language_spec(const std::string& code);
     static std::string normalize_reasoning_effort(const std::string& raw);
+    static std::string normalize_translation_tone(const std::string& raw);
     static std::map<std::string, std::string> parse_glossary(const nlohmann::json& raw);
 
     static bool is_embedding_model(const std::string& model_id);
@@ -246,7 +249,8 @@ public:
         const std::string& reasoning_effort = "off",
         const std::string& custom_instructions = "",
         const std::map<std::string, std::string>& glossary = {},
-        bool has_page_image = false);
+        bool has_page_image = false,
+        const std::string& translation_tone = "standard");
 
     // Strip `<think>...</think>`, `<thought>...</thought>`, `<|thought|>...<|thought|>`,
     // and unclosed reasoning blocks prior to JSON parsing.

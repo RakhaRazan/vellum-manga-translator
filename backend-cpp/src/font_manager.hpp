@@ -33,7 +33,7 @@ class FontManager {
 public:
     explicit FontManager(std::optional<std::filesystem::path> custom_fonts_dir = std::nullopt);
 
-    // Resolve default local fonts dir: `MANGA_FONTS_DIR` or `%LOCALAPPDATA%\ComicTranslator\fonts`.
+    // Resolve default local fonts dir: `MANGA_FONTS_DIR` or `<portable_root>\fonts`.
     static std::filesystem::path default_fonts_dir();
     static std::vector<std::filesystem::path> windows_system_font_dirs();
 

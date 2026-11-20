@@ -13,7 +13,7 @@ class SettingsManager {
 public:
     explicit SettingsManager(std::optional<std::filesystem::path> custom_path = std::nullopt);
 
-    // Resolve default path: `MANGA_SETTINGS_PATH` env var or `%LOCALAPPDATA%\ComicTranslator\settings.json`.
+    // Resolve default path: `MANGA_SETTINGS_PATH` env var or `<portable_root>\settings.json`.
     static std::filesystem::path default_settings_path();
 
     // Thread-safe load from disk (cached after first load unless force_reload=true).

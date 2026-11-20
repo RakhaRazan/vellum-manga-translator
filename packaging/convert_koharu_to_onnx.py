@@ -1,8 +1,8 @@
-"""One-time Koharu Local Cache -> ONNX / GGUF Bridge for MangaFlow AI (Phase 10.1).
+"""One-time Koharu Local Cache -> ONNX / GGUF Bridge for Vellum (Phase 10.1).
 
 Auto-discovers Koharu's local Hugging Face cache (default:
 `C:\\FILE SOFTWARE\\Koharu\\store\\hugging-face\\models\\`), resolves each model's
-`snapshots/<hash>/` directory, and bridges all 4 Koharu models into MangaFlow AI's
+`snapshots/<hash>/` directory, and bridges all 4 Koharu models into Vellum's
 persistent storage (`%LOCALAPPDATA%\\ComicTranslator\\models`):
 
 1. `mayocream--koharu-layout-rfdetr-seg-2xl-1152` (`.safetensors` -> `koharu-layout-rfdetr-seg-2xl-1152.onnx`)
@@ -1334,7 +1334,7 @@ def copy_paddleocr_vl_gguf(cache_root: Path, output_dir: Path, force: bool = Fal
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Convert Koharu local Hugging Face cache (.safetensors/.gguf) into MangaFlow AI ONNX/GGUF models."
+        description="Convert Koharu local Hugging Face cache (.safetensors/.gguf) into Vellum ONNX/GGUF models."
     )
     parser.add_argument(
         "--koharu-cache",
@@ -1371,7 +1371,7 @@ def main() -> int:
         else {m.strip().lower() for m in args.models.split(",") if m.strip()}
     )
 
-    print("=== MangaFlow AI — Koharu 4-Model Cache Bridge ===")
+    print("=== Vellum — Koharu 4-Model Cache Bridge ===")
     print(f"  Koharu cache : {cache_root}")
     print(f"  Output dir   : {output_dir}")
     print(f"  Selected     : {sorted(selected)}")

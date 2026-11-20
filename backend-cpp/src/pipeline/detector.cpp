@@ -804,7 +804,7 @@ DetectionResult TextDetector::detect_rgb(
         throw std::runtime_error(
             "Requested text detector ONNX weights ('" + requested_model + "') were not found in " +
             util::path_to_utf8(model_manager_.models_dir()) +
-            ". Call POST /api/models/import-koharu (for Koharu cache) or GET /api/models/download first.");
+            ". Place the standalone .onnx model in ./models or call GET /api/models/download first.");
     }
 
     ScopeUnload unload_guard{this, normalized_opts.auto_unload};
@@ -889,7 +889,11 @@ DetectionResult TextDetector::run_rfdetr(
     std::vector<Ort::Value> outputs;
     std::string provider_used = "CPUExecutionProvider";
     {
-        OrtSessionHandle& handle = ensure_session(resolved, options.force_cpu);
+        // RF-DETR-Seg-2XL contains transformer/deformable ops that ping-pong between CPU and GPU on DirectML
+        // (~11s on DML vs ~6.5s on CPU, while also keeping GPU VRAM free for LM Studio & LaMa).
+        const bool prefer_cpu_for_rfdetr =
+            options.force_cpu || (ModelManager::get_primary_provider(false) == "DmlExecutionProvider");
+        OrtSessionHandle& handle = ensure_session(resolved, prefer_cpu_for_rfdetr);
         try {
             outputs = run_inference(handle);
             provider_used = handle.active_provider;

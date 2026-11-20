@@ -103,6 +103,7 @@ public:
 
     // Explicitly unload any cached LaMa ONNX session from RAM/VRAM.
     void unload();
+    bool is_loaded() const noexcept { return cached_session_.has_value(); }
 
 private:
     OrtSessionHandle& ensure_session(const ResolvedLamaModel& resolved, bool force_cpu);

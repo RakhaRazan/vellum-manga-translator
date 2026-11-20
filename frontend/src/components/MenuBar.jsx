@@ -178,7 +178,7 @@ function MenuItem({
 /**
  * Compact 28px native desktop application menu bar (`File`, `Edit`, `Process`, `View`, `Help`),
  * wired directly to `useEditorStore`, complete with global keyboard shortcuts,
- * Keyboard Shortcuts modal, and About MangaFlow AI modal.
+ * Keyboard Shortcuts modal, and About Vellum modal.
  */
 export default function MenuBar({
   onImportFiles,
@@ -196,7 +196,7 @@ export default function MenuBar({
   onOpenModelsModal,
   isProcessing = false,
   isWorkspaceUnlocked = true,
-  githubUrl = 'https://github.com/mangaflow-ai/mangaflow',
+  githubUrl = 'https://github.com/vellum-ai/vellum',
   defaultOpenMenu = null,
 }) {
   const [openMenu, setOpenMenu] = useState(defaultOpenMenu);
@@ -604,11 +604,13 @@ export default function MenuBar({
         {/* Left: Compact Brand Mark + Native Top-Level Menus */}
         <div className="flex items-center gap-0.5 min-w-0" role="menubar">
           <div className="flex items-center gap-1.5 pr-2 mr-1 border-r border-studio-border shrink-0">
-            <span className="flex h-4 w-4 items-center justify-center rounded-studio-sm bg-studio-accent text-studio-accent-fg">
-              <BookOpen className="h-2.5 w-2.5 stroke-[2.5]" />
-            </span>
+            <img
+              src="/vellum-logo.svg"
+              alt="Vellum"
+              className="h-4 w-4 shrink-0"
+            />
             <span className="text-[11px] font-semibold tracking-tight text-studio-text hidden sm:inline">
-              MangaFlow AI
+              Vellum
             </span>
           </div>
 
@@ -920,7 +922,7 @@ export default function MenuBar({
                 />
                 <MenuItem
                   icon={Info}
-                  label="About MangaFlow AI"
+                  label="About Vellum"
                   onClick={() => runAndClose(() => openModal('about'))}
                 />
               </div>
@@ -1059,7 +1061,7 @@ export default function MenuBar({
         </div>
       )}
 
-      {/* About MangaFlow AI Modal */}
+      {/* About Vellum Modal */}
       {activeModal === 'about' && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4 select-none"
@@ -1074,12 +1076,12 @@ export default function MenuBar({
           >
             <div className="h-10 px-4 border-b border-studio-border flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <BookOpen className="h-4 w-4 text-studio-accent" />
+                <img src="/vellum-logo.svg" alt="" className="h-4 w-4 shrink-0" />
                 <h2
                   id="about-modal-title"
                   className="text-xs font-semibold uppercase tracking-wider text-studio-text"
                 >
-                  About MangaFlow AI
+                  About Vellum
                 </h2>
               </div>
               <button
@@ -1094,12 +1096,14 @@ export default function MenuBar({
 
             <div className="p-4 space-y-3 text-xs">
               <div className="flex items-center gap-3">
-                <div className="h-10 w-10 shrink-0 rounded-studio bg-studio-accent text-studio-accent-fg flex items-center justify-center">
-                  <BookOpen className="h-5 w-5 stroke-[2.25]" />
-                </div>
+                <img
+                  src="/vellum-logo.svg"
+                  alt="Vellum"
+                  className="h-10 w-10 shrink-0"
+                />
                 <div>
                   <div className="text-sm font-semibold text-studio-text">
-                    MangaFlow AI Studio
+                    Vellum
                   </div>
                   <div className="text-[11px] font-mono text-studio-text-muted">
                     v2 Lightweight Local Architecture

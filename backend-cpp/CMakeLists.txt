@@ -124,6 +124,7 @@ find_path(ONNXRUNTIME_INCLUDE_DIR
     NAMES onnxruntime_cxx_api.h
     PATHS
         "${onnxruntime_prebuilt_SOURCE_DIR}/build/native/include"
+        "${onnxruntime_prebuilt_SOURCE_DIR}/buildTransitive/native/include"
         "${onnxruntime_prebuilt_SOURCE_DIR}/include"
     NO_DEFAULT_PATH
     REQUIRED
@@ -196,12 +197,12 @@ set_target_properties(stb::headers PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${stb_headers_SOURCE_DIR}"
 )
 
-message(STATUS "[MangaFlowAI] ONNX Runtime backend : ${MANGAFLOW_ORT_BACKEND}")
-message(STATUS "[MangaFlowAI] ONNX Runtime include : ${ONNXRUNTIME_INCLUDE_DIR}")
-message(STATUS "[MangaFlowAI] ONNX Runtime lib dir : ${ONNXRUNTIME_LIB_DIR}")
-message(STATUS "[MangaFlowAI] DirectML header      : ${MANGAFLOW_HAS_DML}")
-message(STATUS "[MangaFlowAI] miniz source dir     : ${miniz_prebuilt_SOURCE_DIR}")
-message(STATUS "[MangaFlowAI] stb include dir      : ${stb_headers_SOURCE_DIR}")
+message(STATUS "[Vellum] ONNX Runtime backend : ${MANGAFLOW_ORT_BACKEND}")
+message(STATUS "[Vellum] ONNX Runtime include : ${ONNXRUNTIME_INCLUDE_DIR}")
+message(STATUS "[Vellum] ONNX Runtime lib dir : ${ONNXRUNTIME_LIB_DIR}")
+message(STATUS "[Vellum] DirectML header      : ${MANGAFLOW_HAS_DML}")
+message(STATUS "[Vellum] miniz source dir     : ${miniz_prebuilt_SOURCE_DIR}")
+message(STATUS "[Vellum] stb include dir      : ${stb_headers_SOURCE_DIR}")
 
 # ------------------------------------------------------------------------------
 # 6. Native Windows GUI Executable (WIN32 subsystem = zero black console window)
@@ -233,7 +234,7 @@ add_executable(MangaFlowAI WIN32
 )
 
 set_target_properties(MangaFlowAI PROPERTIES
-    OUTPUT_NAME "MangaFlow-Cpp"
+    OUTPUT_NAME "Vellum"
 )
 
 target_compile_features(MangaFlowAI PRIVATE cxx_std_17)
@@ -276,10 +277,11 @@ target_link_libraries(MangaFlowAI PRIVATE
     stb::headers
     ws2_32
     dwmapi
+    dxgi
     winhttp
 )
 
-# Copy ONNX Runtime DLLs next to MangaFlow-Cpp.exe after every build
+# Copy ONNX Runtime DLLs next to Vellum.exe after every build
 file(GLOB ONNXRUNTIME_RUNTIME_DLLS "${ONNXRUNTIME_LIB_DIR}/*.dll")
 foreach(_dll IN LISTS ONNXRUNTIME_RUNTIME_DLLS)
     add_custom_command(TARGET MangaFlowAI POST_BUILD
@@ -291,7 +293,7 @@ foreach(_dll IN LISTS ONNXRUNTIME_RUNTIME_DLLS)
 endforeach()
 
 # ------------------------------------------------------------------------------
-# 7. Root One-Click Native Launcher (`Manga/MangaFlow-Cpp.exe`)
+# 7. Root One-Click Native Launcher (`Manga/Vellum.exe`)
 # ------------------------------------------------------------------------------
 add_executable(MangaFlowCppLauncher WIN32
     src/launcher.cpp
@@ -299,7 +301,7 @@ add_executable(MangaFlowCppLauncher WIN32
 )
 
 set_target_properties(MangaFlowCppLauncher PROPERTIES
-    OUTPUT_NAME "MangaFlow-Cpp-Launcher"
+    OUTPUT_NAME "Vellum-Launcher"
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
 )
 

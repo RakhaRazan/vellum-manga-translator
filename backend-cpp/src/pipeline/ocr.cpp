@@ -1669,6 +1669,12 @@ OcrStageResult OcrEngine::recognize_rgb(
     result.ocr_model = effective_model;
     result.blocks.reserve(bubbles.size());
 
+    if (bubbles.empty()) {
+        result.engine = (effective_model == "rapidocr-ppocrv4") ? "rapidocr" : effective_model;
+        result.execution_provider = ModelManager::get_primary_provider(options.force_cpu);
+        return result;
+    }
+
     std::string paddle_vl_model_id;
     if (effective_model == "manga-ocr") {
         result.engine = "manga-ocr";

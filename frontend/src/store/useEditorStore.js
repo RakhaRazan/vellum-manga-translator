@@ -636,6 +636,7 @@ export const DEFAULT_PIPELINE_CONFIG = {
   providerProfiles: buildDefaultProviderProfiles(),
   sourceLang: 'ja',
   targetLang: 'id',
+  translationTone: 'standard', // 'standard' | 'casual' | 'adult_doujinshi'
   scope: 'current_page', // 'current_page' | 'selected_pages' | 'project'
   enabledStages: { ...DEFAULT_ENABLED_STAGES },
   temperature: 0.2,
@@ -668,12 +669,74 @@ export const DEFAULT_PIPELINE_CONFIG = {
   autoProcessOnImport: false,
 };
 
+function computeBoxIntersectionArea(a, b) {
+  const ix1 = Math.max(a[0], b[0]);
+  const iy1 = Math.max(a[1], b[1]);
+  const ix2 = Math.min(a[2], b[2]);
+  const iy2 = Math.min(a[3], b[3]);
+  if (ix2 <= ix1 || iy2 <= iy1) return 0;
+  return (ix2 - ix1) * (iy2 - iy1);
+}
+
+function findContainingRegion(textBox, regions = [], minOverlap = 0.35) {
+  if (!Array.isArray(regions) || regions.length === 0) return -1;
+  const tw = Math.max(1, textBox[2] - textBox[0]);
+  const th = Math.max(1, textBox[3] - textBox[1]);
+  const textArea = tw * th;
+  const cx = (textBox[0] + textBox[2]) * 0.5;
+  const cy = (textBox[1] + textBox[3]) * 0.5;
+
+  let bestIdx = -1;
+  let bestScore = -1;
+  let bestArea = Infinity;
+
+  for (let i = 0; i < regions.length; i += 1) {
+    const rb = regions[i]?.bbox;
+    if (!Array.isArray(rb) || rb.length < 4) continue;
+    const bx1 = Number(rb[0]) || 0;
+    const by1 = Number(rb[1]) || 0;
+    const bx2 = Number(rb[2]) || 0;
+    const by2 = Number(rb[3]) || 0;
+    const bw = bx2 - bx1;
+    const bh = by2 - by1;
+    if (bw <= 4 || bh <= 4) continue;
+
+    const inter = computeBoxIntersectionArea(textBox, [bx1, by1, bx2, by2]);
+    const overlap = inter / textArea;
+    const centerInside =
+      cx >= bx1 - 6 && cx <= bx2 + 6 && cy >= by1 - 6 && cy <= by2 + 6;
+    if (overlap < minOverlap && !(centerInside && overlap >= 0.15)) {
+      continue;
+    }
+
+    const area = bw * bh;
+    if (
+      overlap > bestScore + 0.05 ||
+      (Math.abs(overlap - bestScore) <= 0.05 && area < bestArea)
+    ) {
+      bestIdx = i;
+      bestScore = overlap;
+      bestArea = area;
+    }
+  }
+  return bestIdx;
+}
+
 /**
  * Normalize raw dialogue blocks returned from `/api/process-page` or `/api/stage/*`
  * into canvas-ready block objects with explicit geometry & typography styles.
  */
-export function normalizeBlocks(rawBlocks = []) {
-  return (rawBlocks || []).map((b, index) => {
+export function normalizeBlocks(rawBlocks = [], options = null) {
+  const imgWidth = Number(options?.imgWidth) || 0;
+  const targetLang = String(options?.targetLang || 'id').toLowerCase();
+  const isHorizontalTarget = !['ja', 'ja-vert'].includes(targetLang);
+  const layoutBubbles = Array.isArray(options?.layoutBubbles)
+    ? options.layoutBubbles
+    : [];
+  const panels = Array.isArray(options?.panels) ? options.panels : [];
+
+  const list = rawBlocks || [];
+  const matchedBubbleIndices = list.map((b) => {
     const bbox =
       Array.isArray(b.bbox) && b.bbox.length >= 4
         ? b.bbox
@@ -682,8 +745,110 @@ export function normalizeBlocks(rawBlocks = []) {
     const y1 = Number(bbox[1]) || 0;
     const x2 = Number(bbox[2]) || x1 + 140;
     const y2 = Number(bbox[3]) || y1 + 60;
-    const width = Math.max(36, x2 - x1);
-    const height = Math.max(24, y2 - y1);
+    return findContainingRegion([x1, y1, x2, y2], layoutBubbles, 0.35);
+  });
+
+  const bubbleUsageCount = new Map();
+  for (const idx of matchedBubbleIndices) {
+    if (idx >= 0) {
+      bubbleUsageCount.set(idx, (bubbleUsageCount.get(idx) || 0) + 1);
+    }
+  }
+
+  const normalized = list.map((b, index) => {
+    const bbox =
+      Array.isArray(b.bbox) && b.bbox.length >= 4
+        ? b.bbox
+        : [60, 60, 220, 140];
+    const x1 = Number(bbox[0]) || 0;
+    const y1 = Number(bbox[1]) || 0;
+    const x2 = Number(bbox[2]) || x1 + 140;
+    const y2 = Number(bbox[3]) || y1 + 60;
+    const bboxWidth = Math.max(36, x2 - x1);
+    const bboxHeight = Math.max(24, y2 - y1);
+
+    let defaultX = x1;
+    let defaultY = y1;
+    let defaultWidth = bboxWidth;
+    let defaultHeight = bboxHeight;
+
+    const bubbleIdx = matchedBubbleIndices[index];
+    const matchedBubble = bubbleIdx >= 0 ? layoutBubbles[bubbleIdx] : null;
+    const panelIdx = findContainingRegion([x1, y1, x2, y2], panels, 0.45);
+    const matchedPanel = panelIdx >= 0 ? panels[panelIdx] : null;
+
+    if (isHorizontalTarget && matchedBubble && Array.isArray(matchedBubble.bbox)) {
+      // Fit translated horizontal text strictly inside the detected speech bubble interior
+      const bx1 = Number(matchedBubble.bbox[0]) || 0;
+      const by1 = Number(matchedBubble.bbox[1]) || 0;
+      const bx2 = Number(matchedBubble.bbox[2]) || bx1 + bboxWidth;
+      const by2 = Number(matchedBubble.bbox[3]) || by1 + bboxHeight;
+      const bw = Math.max(24, bx2 - bx1);
+      const bh = Math.max(24, by2 - by1);
+
+      const padX = bw >= 48 ? Math.max(6, Math.round(bw * 0.12)) : 3;
+      const padY = bh >= 36 ? Math.max(4, Math.round(bh * 0.10)) : 3;
+      const innerX1 = bx1 + padX;
+      const innerX2 = Math.max(innerX1 + 24, bx2 - padX);
+      const innerY1 = by1 + padY;
+      const innerY2 = Math.max(innerY1 + 20, by2 - padY);
+      const innerW = Math.max(24, innerX2 - innerX1);
+      const innerH = Math.max(20, innerY2 - innerY1);
+
+      if ((bubbleUsageCount.get(bubbleIdx) || 1) === 1) {
+        defaultX = innerX1;
+        defaultY = innerY1;
+        defaultWidth = innerW;
+        defaultHeight = innerH;
+      } else {
+        const desiredW =
+          bboxHeight > bboxWidth * 1.5
+            ? Math.min(innerW, Math.max(bboxWidth, Math.round(bboxHeight * 0.65)))
+            : Math.min(innerW, bboxWidth);
+        const centerX = x1 + bboxWidth / 2;
+        defaultWidth = Math.max(24, desiredW);
+        defaultX = Math.max(
+          innerX1,
+          Math.min(Math.round(centerX - defaultWidth / 2), innerX2 - defaultWidth)
+        );
+        defaultY = Math.max(innerY1, Math.min(y1, innerY2 - 20));
+        defaultHeight = Math.max(20, Math.min(bboxHeight, innerY2 - defaultY));
+      }
+    } else if (isHorizontalTarget && bboxHeight > bboxWidth * 1.5) {
+      // Fallback for narration/SFX without a detected bubble: conservative horizontal reshape
+      const maxCap = imgWidth > 0 ? imgWidth * 0.20 : bboxHeight * 0.50;
+      const expandedWidth = Math.round(
+        Math.max(
+          bboxWidth,
+          Math.min(bboxWidth * 2.2, bboxHeight * 0.50, maxCap)
+        )
+      );
+      const centerX = x1 + bboxWidth / 2;
+      let centeredX = Math.round(centerX - expandedWidth / 2);
+
+      if (matchedPanel && Array.isArray(matchedPanel.bbox)) {
+        const px1 = (Number(matchedPanel.bbox[0]) || 0) + 4;
+        const px2 = (Number(matchedPanel.bbox[2]) || px1 + expandedWidth) - 4;
+        const panelAvailW = Math.max(bboxWidth, px2 - px1);
+        defaultWidth = Math.min(expandedWidth, panelAvailW);
+        centeredX = Math.max(
+          px1,
+          Math.min(Math.round(centerX - defaultWidth / 2), px2 - defaultWidth)
+        );
+      } else {
+        defaultWidth = expandedWidth;
+        if (imgWidth > 0) {
+          centeredX = Math.max(
+            0,
+            Math.min(centeredX, Math.max(0, imgWidth - defaultWidth))
+          );
+        } else {
+          centeredX = Math.max(0, centeredX);
+        }
+      }
+      defaultX = centeredX;
+    }
+
     const fontSize = b.font_size || b.style?.font_size || 18;
     const color = b.color || b.style?.color || '#000000';
     const align = b.align || b.style?.align || 'center';
@@ -703,14 +868,16 @@ export function normalizeBlocks(rawBlocks = []) {
       ...b,
       id: b.id || `block_${String(index + 1).padStart(3, '0')}`,
       order: b.order ?? index + 1,
-      bbox: [x1, y1, x1 + width, y1 + height],
+      bbox: [x1, y1, x1 + bboxWidth, y1 + bboxHeight],
+      bubble_bbox: matchedBubble?.bbox ? [...matchedBubble.bbox] : b.bubble_bbox,
+      panel_bbox: matchedPanel?.bbox ? [...matchedPanel.bbox] : b.panel_bbox,
       polygon: Array.isArray(b.polygon)
         ? b.polygon.map((pt) => (Array.isArray(pt) ? [...pt] : pt))
         : undefined,
-      x: typeof b.x === 'number' ? b.x : x1,
-      y: typeof b.y === 'number' ? b.y : y1,
-      width: typeof b.width === 'number' ? b.width : width,
-      height: typeof b.height === 'number' ? b.height : height,
+      x: typeof b.x === 'number' ? b.x : defaultX,
+      y: typeof b.y === 'number' ? b.y : defaultY,
+      width: typeof b.width === 'number' ? b.width : defaultWidth,
+      height: typeof b.height === 'number' ? b.height : defaultHeight,
       rotation: typeof b.rotation === 'number' ? b.rotation : 0,
       original_text: b.original_text ?? b.source_text ?? '',
       source_text: b.source_text ?? b.original_text ?? '',
@@ -731,8 +898,55 @@ export function normalizeBlocks(rawBlocks = []) {
         align,
         line_height: lineHeight,
       },
+      _autoSized: typeof b.x !== 'number' && typeof b.width !== 'number',
     };
   });
+
+  // Prevent adjacent auto-expanded boxes (e.g. side-by-side floating text outside bubbles)
+  // from overlapping each other horizontally.
+  const gap = 4;
+  for (let i = 0; i < normalized.length; i += 1) {
+    const a = normalized[i];
+    if (!a._autoSized) continue;
+    for (let j = i + 1; j < normalized.length; j += 1) {
+      const b = normalized[j];
+      if (!b._autoSized) continue;
+
+      const ay1 = a.y;
+      const ay2 = a.y + a.height;
+      const by1 = b.y;
+      const by2 = b.y + b.height;
+      const vOverlap = Math.min(ay2, by2) - Math.max(ay1, by1);
+      if (vOverlap <= Math.min(a.height, b.height) * 0.25) continue;
+
+      const aOrigCenter = (a.bbox[0] + a.bbox[2]) * 0.5;
+      const bOrigCenter = (b.bbox[0] + b.bbox[2]) * 0.5;
+      const left = aOrigCenter <= bOrigCenter ? a : b;
+      const right = aOrigCenter <= bOrigCenter ? b : a;
+
+      if (left.x + left.width > right.x - gap && left.bbox[2] <= right.bbox[0] + 4) {
+        const mid = Math.round((left.bbox[2] + right.bbox[0]) * 0.5);
+        const leftMaxX2 = Math.max(left.bbox[2], mid - Math.floor(gap / 2));
+        const rightMinX1 = Math.min(right.bbox[0], mid + Math.ceil(gap / 2));
+
+        const newLeftW = Math.max(24, leftMaxX2 - left.x);
+        if (newLeftW < left.width) {
+          left.width = newLeftW;
+        }
+        const rightEnd = right.x + right.width;
+        if (rightMinX1 > right.x) {
+          const newRightW = Math.max(24, rightEnd - rightMinX1);
+          right.x = rightMinX1;
+          right.width = newRightW;
+        }
+      }
+    }
+  }
+
+  for (const item of normalized) {
+    delete item._autoSized;
+  }
+  return normalized;
 }
 
 function cloneBlock(block) {
@@ -2252,6 +2466,16 @@ export const useEditorStore = create((set, get) => ({
     get()._writeLocalSnapshot();
   },
 
+  setTranslationTone: (translationTone) => {
+    set((state) => ({
+      pipelineConfig: {
+        ...state.pipelineConfig,
+        translationTone: translationTone || 'standard',
+      },
+    }));
+    get()._writeLocalSnapshot();
+  },
+
   hydratePipelineConfig: (backendSettings, { forceAppearance = false } = {}) => {
     if (!backendSettings || typeof backendSettings !== 'object') return;
     const recentlyMutatedAppearance =
@@ -2380,6 +2604,10 @@ export const useEditorStore = create((set, get) => ({
         customInstructions:
           backendSettings.custom_instructions ??
           state.pipelineConfig.customInstructions,
+        translationTone:
+          backendSettings.translation_tone ??
+          state.pipelineConfig.translationTone ??
+          'standard',
         glossary:
           backendSettings.glossary && typeof backendSettings.glossary === 'object'
             ? { ...backendSettings.glossary }
@@ -2468,6 +2696,7 @@ export const useEditorStore = create((set, get) => ({
       timeout: Number(p.timeout) || 90,
       source_lang: p.sourceLang,
       target_lang: p.targetLang,
+      translation_tone: p.translationTone || 'standard',
       temperature: Number(p.temperature),
       top_p: p.topP === null || p.topP === '' ? null : Number(p.topP),
       top_k: p.topK === null || p.topK === '' ? null : Math.round(Number(p.topK)),

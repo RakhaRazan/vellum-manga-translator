@@ -1,8 +1,8 @@
-// MangaFlow AI — One-Click Native Win32 Launcher (`Manga/MangaFlow-Cpp.exe`)
+// Vellum — One-Click Native Win32 Launcher (`Vellum.exe`)
 //
 // Zero-console, zero-.NET, <5ms native Win32 launcher placed in the root
-// `Manga/` folder. Double-clicking it immediately spawns
-// `MangaFlow_Cpp\MangaFlow-Cpp.exe` with `MangaFlow_Cpp\` as its working
+// folder. Double-clicking it immediately spawns
+// `Vellum_Runtime\Vellum.exe` with `Vellum_Runtime\` as its working
 // directory and forwards any CLI arguments (such as `--headless`).
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -49,15 +49,15 @@ int WINAPI wWinMain(
     PWSTR lpCmdLine,
     int /*nCmdShow*/) {
     const std::wstring root_dir = get_executable_dir();
-    const std::wstring app_dir = root_dir + L"\\MangaFlow_Cpp";
-    const std::wstring target_exe = app_dir + L"\\MangaFlow-Cpp.exe";
+    const std::wstring app_dir = root_dir + L"\\Vellum_Runtime";
+    const std::wstring target_exe = app_dir + L"\\Vellum.exe";
 
     if (!file_exists(target_exe)) {
         const std::wstring msg =
-            L"MangaFlow AI (C++17) runtime binary was not found at:\n" +
+            L"Vellum runtime binary was not found at:\n" +
             target_exe +
             L"\n\nPlease rebuild using packaging\\build_cpp_release.bat.";
-        MessageBoxW(nullptr, msg.c_str(), L"MangaFlow AI", MB_OK | MB_ICONERROR);
+        MessageBoxW(nullptr, msg.c_str(), L"Vellum", MB_OK | MB_ICONERROR);
         return 1;
     }
 
@@ -86,9 +86,9 @@ int WINAPI wWinMain(
     if (!ok) {
         const DWORD err = GetLastError();
         const std::wstring msg =
-            L"Failed to launch MangaFlow AI (Win32 error " +
+            L"Failed to launch Vellum (Win32 error " +
             std::to_wstring(err) + L"):\n" + target_exe;
-        MessageBoxW(nullptr, msg.c_str(), L"MangaFlow AI", MB_OK | MB_ICONERROR);
+        MessageBoxW(nullptr, msg.c_str(), L"Vellum", MB_OK | MB_ICONERROR);
         return 1;
     }
 

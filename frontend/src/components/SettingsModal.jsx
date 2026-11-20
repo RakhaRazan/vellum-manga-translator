@@ -146,6 +146,10 @@ const INSTRUCTION_PRESETS = [
     label: 'Preserve Honorifics',
     text: 'Preserve original honorifics (-san, -senpai, -kun, -chan, oppa, hyung, shixiong) faithfully.',
   },
+  {
+    label: 'Adult / Doujinshi (Uncensored)',
+    text: 'Use natural, expressive, uncensored colloquial language (including intimate dialogue, moans, and SFX) instead of stiff textbook phrasing.',
+  },
 ];
 
 const FONT_STYLE_FILTERS = [
@@ -1120,6 +1124,7 @@ export default function SettingsModal({
         ...prev,
         sourceLang: 'ja',
         targetLang: 'id',
+        translationTone: 'standard',
         temperature: 0.2,
         topP: 0.95,
         topK: 40,
@@ -1263,9 +1268,12 @@ export default function SettingsModal({
     runtimeStatus.lmStudio,
   ]);
 
+  const normalizeFontQuery = (val) =>
+    String(val || '').toLowerCase().replace(/[\s\-_]+/g, '');
+
   // Derived filtered fonts for Tab 5 (Typesetting)
   const { filteredInstalledFamilies, filteredCatalogItems } = useMemo(() => {
-    const q = fontSearch.trim().toLowerCase();
+    const q = normalizeFontQuery(fontSearch.trim());
     const families = fontsData?.families || [];
     const catalog = fontsData?.catalog || [];
 
@@ -1279,7 +1287,7 @@ export default function SettingsModal({
       ) {
         return false;
       }
-      if (q && !fam.family.toLowerCase().includes(q)) return false;
+      if (q && !normalizeFontQuery(fam.family).includes(q)) return false;
       return true;
     });
 
@@ -1296,9 +1304,9 @@ export default function SettingsModal({
       }
       if (
         q &&
-        !item.family.toLowerCase().includes(q) &&
-        !(item.description || '').toLowerCase().includes(q) &&
-        !(item.scripts || []).some((sc) => sc.toLowerCase().includes(q))
+        !normalizeFontQuery(item.family).includes(q) &&
+        !normalizeFontQuery(item.description).includes(q) &&
+        !(item.scripts || []).some((sc) => normalizeFontQuery(sc).includes(q))
       ) {
         return false;
       }
@@ -1310,6 +1318,12 @@ export default function SettingsModal({
       filteredCatalogItems: catItems,
     };
   }, [fontsData, fontSearch, fontSourceTab, fontStyleFilter]);
+
+  const installedFontSet = useMemo(() => {
+    const families = fontsData?.families;
+    if (!Array.isArray(families) || families.length === 0) return null;
+    return new Set(families.map((f) => normalizeFontQuery(f.family)));
+  }, [fontsData]);
 
   if (!isOpen) return null;
 
@@ -1645,7 +1659,7 @@ export default function SettingsModal({
                         title={
                           pipelineModelsData?.koharu_cache_dir
                             ? `Import local Koharu models from ${pipelineModelsData.koharu_cache_dir}`
-                            : 'Import local Koharu models into MangaFlow storage'
+                            : 'Import local Koharu models into Vellum storage'
                         }
                         className="studio-btn h-7 px-2.5 text-[11px] border-studio-accent/50 text-studio-accent hover:bg-studio-accent/10 shrink-0"
                       >
@@ -2731,6 +2745,36 @@ export default function SettingsModal({
                         ))}
                       </select>
                     </div>
+
+                    {/* Tone / Genre Preset */}
+                    <div className="space-y-1 sm:col-span-2">
+                      <label
+                        htmlFor="trans-tone"
+                        className="text-[11px] font-medium text-studio-text-secondary block"
+                      >
+                        Tone / Genre
+                      </label>
+                      <select
+                        id="trans-tone"
+                        value={draftPipeline.translationTone || 'standard'}
+                        onChange={(e) =>
+                          setDraftPipeline((prev) => ({
+                            ...prev,
+                            translationTone: e.target.value,
+                          }))
+                        }
+                        className="studio-input w-full h-8 px-2.5 text-xs cursor-pointer"
+                      >
+                        <option value="standard">Standard</option>
+                        <option value="casual">Casual</option>
+                        <option value="adult_doujinshi">
+                          Adult / Doujinshi (Uncensored)
+                        </option>
+                      </select>
+                      <p className="text-[10px] text-studio-text-muted">
+                        Controls dialogue register, SFX expressiveness, and uncensored colloquial phrasing.
+                      </p>
+                    </div>
                   </div>
                 </SectionCard>
 
@@ -3259,6 +3303,18 @@ export default function SettingsModal({
                                     Primary
                                   </span>
                                 )}
+                                {installedFontSet &&
+                                  !['sans-serif', 'serif', 'monospace', 'cursive', 'fantasy', 'system-ui', 'ui-sans-serif', 'ui-serif', 'ui-monospace'].includes(
+                                    String(fontName).trim().toLowerCase()
+                                  ) &&
+                                  !installedFontSet.has(normalizeFontQuery(fontName)) && (
+                                    <span
+                                      className="rounded-studio-sm border border-amber-500/40 bg-amber-500/10 text-amber-400 px-1.5 py-0.5 text-[9px] font-mono font-medium leading-none shrink-0"
+                                      title={`"${fontName}" was not found in C:\\Windows\\Fonts or local custom fonts`}
+                                    >
+                                      Not Installed on PC
+                                    </span>
+                                  )}
                               </div>
 
                               <div className="flex items-center gap-0.5 shrink-0">

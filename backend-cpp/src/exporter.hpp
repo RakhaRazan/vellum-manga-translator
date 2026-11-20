@@ -42,6 +42,11 @@ struct ExportPageInput {
     std::optional<std::string> filename;
 };
 
+struct DiskExportPageEntry {
+    std::filesystem::path file_path;
+    std::optional<std::string> filename;
+};
+
 enum class ExportImageFormat {
     Original,
     Png,
@@ -50,7 +55,8 @@ enum class ExportImageFormat {
 
 // Local image cache utilities (`/api/cache/images/{image_id}.{ext}`)
 std::filesystem::path get_image_cache_dir();
-void prune_image_cache(const std::filesystem::path& cache_dir, size_t max_files = 500);
+std::filesystem::path get_export_sessions_dir();
+void prune_image_cache(const std::filesystem::path& cache_dir, size_t max_files = 10000);
 std::filesystem::path resolve_cached_image_path(const std::string& id_or_url);
 std::string media_type_for_cache_ext(const std::string& ext_lower);
 
@@ -69,7 +75,7 @@ std::vector<uint8_t> decode_export_image_reference(const std::string& ref, int p
 std::vector<ExtractedArchivePage> extract_archive_pages(
     const std::vector<uint8_t>& archive_bytes,
     const std::filesystem::path& output_dir,
-    size_t max_pages = 500);
+    size_t max_pages = 10000);
 
 // `POST /api/export/cbz` — package ordered pages into a downloadable `.cbz` archive
 std::vector<uint8_t> build_cbz_bytes(
@@ -77,7 +83,19 @@ std::vector<uint8_t> build_cbz_bytes(
     ExportImageFormat image_format = ExportImageFormat::Original,
     int jpeg_quality = 95);
 
+// Disk-backed O(1)-RAM `.cbz` writer for large multi-thousand-page batches
+void build_cbz_to_file(
+    const std::vector<DiskExportPageEntry>& pages,
+    const std::filesystem::path& output_path,
+    ExportImageFormat image_format = ExportImageFormat::Original,
+    int jpeg_quality = 95);
+
 // `POST /api/export/pdf` — native C++ PDF 1.4 multi-page writer (JPEG DCTDecode + lossless FlateDecode)
 std::vector<uint8_t> build_pdf_bytes(const std::vector<ExportPageInput>& pages);
+
+// Disk-backed O(1)-RAM PDF 1.4 writer for large multi-thousand-page batches
+void build_pdf_to_file(
+    const std::vector<DiskExportPageEntry>& pages,
+    const std::filesystem::path& output_path);
 
 }  // namespace mangaflow

@@ -1,25 +1,15 @@
-# Models, fonts & large weight files
+# Models, fonts, cache, local settings & large weight files
 models/
-backend/models/
 fonts/
-backend/fonts/
+cache/
+settings.json
+Vellum_Runtime/
 *.onnx
 *.gguf
 *.bin
 *.safetensors
 *.pt
 *.pth
-
-# Python virtual environments & caches
-venv/
-.venv/
-backend/venv/
-env/
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-.pytest_cache/
 
 # C++17 CMake / MSVC build artifacts
 backend-cpp/build/
@@ -31,7 +21,7 @@ backend-cpp/CMakeUserPresets.json
 *.exp
 *.ilk
 
-# Node / Frontend
+# Node / React frontend
 node_modules/
 frontend/node_modules/
 dist/
@@ -39,25 +29,20 @@ frontend/dist/
 dist-ssr/
 *.local
 
-# Standalone Desktop Bundles, Release Archives & Compiled Binaries
-MangaFlow_App/
-MangaFlow_Cpp/
+# Standalone Desktop Bundle, Release Archives & Compiled Binaries
+Vellum/
 release/
 *.exe
 *.dll
 
-# Tauri & Legacy Packaging Staging
-src-tauri/target/
-frontend/src-tauri/target/
-packaging/build/
-packaging/dist/
+# Optional standalone Python CLI helper caches (packaging/convert_koharu_to_onnx.py)
+venv/
+.venv/
+__pycache__/
+*.py[cod]
 packaging/_koharu_stage/
-*.spec
-!packaging/*.spec
-!packaging/pyinstaller/*.spec
 
-# Local runtime settings (may contain API keys), logs & environment files
-backend/settings.json
+# Local environment files & logs
 .env
 .env.*.local
 *.log

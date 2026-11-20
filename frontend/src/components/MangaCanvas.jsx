@@ -237,11 +237,13 @@ function useMaskOverlayCanvas(maskSrc, maskImg) {
 
 /**
  * Extract canonical geometry `{ x, y, width, height, rotation }` from a block.
+ * Automatically reshapes tall narrow vertical Japanese strips into readable
+ * horizontal boxes when targeting horizontal languages (EN, ID, etc.).
  */
-export function getBlockGeometry(block) {
-  const x = typeof block?.x === 'number' ? block.x : block?.bbox?.[0] ?? 0;
+export function getBlockGeometry(block, imgWidth = 0, targetLang = null) {
+  let x = typeof block?.x === 'number' ? block.x : block?.bbox?.[0] ?? 0;
   const y = typeof block?.y === 'number' ? block.y : block?.bbox?.[1] ?? 0;
-  const width =
+  let width =
     typeof block?.width === 'number'
       ? Math.max(32, block.width)
       : Math.max(40, (block?.bbox?.[2] ?? 140) - (block?.bbox?.[0] ?? 0));
@@ -250,15 +252,123 @@ export function getBlockGeometry(block) {
       ? Math.max(20, block.height)
       : Math.max(24, (block?.bbox?.[3] ?? 60) - (block?.bbox?.[1] ?? 0));
   const rotation = typeof block?.rotation === 'number' ? block.rotation : 0;
+
+  const resolvedTargetLang = String(
+    targetLang || useEditorStore.getState()?.pipelineConfig?.targetLang || 'id'
+  ).toLowerCase();
+  const isHorizontalTarget = !['ja', 'ja-vert'].includes(resolvedTargetLang);
+
+  if (
+    isHorizontalTarget &&
+    typeof block?.width !== 'number' &&
+    !Array.isArray(block?.bubble_bbox) &&
+    Array.isArray(block?.bbox) &&
+    block.bbox.length >= 4
+  ) {
+    const bx1 = Number(block.bbox[0]) || 0;
+    const by1 = Number(block.bbox[1]) || 0;
+    const bx2 = Number(block.bbox[2]) || bx1 + width;
+    const by2 = Number(block.bbox[3]) || by1 + height;
+    const bboxWidth = Math.max(1, bx2 - bx1);
+    const bboxHeight = Math.max(1, by2 - by1);
+
+    if (bboxHeight > bboxWidth * 1.5 && Math.abs(width - bboxWidth) <= 2) {
+      const maxCap = imgWidth > 0 ? imgWidth * 0.32 : bboxHeight * 0.72;
+      const expandedWidth = Math.round(
+        Math.max(bboxWidth, Math.min(bboxHeight * 0.72, maxCap))
+      );
+      const centerX = bx1 + bboxWidth / 2;
+      let centeredX = Math.round(centerX - expandedWidth / 2);
+      if (imgWidth > 0) {
+        centeredX = Math.max(
+          0,
+          Math.min(centeredX, Math.max(0, imgWidth - expandedWidth))
+        );
+      } else {
+        centeredX = Math.max(0, centeredX);
+      }
+      x = centeredX;
+      width = expandedWidth;
+    }
+  }
+
   return { x, y, width, height, rotation };
+}
+
+let _measureCanvasCtx = null;
+function getMeasureCanvasCtx() {
+  if (!_measureCanvasCtx && typeof document !== 'undefined') {
+    const c = document.createElement('canvas');
+    _measureCanvasCtx = c.getContext('2d');
+  }
+  return _measureCanvasCtx;
+}
+
+function computeAutoFitFontSize({
+  text,
+  width,
+  height,
+  fontFamily,
+  lineHeight = 1.18,
+  padding = 4,
+  minFontSize = 14,
+  maxFontSize = 28,
+}) {
+  const ctx = getMeasureCanvasCtx();
+  const availW = Math.max(24, width - padding * 2);
+  const availH = Math.max(20, height - padding * 2);
+  const cleanText = String(text || '').trim();
+  if (!ctx || !cleanText) return minFontSize;
+
+  const paragraphs = cleanText.split(/\r?\n/);
+  const fitsAtSize = (size) => {
+    ctx.font = `bold ${size}px ${fontFamily || 'sans-serif'}`;
+    let lineCount = 0;
+    for (const para of paragraphs) {
+      const words = para.split(/\s+/).filter(Boolean);
+      if (words.length === 0) {
+        lineCount += 1;
+        continue;
+      }
+      let currentLine = words[0];
+      for (let i = 1; i < words.length; i += 1) {
+        const candidate = `${currentLine} ${words[i]}`;
+        if (ctx.measureText(candidate).width <= availW) {
+          currentLine = candidate;
+        } else {
+          lineCount += 1;
+          currentLine = words[i];
+        }
+      }
+      lineCount += 1;
+    }
+    return lineCount * size * lineHeight <= availH;
+  };
+
+  let best = minFontSize;
+  let lo = minFontSize;
+  let hi = Math.max(minFontSize, Math.round(maxFontSize));
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (fitsAtSize(mid)) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return Math.max(minFontSize, best);
 }
 
 /**
  * Extract canonical Konva typography props shared 1:1 between live canvas and native export.
  */
-export function getBlockTextStyle(block) {
+export function getBlockTextStyle(block, geom = null, imgWidth = 0) {
   const ts = useEditorStore.getState().typesetting;
-  const fontSize = block?.font_size || block?.style?.font_size || ts?.defaultFontSize || 18;
+  const resolvedImgWidth = Math.max(1, Number(imgWidth) || 1000);
+  const dynamicMinFontSize = Math.max(14, Math.round(resolvedImgWidth * 0.015));
+  const baseFontSize =
+    block?.font_size || block?.style?.font_size || ts?.defaultFontSize || 18;
   const rawFontFamily =
     block?.style?.font_family || block?.font_family || ts?.fontFamily || DEFAULT_FONT_FAMILY;
   const fontFamily = buildKonvaFontFamily(rawFontFamily, ts?.fontFallbackChain);
@@ -280,9 +390,31 @@ export function getBlockTextStyle(block) {
       ? Boolean(block.style.all_caps)
       : Boolean(ts?.allCaps);
   const rawText = block?.translated_text || '';
+  const displayText = useAllCaps ? rawText.toUpperCase() : rawText;
+
+  let fontSize = baseFontSize;
+  if (ts?.autoFitFontSize !== false && geom && displayText) {
+    const maxFontSize = Math.max(
+      dynamicMinFontSize,
+      baseFontSize,
+      Math.round(resolvedImgWidth * 0.022)
+    );
+    fontSize = computeAutoFitFontSize({
+      text: displayText,
+      width: geom.width,
+      height: geom.height,
+      fontFamily,
+      lineHeight,
+      padding: 4,
+      minFontSize: dynamicMinFontSize,
+      maxFontSize,
+    });
+  } else if (ts?.autoFitFontSize !== false) {
+    fontSize = Math.max(dynamicMinFontSize, baseFontSize);
+  }
 
   return {
-    text: useAllCaps ? rawText.toUpperCase() : rawText,
+    text: displayText,
     fontSize,
     fontFamily,
     fontStyle: 'bold',
@@ -357,9 +489,9 @@ function buildOffscreenExportStage(page, baseImageEl, format = 'png') {
   const blocks = page?.blocks || [];
   for (let i = 0; i < blocks.length; i += 1) {
     const block = blocks[i];
-    const style = getBlockTextStyle(block);
+    const geom = getBlockGeometry(block, width, page?.targetLang);
+    const style = getBlockTextStyle(block, geom, width);
     if (!style.text) continue;
-    const geom = getBlockGeometry(block);
     textLayer.add(
       new Konva.Text({
         x: geom.x,
@@ -387,7 +519,7 @@ function buildOffscreenExportStage(page, baseImageEl, format = 'png') {
 export function compositePageToDataUrl(
   page,
   baseImageEl,
-  { format = 'png', quality = 0.98 } = {}
+  { format = 'png', quality = 0.98, pixelRatio = null } = {}
 ) {
   if (!page || !baseImageEl) return null;
   const { stage, width, height, isJpeg } = buildOffscreenExportStage(
@@ -395,13 +527,15 @@ export function compositePageToDataUrl(
     baseImageEl,
     format
   );
+  const resolvedPixelRatio =
+    pixelRatio ?? (Math.max(width, height) > 2800 ? 1.5 : 2);
   try {
     return stage.toDataURL({
       x: 0,
       y: 0,
       width,
       height,
-      pixelRatio: 1,
+      pixelRatio: resolvedPixelRatio,
       mimeType: isJpeg ? 'image/jpeg' : 'image/png',
       quality: isJpeg ? quality : 1,
     });
@@ -411,7 +545,7 @@ export function compositePageToDataUrl(
 }
 
 /**
- * Asynchronously composite ANY page (active or background) at exact 1:1 native resolution
+ * Asynchronously composite ANY page (active or background) at high-DPI resolution
  * into a lossless PNG or JPEG `Blob` suitable for single download, `.cbz`, or `.pdf` export.
  */
 export async function compositePageToBlob(
@@ -419,6 +553,7 @@ export async function compositePageToBlob(
   {
     format = 'png',
     quality = 0.98,
+    pixelRatio = null,
     apiBaseUrl = DEFAULT_API_BASE_URL,
     preloadedImage = null,
   } = {}
@@ -442,6 +577,8 @@ export async function compositePageToBlob(
     baseImg,
     format
   );
+  const resolvedPixelRatio =
+    pixelRatio ?? (Math.max(width, height) > 2800 ? 1.5 : 2);
 
   try {
     const canvas = stage.toCanvas({
@@ -449,16 +586,20 @@ export async function compositePageToBlob(
       y: 0,
       width,
       height,
-      pixelRatio: 1,
+      pixelRatio: resolvedPixelRatio,
     });
     const mimeType = isJpeg ? 'image/jpeg' : 'image/png';
-    return await new Promise((resolve) => {
+    const blob = await new Promise((resolve) => {
       canvas.toBlob(
-        (blob) => resolve(blob),
+        (b) => resolve(b),
         mimeType,
         isJpeg ? quality : undefined
       );
     });
+    // Explicitly release Chromium GPU canvas backing store immediately (critical for 1,500+ page exports)
+    canvas.width = 0;
+    canvas.height = 0;
+    return blob;
   } finally {
     stage.destroy();
   }
@@ -473,11 +614,12 @@ export async function exportPagesArchive(
   archiveFormat = 'cbz',
   {
     apiBaseUrl = DEFAULT_API_BASE_URL,
-    filename = 'mangaflow_export',
+    filename = 'vellum_export',
     imageFormat = 'png',
     quality = 0.98,
     activePageId = null,
     activeBaseImage = null,
+    onProgress = null,
   } = {}
 ) {
   if (!Array.isArray(pages) || pages.length === 0) {
@@ -490,6 +632,111 @@ export async function exportPagesArchive(
     String(imageFormat).toLowerCase() === 'jpeg'
       ? 'jpg'
       : 'png';
+  const base = String(apiBaseUrl || '').replace(/\/+$/, '');
+  const padWidth = Math.max(4, String(pages.length).length);
+
+  // Use disk-backed O(1)-RAM streamed export session for large batches (>10 pages, up to 10,000+ pages)
+  if (pages.length > 10) {
+    const startResp = await fetch(`${base}/api/export/session/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        format: fmt,
+        filename,
+        image_format: ext,
+        jpeg_quality: Math.round(quality * 100),
+      }),
+    });
+    if (!startResp.ok) {
+      const errJson = await startResp.json().catch(() => ({}));
+      throw new Error(errJson?.detail || `Export session start HTTP ${startResp.status}`);
+    }
+    const { session_id: sessionId } = await startResp.json();
+    let uploadedCount = 0;
+
+    try {
+      for (let idx = 0; idx < pages.length; idx += 1) {
+        const p = pages[idx];
+        if (onProgress) {
+          onProgress({ current: idx + 1, total: pages.length, phase: 'rendering' });
+        }
+        const preloaded = p.id === activePageId ? activeBaseImage : null;
+        let blob = await compositePageToBlob(p, {
+          format: ext,
+          quality,
+          apiBaseUrl,
+          preloadedImage: preloaded,
+        });
+        if (!blob && p.file) {
+          blob = p.file;
+        }
+        if (!blob) continue;
+
+        const safeStem = (p.name || `page_${idx + 1}`).replace(/\.[^/.]+$/, '');
+        const pageFilename = `${String(idx + 1).padStart(padWidth, '0')}_${safeStem}.${ext}`;
+
+        const pageForm = new FormData();
+        pageForm.append('index', String(idx));
+        pageForm.append('filename', pageFilename);
+        pageForm.append('image', blob, pageFilename);
+
+        let pageResp = null;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            pageResp = await fetch(
+              `${base}/api/export/session/${encodeURIComponent(sessionId)}/page`,
+              { method: 'POST', body: pageForm }
+            );
+            if (pageResp.ok) break;
+          } catch (netErr) {
+            if (attempt === 2) throw netErr;
+          }
+          await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+        }
+        if (!pageResp || !pageResp.ok) {
+          const errJson = await pageResp?.json().catch(() => ({}));
+          throw new Error(
+            errJson?.detail ||
+              `Export page ${idx + 1} upload failed (HTTP ${pageResp?.status || 'network'})`
+          );
+        }
+        uploadedCount += 1;
+
+        // Yield to UI event loop periodically so WebView stays responsive over 1,500+ pages
+        if ((idx & 3) === 3) {
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+
+      if (uploadedCount === 0) {
+        throw new Error('No renderable page images found for export.');
+      }
+
+      if (onProgress) {
+        onProgress({ current: uploadedCount, total: pages.length, phase: 'finalizing' });
+      }
+      const finResp = await fetch(
+        `${base}/api/export/session/${encodeURIComponent(sessionId)}/finalize`,
+        { method: 'POST' }
+      );
+      if (!finResp.ok) {
+        const errJson = await finResp.json().catch(() => ({}));
+        throw new Error(errJson?.detail || `Export finalize HTTP ${finResp.status}`);
+      }
+
+      const outBlob = await finResp.blob();
+      return {
+        blob: outBlob,
+        filename: `${filename}.${fmt}`,
+        pageCount: uploadedCount,
+      };
+    } catch (err) {
+      fetch(`${base}/api/export/session/${encodeURIComponent(sessionId)}/cancel`, {
+        method: 'POST',
+      }).catch(() => {});
+      throw err;
+    }
+  }
 
   const formData = new FormData();
   formData.append('filename', filename);
@@ -499,6 +746,9 @@ export async function exportPagesArchive(
   let appendedCount = 0;
   for (let idx = 0; idx < pages.length; idx += 1) {
     const p = pages[idx];
+    if (onProgress) {
+      onProgress({ current: idx + 1, total: pages.length, phase: 'rendering' });
+    }
     const preloaded = p.id === activePageId ? activeBaseImage : null;
     let blob = await compositePageToBlob(p, {
       format: ext,
@@ -513,7 +763,7 @@ export async function exportPagesArchive(
 
     if (blob) {
       const safeStem = (p.name || `page_${idx + 1}`).replace(/\.[^/.]+$/, '');
-      const pageFilename = `${String(idx + 1).padStart(3, '0')}_${safeStem}.${ext}`;
+      const pageFilename = `${String(idx + 1).padStart(padWidth, '0')}_${safeStem}.${ext}`;
       formData.append('images', blob, pageFilename);
       appendedCount += 1;
     }
@@ -523,7 +773,6 @@ export async function exportPagesArchive(
     throw new Error('No renderable page images found for export.');
   }
 
-  const base = String(apiBaseUrl || '').replace(/\/+$/, '');
   const resp = await fetch(`${base}/api/export/${fmt}`, {
     method: 'POST',
     body: formData,
@@ -554,6 +803,8 @@ export async function exportPagesArchive(
 const MemoTextNode = React.memo(
   function MemoTextNode({
     block,
+    imgWidth,
+    targetLang,
     fontRenderKey,
     isInteractive,
     isEditingInline,
@@ -566,8 +817,8 @@ const MemoTextNode = React.memo(
     onBlockDragMove,
     onBlockDragEnd,
   }) {
-    const geom = getBlockGeometry(block);
-    const style = getBlockTextStyle(block);
+    const geom = getBlockGeometry(block, imgWidth, targetLang);
+    const style = getBlockTextStyle(block, geom, imgWidth);
     void fontRenderKey;
 
     const handleRef = useCallback(
@@ -2628,6 +2879,8 @@ const MangaCanvas = forwardRef(function MangaCanvas(
                 <MemoTextNode
                   key={block.id}
                   block={block}
+                  imgWidth={imageWidth}
+                  targetLang={page?.targetLang}
                   fontRenderKey={fontRenderKey}
                   isInteractive={isTextInteractive}
                   isEditingInline={inlineEditState?.id === block.id}
@@ -2964,30 +3217,6 @@ const MangaCanvas = forwardRef(function MangaCanvas(
           <div className="inline-flex items-center gap-1.5 rounded-studio border border-sky-400/50 bg-studio-panel/95 px-3 py-1 text-[11px] font-medium text-sky-400 shadow-lg">
             <Type className="h-3.5 w-3.5" />
             <span>Click or drag on page to place a manual text box (Esc to cancel)</span>
-          </div>
-        </div>
-      )}
-
-      {/* Pipeline Processing Overlay */}
-      {page && (isProcessing || page.status === 'processing') && (
-        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/60 backdrop-blur-[2px]">
-          <div className="rounded-studio-md border border-studio-border bg-studio-panel px-5 py-4 shadow-2xl flex items-center gap-3.5 max-w-md">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-studio border border-studio-accent/35 bg-studio-accent/10 text-studio-accent">
-              <Loader2 className="h-5 w-5 animate-spin" />
-            </div>
-            <div>
-              <div className="flex items-center gap-1.5">
-                <h3 className="text-xs font-semibold text-studio-text">
-                  {page.activeStage
-                    ? `Running Stage: ${page.activeStage.toUpperCase()}…`
-                    : 'Processing Comic Page…'}
-                </h3>
-                <Sparkles className="h-3.5 w-3.5 text-studio-accent" />
-              </div>
-              <p className="mt-0.5 text-[11px] text-studio-text-secondary">
-                ONNX Detect → OCR → LaMa Tile Inpaint → Context-Aware LLM Translation
-              </p>
-            </div>
           </div>
         </div>
       )}

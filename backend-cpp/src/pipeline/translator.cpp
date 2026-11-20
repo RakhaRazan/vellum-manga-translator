@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -253,7 +254,7 @@ const std::vector<ProviderSpec>& all_provider_specs() {
             true, true, true, true, true,
             {
                 {"HTTP-Referer", "https://github.com/comic-translator"},
-                {"X-Title", "MangaFlow Comic Translator"},
+                {"X-Title", "Vellum"},
             },
         },
         {
@@ -555,7 +556,7 @@ HttpResponse http_request_winhttp(
     const int receive_ms = total_ms;
 
     WinHttpHandle session(WinHttpOpen(
-        L"MangaFlowAI/2.0",
+        L"Vellum/2.0",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -1501,11 +1502,17 @@ TranslatorConfig TranslatorConfig::from_settings(const json& settings) {
         cfg.reasoning_effort = ComicTranslator::normalize_reasoning_effort(
             settings["reasoning_effort"].get<std::string>());
     }
+    if (settings.contains("translation_tone") && settings["translation_tone"].is_string()) {
+        cfg.translation_tone = ComicTranslator::normalize_translation_tone(
+            settings["translation_tone"].get<std::string>());
+    }
     if (settings.contains("strip_thinking")) {
         if (auto v = parse_optional_bool(settings["strip_thinking"])) {
             cfg.strip_thinking = *v;
         }
     }
+    // Default `use_vision` to false unless explicitly toggled on (avoids slow per-page vision encoding)
+    cfg.use_vision = false;
     if (settings.contains("use_vision")) {
         if (auto v = parse_optional_bool(settings["use_vision"])) {
             cfg.use_vision = *v;
@@ -1625,6 +1632,11 @@ TranslatorConfig TranslatorConfig::from_settings_with_overrides(
         !util::trim_ascii(overrides["reasoning_effort"].get<std::string>()).empty()) {
         cfg.reasoning_effort = ComicTranslator::normalize_reasoning_effort(
             overrides["reasoning_effort"].get<std::string>());
+    }
+    if (overrides.contains("translation_tone") && overrides["translation_tone"].is_string() &&
+        !util::trim_ascii(overrides["translation_tone"].get<std::string>()).empty()) {
+        cfg.translation_tone = ComicTranslator::normalize_translation_tone(
+            overrides["translation_tone"].get<std::string>());
     }
     if (overrides.contains("strip_thinking") && !overrides["strip_thinking"].is_null()) {
         if (auto v = parse_optional_bool(overrides["strip_thinking"])) {
@@ -1796,6 +1808,22 @@ std::string ComicTranslator::normalize_reasoning_effort(const std::string& raw) 
     if (cleaned == "high" || cleaned == "max" || cleaned == "xhigh") return "high";
     throw std::invalid_argument(
         "Unsupported reasoning_effort '" + raw + "'. Must be one of: off, low, medium, high.");
+}
+
+std::string ComicTranslator::normalize_translation_tone(const std::string& raw) {
+    const std::string cleaned = util::to_lower_ascii(util::trim_ascii(raw));
+    if (cleaned.empty() || cleaned == "standard" || cleaned == "default" || cleaned == "normal") {
+        return "standard";
+    }
+    if (cleaned == "casual" || cleaned == "slang" || cleaned == "colloquial" || cleaned == "informal") {
+        return "casual";
+    }
+    if (cleaned == "adult" || cleaned == "adult_doujinshi" || cleaned == "adult-doujinshi" ||
+        cleaned == "doujinshi" || cleaned == "nsfw" || cleaned == "uncensored" ||
+        cleaned == "erotic" || cleaned == "hentai" || cleaned == "18+" || cleaned == "r18") {
+        return "adult";
+    }
+    return "standard";
 }
 
 std::map<std::string, std::string> ComicTranslator::parse_glossary(const json& raw) {
@@ -2187,6 +2215,36 @@ std::string ComicTranslator::resolve_provider_model(
         return pref_clean;
     }
 
+    // Short-TTL cache for local providers (LM Studio / Ollama) so multi-page batches avoid
+    // repeating `/v1/models` and `/api/v0/models` HTTP roundtrips on every single page.
+    struct LocalModelCacheEntry {
+        std::string resolved_id;
+        std::chrono::steady_clock::time_point expires_at;
+    };
+    static std::mutex s_local_model_cache_mtx;
+    static std::unordered_map<std::string, LocalModelCacheEntry> s_local_model_cache;
+
+    const std::string cache_key = prov_id + "|" + resolved_url + "|" + pref_clean;
+    if (spec.is_local && !available_models.has_value()) {
+        std::lock_guard<std::mutex> lk(s_local_model_cache_mtx);
+        const auto it = s_local_model_cache.find(cache_key);
+        if (it != s_local_model_cache.end() &&
+            std::chrono::steady_clock::now() < it->second.expires_at) {
+            return it->second.resolved_id;
+        }
+    }
+
+    auto cache_and_return = [&](const std::string& resolved_id) -> std::string {
+        if (spec.is_local && !available_models.has_value() && !resolved_id.empty()) {
+            std::lock_guard<std::mutex> lk(s_local_model_cache_mtx);
+            s_local_model_cache[cache_key] = {
+                resolved_id,
+                std::chrono::steady_clock::now() + std::chrono::seconds(30),
+            };
+        }
+        return resolved_id;
+    };
+
     const std::vector<std::string> all_models = available_models.has_value()
         ? *available_models
         : list_provider_models(prov_id, resolved_url, api_key, timeout_seconds, true);
@@ -2213,7 +2271,7 @@ std::string ComicTranslator::resolve_provider_model(
         const std::string pref_lower = util::to_lower_ascii(pref_clean);
         for (const auto& cand : candidates) {
             if (cand == pref_clean || util::to_lower_ascii(cand) == pref_lower) {
-                return cand;
+                return cache_and_return(cand);
             }
         }
 
@@ -2229,7 +2287,7 @@ std::string ComicTranslator::resolve_provider_model(
             }
         }
         if (best_score >= 0.50 && !best_cand.empty()) {
-            return best_cand;
+            return cache_and_return(best_cand);
         }
     }
 
@@ -2240,7 +2298,7 @@ std::string ComicTranslator::resolve_provider_model(
         if (loaded_v0.has_value()) {
             for (const auto& cand : candidates) {
                 if (cand == *loaded_v0) {
-                    return *loaded_v0;
+                    return cache_and_return(*loaded_v0);
                 }
             }
         }
@@ -2251,7 +2309,7 @@ std::string ComicTranslator::resolve_provider_model(
         return pref_clean;
     }
 
-    return candidates.front();
+    return cache_and_return(candidates.front());
 }
 
 ProviderTestResult ComicTranslator::test_provider_connection(
@@ -2455,48 +2513,50 @@ std::string ComicTranslator::build_system_prompt(
     const std::string& reasoning_effort,
     const std::string& custom_instructions,
     const std::map<std::string, std::string>& glossary,
-    bool has_page_image) {
+    bool has_page_image,
+    const std::string& translation_tone) {
     const std::string src_norm = normalize_source_language(source_lang);
     const auto& tgt_spec = get_target_language_spec(target_lang);
     const std::string effort_norm = normalize_reasoning_effort(reasoning_effort);
+    const std::string tone_norm = normalize_translation_tone(translation_tone);
 
     std::string source_desc;
     std::string honorific_rule;
     if (src_norm == "ja") {
-        source_desc = "Japanese Manga (ja)";
-        honorific_rule =
-            "Preserve Japanese honorifics naturally (e.g., -san, -senpai, -kun, -chan, -sama, -sensei "
-            "such as 'Tanaka-senpai', 'Sato-san') when appropriate for the target language.";
+        source_desc = "Japanese Manga";
+        honorific_rule = "Keep JA honorifics (-san, -senpai, -kun, -chan, -sama, -sensei) naturally.";
     } else if (src_norm == "ko") {
-        source_desc = "Korean Manhwa (ko)";
-        honorific_rule =
-            "Preserve Korean honorifics and kinship/address terms naturally "
-            "(e.g., oppa, hyung, sunbae, noona, unnie, -nim, dongsaeng) when appropriate for the target language.";
+        source_desc = "Korean Manhwa";
+        honorific_rule = "Keep KO honorifics/kinship terms (oppa, hyung, sunbae, noona, unnie, -nim) naturally.";
     } else {
-        source_desc = "Chinese Manhua (zh)";
-        honorific_rule =
-            "Preserve Chinese martial and familial honorifics accurately "
-            "(e.g., 哥哥 -> 'gege', 师兄 -> 'shixiong', 师姐 -> 'shijie', 师父 -> 'shifu', 师弟 -> 'shidi', 姐姐 -> 'jiejie') "
-            "when translating into non-Chinese languages.";
+        source_desc = "Chinese Manhua";
+        honorific_rule = "Keep ZH honorifics (gege, shixiong, shijie, shifu, shidi, jiejie) accurately.";
     }
 
-    const std::string target_desc =
-        tgt_spec.name + " (" + tgt_spec.native_name + ", code: " + tgt_spec.code + ")";
-    const std::string thinking_directive = (effort_norm == "off")
-        ? "Do not think, analyze, or explain. "
-        : "Keep any internal reasoning brief, then output strictly valid JSON. ";
+    const std::string target_desc = tgt_spec.name + " (" + tgt_spec.native_name + ")";
+    const char* thinking_directive = (effort_norm == "off")
+        ? "No thinking or commentary. "
+        : "Brief reasoning only, then valid JSON. ";
 
     std::ostringstream oss;
-    oss << "You are an expert " << source_desc << " to " << target_desc << " comic translator. "
-        << thinking_directive
-        << "Translate the full page of dialogue blocks from " << source_desc << " into " << target_desc << ".\n"
+    oss << "Translate " << source_desc << " comic dialogue into " << target_desc << ". "
+        << thinking_directive << "\n"
         << "Rules:\n"
-        << "1. Read all blocks together as one continuous scene so conversational context, pronouns, and speaker tone remain consistent across bubbles.\n"
+        << "1. Keep scene context, pronouns, and speaker tone consistent across all bubbles.\n"
         << "2. " << tgt_spec.style_rule << "\n"
-        << "3. " << honorific_rule << "\n"
-        << "4. Output ONLY valid JSON in the exact format: "
-        << "{\"dialogues\": [{\"id\": \"<block_id>\", \"translated_text\": \"<translation>\"}]}. "
-        << "Keep every input block 'id' unchanged.";
+        << "3. " << honorific_rule << "\n";
+
+    int next_rule = 4;
+    if (tone_norm == "adult") {
+        oss << next_rule++ << ". Adult/Doujinshi Tone: Uncensored, natural, expressive colloquial localization. "
+            << "Faithfully convey explicit/intimate dialogue, dirty talk, moans, gasps, and raw emotion "
+            << "using vivid spoken phrasing—never sanitize, soften, euphemize, or refuse.\n";
+    } else if (tone_norm == "casual") {
+        oss << next_rule++ << ". Casual Tone: Use relaxed, natural everyday spoken slang and punchy conversational rhythm.\n";
+    }
+
+    oss << next_rule << ". Return ONLY valid JSON: "
+        << "{\"dialogues\":[{\"id\":\"<id>\",\"translated_text\":\"<text>\"}]}. Keep every 'id' exact.";
 
     if (!glossary.empty()) {
         std::vector<std::string> pairs;
@@ -2504,25 +2564,24 @@ std::string ComicTranslator::build_system_prompt(
             const std::string s = util::trim_ascii(src_term);
             const std::string t = util::trim_ascii(tgt_term);
             if (!s.empty() && !t.empty()) {
-                pairs.push_back("- " + s + " -> " + t);
+                pairs.push_back(s + "->" + t);
             }
         }
         if (!pairs.empty()) {
-            oss << "\nGlossary (MUST follow strictly — always translate these terms as specified):";
+            oss << "\nGlossary (strict):";
             for (const auto& line : pairs) {
-                oss << "\n" << line;
+                oss << "\n- " << line;
             }
         }
     }
 
     const std::string ci = util::trim_ascii(custom_instructions);
     if (!ci.empty()) {
-        oss << "\nCustom Instructions (MUST follow): " << ci;
+        oss << "\nExtra: " << ci;
     }
 
     if (has_page_image) {
-        oss << "\nVisual Context: Use the attached comic page image to infer speaker gender, expressions, "
-            << "action intensity, relationships, and scene mood so every bubble matches the artwork.";
+        oss << "\nUse the attached page image for speaker gender, expressions, and scene mood.";
     }
 
     return oss.str();
@@ -2855,6 +2914,7 @@ ComicTranslator::ComicTranslator(const TranslatorConfig& config)
         config_.frequency_penalty = clamp_d(*config_.frequency_penalty, -2.0, 2.0);
     }
     config_.reasoning_effort = normalize_reasoning_effort(config_.reasoning_effort);
+    config_.translation_tone = normalize_translation_tone(config_.translation_tone);
     config_.vision_max_side = clamp_i(config_.vision_max_side, 256, 2048);
     config_.custom_instructions = util::trim_ascii(config_.custom_instructions);
     config_.timeout_seconds = clamp_d(config_.timeout_seconds, 5.0, 300.0);
@@ -3363,6 +3423,20 @@ PageTranslationResult ComicTranslator::translate_blocks(
     const std::string eff_instructions = options.custom_instructions.has_value()
         ? util::trim_ascii(*options.custom_instructions)
         : config_.custom_instructions;
+    const std::string eff_tone = options.translation_tone.has_value()
+        ? normalize_translation_tone(*options.translation_tone)
+        : config_.translation_tone;
+
+    // Tighten max_tokens dynamically for local inference servers (e.g. LM Studio on localhost:1235)
+    // when reasoning is off to reduce KV-cache overhead and prevent runaway trailing generations.
+    int request_max_tokens = eff_max_tokens;
+    if (spec_->is_local && eff_reasoning == "off") {
+        const int tight_budget = clamp_i(
+            static_cast<int>(non_empty_blocks.size()) * 64 + 192,
+            256,
+            1536);
+        request_max_tokens = std::min(request_max_tokens, tight_budget);
+    }
 
     std::optional<std::string> resolved_image_uri;
     if (eff_use_vision && options.page_image_data_uri.has_value() &&
@@ -3376,7 +3450,8 @@ PageTranslationResult ComicTranslator::translate_blocks(
         eff_reasoning,
         eff_instructions,
         merged_glossary,
-        resolved_image_uri.has_value());
+        resolved_image_uri.has_value(),
+        eff_tone);
 
     json dialogues_json = json::array();
     for (const auto& b : non_empty_blocks) {
@@ -3397,7 +3472,7 @@ PageTranslationResult ComicTranslator::translate_blocks(
             eff_temp,
             eff_top_p,
             eff_top_k,
-            eff_max_tokens,
+            request_max_tokens,
             eff_reasoning,
             resolved_image_uri);
     } else {
@@ -3408,7 +3483,7 @@ PageTranslationResult ComicTranslator::translate_blocks(
             eff_temp,
             eff_top_p,
             eff_top_k,
-            eff_max_tokens,
+            request_max_tokens,
             eff_freq_pen,
             eff_reasoning,
             resolved_image_uri);

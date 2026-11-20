@@ -17,6 +17,12 @@ const SOURCE_LANGUAGES = [
   { value: 'zh', label: 'ZH · Manhua' },
 ];
 
+const TRANSLATION_TONES = [
+  { value: 'standard', label: 'Standard' },
+  { value: 'casual', label: 'Casual' },
+  { value: 'adult_doujinshi', label: 'Adult / Doujinshi (Uncensored)' },
+];
+
 const PIPELINE_STAGES = [
   { key: 'detect', label: 'Detect', title: 'Stage 1: Comic Text Detector (ONNX)' },
   { key: 'ocr', label: 'OCR', title: 'Stage 2: Multi-Language OCR Router' },
@@ -42,6 +48,7 @@ export default function FrontControlBar({
     enabledStages,
     sourceLang,
     targetLang,
+    translationTone,
     supportedTargetLanguages,
     lmStudio,
     activeProviderSummary,
@@ -53,6 +60,7 @@ export default function FrontControlBar({
     togglePipelineStage,
     setSourceLang,
     setTargetLang,
+    setTranslationTone,
   } = useEditorStore(
     useShallow((s) => ({
       model: s.pipelineConfig.model,
@@ -61,6 +69,7 @@ export default function FrontControlBar({
       enabledStages: s.pipelineConfig.enabledStages,
       sourceLang: s.pipelineConfig.sourceLang,
       targetLang: s.pipelineConfig.targetLang,
+      translationTone: s.pipelineConfig.translationTone || 'standard',
       supportedTargetLanguages: s.supportedTargetLanguages,
       lmStudio: s.runtimeStatus.lmStudio,
       activeProviderSummary: s.runtimeStatus.activeProviderSummary,
@@ -72,6 +81,7 @@ export default function FrontControlBar({
       togglePipelineStage: s.togglePipelineStage,
       setSourceLang: s.setSourceLang,
       setTargetLang: s.setTargetLang,
+      setTranslationTone: s.setTranslationTone,
     }))
   );
 
@@ -234,8 +244,31 @@ export default function FrontControlBar({
         </div>
       </div>
 
-      {/* Right: Source & Target Language Dropdowns + Primary Run Button + Settings Gear */}
+      {/* Right: Tone Selector + Source & Target Language Dropdowns + Primary Run Button + Settings Gear */}
       <div className="flex items-center gap-2 shrink-0">
+        {/* Tone / Genre Selector */}
+        <div
+          className="inline-flex items-center gap-1 h-6 rounded-studio border border-studio-border bg-studio-surface px-2"
+          title="Translation Tone / Genre"
+        >
+          <span className="text-[10px] font-medium text-studio-text-muted">
+            Tone
+          </span>
+          <select
+            aria-label="Translation Tone"
+            value={translationTone}
+            onChange={(e) => setTranslationTone(e.target.value)}
+            disabled={!isWorkspaceUnlocked || isProcessing}
+            className="bg-transparent text-[11px] font-medium text-studio-text focus:outline-none cursor-pointer disabled:opacity-50 max-w-[140px]"
+          >
+            {TRANSLATION_TONES.map((t) => (
+              <option key={t.value} value={t.value}>
+                {t.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
         {/* Source → Target Languages */}
         <div className="inline-flex items-center gap-1 h-6 rounded-studio border border-studio-border bg-studio-surface px-2">
           <Languages className="h-3 w-3 text-studio-accent shrink-0" />

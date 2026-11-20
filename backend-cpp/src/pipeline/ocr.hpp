@@ -96,6 +96,11 @@ public:
 
     // Explicitly release all loaded ONNX OCR sessions and dictionaries.
     void unload();
+    bool is_loaded() const noexcept {
+        return manga_enc_session_.has_value() || manga_dec_session_.has_value() ||
+               rapid_det_session_.has_value() || rapid_cls_session_.has_value() ||
+               rapid_rec_session_.has_value();
+    }
 
 private:
     struct RgbImage {

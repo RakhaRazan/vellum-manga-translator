@@ -132,6 +132,7 @@ public:
 
     // Explicitly unload any cached ONNX session from RAM/VRAM.
     void unload();
+    bool is_loaded() const noexcept { return cached_session_.has_value(); }
 
 private:
     struct RawBox {

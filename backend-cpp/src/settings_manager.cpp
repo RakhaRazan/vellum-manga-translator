@@ -631,10 +631,11 @@ json SettingsManager::build_default_settings() {
         {"timeout", 90.0},
         {"source_lang", "ja"},
         {"target_lang", "id"},
+        {"translation_tone", "standard"},
         {"temperature", 0.2},
         {"top_p", 0.95},
         {"top_k", 40},
-        {"max_tokens", 2048},
+        {"max_tokens", 1024},
         {"frequency_penalty", 0.0},
         {"reasoning_effort", "off"},
         {"strip_thinking", true},
@@ -784,6 +785,20 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         target_lang = normalize_target_language(json_to_string(raw["target_lang"]));
     }
 
+    std::string translation_tone = current.value("translation_tone", std::string("standard"));
+    if (raw.contains("translation_tone") && !raw["translation_tone"].is_null()) {
+        const std::string tt = util::to_lower_ascii(util::trim_ascii(json_to_string(raw["translation_tone"])));
+        if (tt.empty() || tt == "standard" || tt == "default" || tt == "normal") {
+            translation_tone = "standard";
+        } else if (tt == "casual" || tt == "slang" || tt == "colloquial") {
+            translation_tone = "casual";
+        } else if (tt == "adult_doujinshi" || tt == "adult-doujinshi") {
+            translation_tone = "adult_doujinshi";
+        } else if (tt == "adult" || tt == "doujinshi" || tt == "nsfw" || tt == "uncensored") {
+            translation_tone = "adult";
+        }
+    }
+
     std::string reasoning_effort = current.value("reasoning_effort", std::string("off"));
     if (raw.contains("reasoning_effort") && !raw["reasoning_effort"].is_null()) {
         reasoning_effort = normalize_reasoning_effort(json_to_string(raw["reasoning_effort"]));
@@ -802,8 +817,8 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         : current.value("top_k", json(40));
 
     const int max_tokens = (raw.contains("max_tokens") && !raw["max_tokens"].is_null())
-        ? clamp_int(raw["max_tokens"], 64, 32768, current.value("max_tokens", 2048))
-        : current.value("max_tokens", 2048);
+        ? clamp_int(raw["max_tokens"], 64, 32768, current.value("max_tokens", 1024))
+        : current.value("max_tokens", 1024);
 
     const json frequency_penalty = raw.contains("frequency_penalty")
         ? clamp_optional_double(raw["frequency_penalty"], -2.0, 2.0, current.value("frequency_penalty", json(0.0)))
@@ -1021,6 +1036,7 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         {"timeout", timeout},
         {"source_lang", source_lang},
         {"target_lang", target_lang},
+        {"translation_tone", translation_tone},
         {"temperature", temperature},
         {"top_p", top_p},
         {"top_k", top_k},
@@ -1159,6 +1175,7 @@ json SettingsManager::get_active_provider_summary() {
         {"use_vision", s.value("use_vision", false)},
         {"reasoning_effort", s.value("reasoning_effort", std::string("off"))},
         {"target_lang", s.value("target_lang", std::string("id"))},
+        {"translation_tone", s.value("translation_tone", std::string("standard"))},
     };
 }
 

@@ -3,7 +3,7 @@
 // MangaFlow AI — Native C++17 Model Manager & ONNX Runtime Session Factory (Phase 10.1)
 //
 // Features:
-// - Persistent model storage at `%LOCALAPPDATA%\ComicTranslator\models` (or `MANGA_MODELS_DIR`).
+// - Persistent model storage at `<portable_root>\models` (or `MANGA_MODELS_DIR`).
 // - Full 4-model Koharu local Hugging Face cache auto-discovery
 //   (`C:\FILE SOFTWARE\Koharu\store\hugging-face\models\<repo>\snapshots\<hash>\`):
 //     1. mayocream--koharu-layout-rfdetr-seg-2xl-1152 (layout & text segmentation)
@@ -118,6 +118,16 @@ struct OrtSessionHandle {
     std::string active_provider = "CPUExecutionProvider";
 };
 
+struct SystemHardwareProfile {
+    uint64_t total_ram_mb = 0;
+    uint64_t available_ram_mb = 0;
+    uint32_t memory_load_percent = 0;
+    uint64_t dedicated_vram_mb = 0;
+    uint32_t logical_cpus = 1;
+    bool low_memory_mode = false;  // True on <10 GB RAM or <5 GB VRAM systems
+    std::string gpu_name;
+};
+
 class ModelManager {
 public:
     using ProgressCallback = std::function<bool(const nlohmann::json& event)>;
@@ -142,6 +152,11 @@ public:
     static OrtSessionHandle create_ort_session(
         const std::filesystem::path& model_path,
         bool force_cpu = false);
+
+    // Live hardware & memory pressure telemetry (adaptive RAM/VRAM/CPU budgeting)
+    static SystemHardwareProfile query_hardware_profile();
+    static bool is_under_memory_pressure();
+    static void trim_process_heap();
 
     // Koharu 4-model Hugging Face cache auto-discovery (`<model_dir>/snapshots/<hash>/`)
     static std::optional<std::filesystem::path> resolve_koharu_snapshot(

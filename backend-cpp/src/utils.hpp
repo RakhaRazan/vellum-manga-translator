@@ -131,8 +131,61 @@ inline fs::path get_local_app_data_dir() {
     return fs::temp_directory_path(ec);
 }
 
+inline fs::path get_executable_dir() {
+    std::wstring buffer(MAX_PATH, L'\0');
+    while (true) {
+        const DWORD len = GetModuleFileNameW(
+            nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (len == 0) {
+            std::error_code ec;
+            return fs::current_path(ec);
+        }
+        if (len < buffer.size()) {
+            buffer.resize(static_cast<size_t>(len));
+            break;
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+    std::error_code ec;
+    fs::path exe_path = fs::weakly_canonical(fs::path(buffer), ec);
+    if (ec) {
+        exe_path = fs::path(buffer);
+    }
+    return exe_path.parent_path();
+}
+
+inline fs::path get_portable_root_dir() {
+    const fs::path exe_dir = get_executable_dir();
+    auto has_root_markers = [](const fs::path& dir) -> bool {
+        std::error_code ec;
+        return fs::is_directory(dir / L"models", ec) ||
+               fs::is_regular_file(dir / L"settings.json", ec) ||
+               fs::is_directory(dir / L"backend-cpp", ec);
+    };
+
+    if (has_root_markers(exe_dir)) {
+        return exe_dir;
+    }
+
+    // Support running from `Manga/MangaFlow_Cpp/` or `Manga/backend-cpp/build/Release/`
+    // by walking up to the portable root `Manga/` directory if present.
+    fs::path cursor = exe_dir;
+    for (int depth = 0; depth < 4; ++depth) {
+        fs::path parent = cursor.parent_path();
+        if (parent.empty() || parent == cursor) {
+            break;
+        }
+        if (has_root_markers(parent)) {
+            return parent;
+        }
+        cursor = parent;
+    }
+
+    return exe_dir;
+}
+
 inline fs::path get_comic_translator_app_dir() {
-    return get_local_app_data_dir() / L"ComicTranslator";
+    return get_portable_root_dir();
 }
 
 inline std::string generate_uuid_hex() {

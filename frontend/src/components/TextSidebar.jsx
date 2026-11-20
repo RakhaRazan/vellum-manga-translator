@@ -381,9 +381,12 @@ export default function TextSidebar({
     [apiBaseUrl, fallbackChain, fetchFontsCatalog, onUpdateBlock, selectedBlock]
   );
 
+  const normalizeFontQuery = (val) =>
+    String(val || '').toLowerCase().replace(/[\s\-_]+/g, '');
+
   // Filtered installed families + online catalog items for fast searching
   const { installedResults, catalogResults } = useMemo(() => {
-    const q = fontSearch.trim().toLowerCase();
+    const q = normalizeFontQuery(fontSearch.trim());
     const families = fontsCatalogCache?.families || [];
     const catalog = fontsCatalogCache?.catalog || [];
 
@@ -404,7 +407,7 @@ export default function TextSidebar({
         if (fontFilterTab === 'system' && fam.category !== 'system') {
           return false;
         }
-        if (q && !fam.family.toLowerCase().includes(q)) return false;
+        if (q && !normalizeFontQuery(fam.family).includes(q)) return false;
         return true;
       })
       .sort((a, b) => {
@@ -420,9 +423,9 @@ export default function TextSidebar({
           if (item.installed && fontFilterTab === 'all') return false;
           if (!q) return true;
           return (
-            item.family.toLowerCase().includes(q) ||
-            (item.description || '').toLowerCase().includes(q) ||
-            (item.style_category || '').toLowerCase().includes(q)
+            normalizeFontQuery(item.family).includes(q) ||
+            normalizeFontQuery(item.description).includes(q) ||
+            normalizeFontQuery(item.style_category).includes(q)
           );
         })
       : [];
@@ -432,6 +435,32 @@ export default function TextSidebar({
       catalogResults: catFiltered.slice(0, 40),
     };
   }, [fontsCatalogCache, fontSearch, fontFilterTab]);
+
+  // Identify missing fallback fonts that aren't installed on PC
+  const missingFallbackFonts = useMemo(() => {
+    const families = fontsCatalogCache?.families;
+    if (!Array.isArray(families) || families.length === 0) return [];
+    const genericCss = new Set([
+      'sans-serif',
+      'serif',
+      'monospace',
+      'cursive',
+      'fantasy',
+      'system-ui',
+      'ui-sans-serif',
+      'ui-serif',
+      'ui-monospace',
+    ]);
+    const installedSet = new Set(
+      families.map((f) => normalizeFontQuery(f.family))
+    );
+    return (fallbackChain || []).filter(
+      (name) =>
+        name &&
+        !genericCss.has(String(name).trim().toLowerCase()) &&
+        !installedSet.has(normalizeFontQuery(name))
+    );
+  }, [fontsCatalogCache, fallbackChain]);
 
   // Identify category badge for current primary font
   const currentFontCategory = useMemo(() => {
@@ -747,6 +776,14 @@ export default function TextSidebar({
               <span className="truncate">
                 Fallback: {fallbackChain.slice(0, 3).join(' → ')} → ♡♪…
               </span>
+              {missingFallbackFonts.length > 0 && (
+                <span
+                  className="shrink-0 rounded-studio-sm border border-amber-500/40 bg-amber-500/10 text-amber-400 px-1 py-0.5 text-[9px] font-mono leading-none"
+                  title={`Missing on PC (C:\\Windows\\Fonts): ${missingFallbackFonts.join(', ')}`}
+                >
+                  Not Installed on PC
+                </span>
+              )}
             </div>
 
             {/* Searchable Font Picker Popover */}

@@ -1,6 +1,8 @@
 #include "model_manager.hpp"
 #include "../utils.hpp"
 
+#include <dxgi.h>
+#include <malloc.h>
 #include <winhttp.h>
 
 #include <algorithm>
@@ -585,7 +587,7 @@ fs::path ModelManager::default_koharu_cache_dir() {
             return fs::path(*env_dir);
         }
     }
-    return fs::path(kDefaultKoharuCachePath);
+    return {};
 }
 
 std::optional<fs::path> ModelManager::find_workspace_models_dir(const fs::path& exe_dir) {
@@ -618,7 +620,7 @@ std::optional<fs::path> ModelManager::find_workspace_models_dir(const fs::path& 
 // -----------------------------------------------------------------------------
 
 Ort::Env& ModelManager::shared_ort_env() {
-    static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "MangaFlowAI");
+    static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "Vellum");
     return env;
 }
 
@@ -661,6 +663,67 @@ std::string ModelManager::get_primary_provider(bool force_cpu) {
     return preferred.empty() ? "CPUExecutionProvider" : preferred.front();
 }
 
+SystemHardwareProfile ModelManager::query_hardware_profile() {
+    static const auto kStaticGpu = []() -> std::pair<uint64_t, std::string> {
+        uint64_t best_vram_mb = 0;
+        std::string best_name;
+        IDXGIFactory1* factory = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) &&
+            factory != nullptr) {
+            IDXGIAdapter1* adapter = nullptr;
+            for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+                DXGI_ADAPTER_DESC1 desc{};
+                if (SUCCEEDED(adapter->GetDesc1(&desc))) {
+                    if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
+                        const uint64_t vram_mb = static_cast<uint64_t>(desc.DedicatedVideoMemory) / (1024ULL * 1024ULL);
+                        if (vram_mb > best_vram_mb || best_name.empty()) {
+                            best_vram_mb = vram_mb;
+                            best_name = util::wide_to_utf8(desc.Description);
+                        }
+                    }
+                }
+                adapter->Release();
+            }
+            factory->Release();
+        }
+        return {best_vram_mb, best_name};
+    }();
+
+    SystemHardwareProfile prof;
+    prof.logical_cpus = std::max(1u, std::thread::hardware_concurrency());
+    prof.dedicated_vram_mb = kStaticGpu.first;
+    prof.gpu_name = kStaticGpu.second;
+
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) {
+        prof.total_ram_mb = static_cast<uint64_t>(ms.ullTotalPhys) / (1024ULL * 1024ULL);
+        prof.available_ram_mb = static_cast<uint64_t>(ms.ullAvailPhys) / (1024ULL * 1024ULL);
+        prof.memory_load_percent = static_cast<uint32_t>(ms.dwMemoryLoad);
+    }
+
+    // Automatically classify low-spec hardware (<10 GB RAM or <5 GB dedicated GPU VRAM)
+    // so the pipeline stays safe alongside LM Studio on lower-spec PCs.
+    const bool low_ram = (prof.total_ram_mb > 0 && prof.total_ram_mb < 10240ULL);
+    const bool low_vram = (prof.dedicated_vram_mb > 0 && prof.dedicated_vram_mb < 5120ULL);
+    prof.low_memory_mode = low_ram || low_vram;
+    return prof;
+}
+
+bool ModelManager::is_under_memory_pressure() {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) {
+        return false;
+    }
+    const uint64_t avail_mb = static_cast<uint64_t>(ms.ullAvailPhys) / (1024ULL * 1024ULL);
+    return (ms.dwMemoryLoad >= 86) || (avail_mb < 1536ULL);
+}
+
+void ModelManager::trim_process_heap() {
+    _heapmin();
+}
+
 OrtSessionHandle ModelManager::create_ort_session(const fs::path& model_path, bool force_cpu) {
     std::error_code ec;
     if (!fs::is_regular_file(model_path, ec) || ec) {
@@ -670,14 +733,29 @@ OrtSessionHandle ModelManager::create_ort_session(const fs::path& model_path, bo
     Ort::Env& env = shared_ort_env();
     const auto preferred = get_preferred_providers(force_cpu);
 
+    // Leave 1 CPU thread for OS/UI/LM Studio host while maximizing CPU inference throughput
     const unsigned int hw_threads = std::thread::hardware_concurrency();
-    const int intra_threads = static_cast<int>(std::max(1u, std::min(8u, hw_threads > 1 ? hw_threads / 2 : 1u)));
+    const int cpu_intra_threads = static_cast<int>(
+        std::max(1u, std::min(7u, hw_threads > 1 ? (hw_threads - 1u) : 1u)));
+    const int gpu_host_threads = static_cast<int>(std::max(1u, std::min(2u, hw_threads / 2u)));
+
+    auto apply_common_resource_opts = [](Ort::SessionOptions& opts, bool is_cpu_only) {
+        opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        opts.SetInterOpNumThreads(1);
+        // Enable thread spinning on CPU-only sessions for faster transformer/decoder throughput,
+        // disable spinning on GPU sessions so CPU doesn't busy-wait for GPU kernels.
+        opts.AddConfigEntry("session.intra_op.allow_spinning", is_cpu_only ? "1" : "0");
+        opts.AddConfigEntry("session.inter_op.allow_spinning", "0");
+        opts.AddConfigEntry("session.set_denormal_as_zero", "1");
+        if (is_cpu_only) {
+            opts.AddConfigEntry("session.memory.enable_memory_arena_shrinkage", "cpu:0");
+        }
+    };
 
     auto build_cpu_session = [&]() -> OrtSessionHandle {
         Ort::SessionOptions opts;
-        opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-        opts.SetIntraOpNumThreads(intra_threads);
-        opts.SetInterOpNumThreads(1);
+        apply_common_resource_opts(opts, /*is_cpu_only=*/true);
+        opts.SetIntraOpNumThreads(cpu_intra_threads);
         OrtSessionHandle handle;
         handle.session = std::make_unique<Ort::Session>(env, model_path.c_str(), opts);
         handle.active_provider = "CPUExecutionProvider";
@@ -691,17 +769,19 @@ OrtSessionHandle ModelManager::create_ort_session(const fs::path& model_path, bo
 
         try {
             Ort::SessionOptions opts;
-            opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-            opts.SetIntraOpNumThreads(intra_threads);
-            opts.SetInterOpNumThreads(1);
+            apply_common_resource_opts(opts, /*is_cpu_only=*/false);
+            opts.SetIntraOpNumThreads(gpu_host_threads);
 
             if (provider == "CUDAExecutionProvider") {
                 OrtCUDAProviderOptions cuda_opts{};
                 cuda_opts.device_id = 0;
+                // kSameAsRequested (1) prevents power-of-2 VRAM doubling so CUDA coexists cleanly with LM Studio
+                cuda_opts.arena_extend_strategy = 1;
                 opts.AppendExecutionProvider_CUDA(cuda_opts);
             } else if (provider == "DmlExecutionProvider") {
-                // DirectML-safe SessionOptions per SPEC.md Section 6
+                // DirectML-safe SessionOptions + disable duplicate CPU scratch arena RAM
                 opts.DisableMemPattern();
+                opts.DisableCpuMemArena();
                 opts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
 
                 const void* raw_dml_api = nullptr;
@@ -991,9 +1071,8 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
         const bool koharu_cached = snap.has_value();
 
         std::optional<fs::path> cfg_path;
-        if (const fs::path local_cfg = models_dir_ / util::utf8_to_wide(kRfDetrConfigFile);
-            is_valid_regular_file(local_cfg, 10ULL)) {
-            cfg_path = local_cfg;
+        if (auto local_cfg = find_valid_file(kRfDetrConfigFile, 10ULL)) {
+            cfg_path = *local_cfg;
         } else if (snap.has_value()) {
             const fs::path snap_cfg = *snap / L"inference_config.json";
             if (is_valid_regular_file(snap_cfg, 10ULL)) {
@@ -1189,9 +1268,15 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
         const auto snap = resolve_koharu_snapshot(koharu_cache_dir_, kKoharuPaddleVlFolder);
         paddle_vl_koharu_cached = snap.has_value();
 
-        const fs::path local_dir = models_dir_ / L"paddleocr-vl-gguf";
-        auto local_model = find_first_with_ext(local_dir, ".gguf", kMinGgufBytes, "", "mmproj");
-        auto local_mmproj = find_first_with_ext(local_dir, ".gguf", kMinGgufBytes, "mmproj");
+        std::optional<fs::path> local_model;
+        std::optional<fs::path> local_mmproj;
+        for (const auto& base_dir : {std::optional<fs::path>(models_dir_), fallback_models_dir_}) {
+            if (!base_dir.has_value()) continue;
+            const fs::path local_dir = *base_dir / L"paddleocr-vl-gguf";
+            local_model = find_first_with_ext(local_dir, ".gguf", kMinGgufBytes, "", "mmproj");
+            local_mmproj = find_first_with_ext(local_dir, ".gguf", kMinGgufBytes, "mmproj");
+            if (local_model.has_value()) break;
+        }
         if (local_model.has_value()) {
             paddle_vl_installed = true;
             paddle_vl_source = "local";
@@ -1963,36 +2048,16 @@ std::optional<ResolvedDetectorModel> ModelManager::resolve_detector_model(
                            pref == "comictextdetector";
 
     auto try_rfdetr = [&]() -> std::optional<ResolvedDetectorModel> {
-        // 1. Converted Koharu RF-DETR ONNX in persistent `%LOCALAPPDATA%\ComicTranslator\models` (or workspace)
+        // 1. Standalone RF-DETR ONNX in local `./models/`
         for (const char* fname : {kRfDetrPrimaryFile, kRfDetrAltFile}) {
             std::string src;
             if (auto found = find_valid_file(fname, kMinRfDetrBytes, &src)) {
                 ResolvedDetectorModel res;
                 res.backend = DetectorBackend::KoharuRfDetr;
                 res.model_path = *found;
-                res.source = (src == "persistent_models_dir") ? "koharu_converted_onnx" : src;
-                const fs::path cfg = models_dir_ / util::utf8_to_wide(kRfDetrConfigFile);
-                if (is_valid_regular_file(cfg, 10ULL)) {
-                    res.config_path = cfg;
-                } else if (auto snap = resolve_koharu_snapshot(koharu_cache_dir_, kKoharuRfDetrFolder)) {
-                    const fs::path snap_cfg = *snap / L"inference_config.json";
-                    if (is_valid_regular_file(snap_cfg, 10ULL)) {
-                        res.config_path = snap_cfg;
-                    }
-                }
-                return res;
-            }
-        }
-        // 2. Direct `.onnx` inside Koharu HF snapshot (if Koharu ever ships ONNX directly)
-        if (auto snap = resolve_koharu_snapshot(koharu_cache_dir_, kKoharuRfDetrFolder)) {
-            if (auto snap_onnx = find_first_with_ext(*snap, ".onnx", kMinRfDetrBytes)) {
-                ResolvedDetectorModel res;
-                res.backend = DetectorBackend::KoharuRfDetr;
-                res.model_path = *snap_onnx;
-                res.source = "koharu_snapshot_onnx";
-                const fs::path cfg = *snap / L"inference_config.json";
-                if (is_valid_regular_file(cfg, 10ULL)) {
-                    res.config_path = cfg;
+                res.source = (src == "persistent_models_dir") ? "local_models_dir" : src;
+                if (auto cfg = find_valid_file(kRfDetrConfigFile, 10ULL)) {
+                    res.config_path = *cfg;
                 }
                 return res;
             }
@@ -2058,12 +2123,10 @@ std::optional<ResolvedLamaModel> ModelManager::resolve_lama_model(
     auto try_manga = [&]() -> std::optional<ResolvedLamaModel> {
         std::string src;
         if (auto found = find_valid_file(kLamaMangaFile, kMinLamaBytes, &src)) {
-            return ResolvedLamaModel{*found, "koharu_converted_onnx", true};
-        }
-        if (auto snap = resolve_koharu_snapshot(koharu_cache_dir_, kKoharuLamaFolder)) {
-            if (auto snap_onnx = find_first_with_ext(*snap, ".onnx", kMinLamaBytes)) {
-                return ResolvedLamaModel{*snap_onnx, "koharu_snapshot_onnx", true};
-            }
+            return ResolvedLamaModel{
+                *found,
+                (src == "persistent_models_dir") ? "local_models_dir" : src,
+                true};
         }
         return std::nullopt;
     };
@@ -2116,53 +2179,28 @@ std::optional<ResolvedMangaOcrModel> ModelManager::resolve_manga_ocr_models() co
         if (auto cfg = find_valid_file(kMangaOcrConfigFile, 100ULL)) {
             res.config_json = *cfg;
         }
-        res.source = (src == "persistent_models_dir") ? "koharu_converted_onnx" : src;
+        res.source = (src == "persistent_models_dir") ? "local_models_dir" : src;
         return res;
-    }
-
-    if (auto snap = resolve_koharu_snapshot(koharu_cache_dir_, kKoharuMangaOcrFolder)) {
-        auto snap_enc = find_first_with_ext(*snap, ".onnx", kMinMangaOcrEncBytes, "encoder");
-        auto snap_dec = find_first_with_ext(*snap, ".onnx", kMinMangaOcrDecBytes, "decoder");
-        const fs::path snap_vocab = *snap / L"vocab.txt";
-        if (snap_enc.has_value() && snap_dec.has_value() && is_valid_regular_file(snap_vocab, kMinVocabBytes)) {
-            ResolvedMangaOcrModel res;
-            res.encoder_onnx = *snap_enc;
-            res.decoder_onnx = *snap_dec;
-            res.vocab_txt = snap_vocab;
-            const fs::path snap_cfg = *snap / L"config.json";
-            if (is_valid_regular_file(snap_cfg, 100ULL)) {
-                res.config_json = snap_cfg;
-            }
-            res.source = "koharu_snapshot_onnx";
-            return res;
-        }
     }
 
     return std::nullopt;
 }
 
 std::optional<ResolvedPaddleOcrVlGguf> ModelManager::resolve_paddleocr_vl_gguf() const {
-    // 1. Persistent `%LOCALAPPDATA%\ComicTranslator\models\paddleocr-vl-gguf\`
-    const fs::path target_dir = models_dir_ / L"paddleocr-vl-gguf";
-    auto model_f = find_first_with_ext(target_dir, ".gguf", kMinGgufBytes, "", "mmproj");
-    auto mmproj_f = find_first_with_ext(target_dir, ".gguf", kMinGgufBytes, "mmproj");
-    if (model_f.has_value()) {
-        ResolvedPaddleOcrVlGguf res;
-        res.model_gguf = *model_f;
-        if (mmproj_f.has_value()) res.mmproj_gguf = *mmproj_f;
-        res.source = "persistent_models_dir";
-        return res;
-    }
-
-    // 2. Direct Koharu Hugging Face cache snapshot
-    if (auto snap = resolve_koharu_snapshot(koharu_cache_dir_, kKoharuPaddleVlFolder)) {
-        auto snap_model = find_first_with_ext(*snap, ".gguf", kMinGgufBytes, "", "mmproj");
-        auto snap_mmproj = find_first_with_ext(*snap, ".gguf", kMinGgufBytes, "mmproj");
-        if (snap_model.has_value()) {
+    // Standalone `./models/paddleocr-vl-gguf/` (or workspace fallback)
+    for (const auto& entry : {
+             std::pair{std::optional<fs::path>(models_dir_), "local_models_dir"},
+             std::pair{fallback_models_dir_, "workspace_fallback"},
+         }) {
+        if (!entry.first.has_value()) continue;
+        const fs::path target_dir = *entry.first / L"paddleocr-vl-gguf";
+        auto model_f = find_first_with_ext(target_dir, ".gguf", kMinGgufBytes, "", "mmproj");
+        auto mmproj_f = find_first_with_ext(target_dir, ".gguf", kMinGgufBytes, "mmproj");
+        if (model_f.has_value()) {
             ResolvedPaddleOcrVlGguf res;
-            res.model_gguf = *snap_model;
-            if (snap_mmproj.has_value()) res.mmproj_gguf = *snap_mmproj;
-            res.source = "koharu_snapshot_gguf";
+            res.model_gguf = *model_f;
+            if (mmproj_f.has_value()) res.mmproj_gguf = *mmproj_f;
+            res.source = entry.second;
             return res;
         }
     }
@@ -2222,6 +2260,7 @@ json ModelManager::get_status_json() const {
             {"files", std::move(files)},
             {"missing_files", std::move(missing)},
             {"active_backend", installed ? json(detector_backend_name(det->backend)) : json(nullptr)},
+            {"active_filename", installed ? json(util::path_to_utf8(det->model_path.filename())) : json(nullptr)},
             {"active_path", installed ? json(util::path_to_utf8(det->model_path)) : json(nullptr)},
             {"source", installed ? json(det->source) : json(nullptr)},
         };
@@ -2269,13 +2308,29 @@ json ModelManager::get_status_json() const {
         }
 
         if (!installed) all_ready = false;
+        json active_mocr_files = json::array();
+        if (onnx_mocr.has_value()) {
+            active_mocr_files = {
+                util::path_to_utf8(onnx_mocr->encoder_onnx.filename()),
+                util::path_to_utf8(onnx_mocr->decoder_onnx.filename()),
+                util::path_to_utf8(onnx_mocr->vocab_txt.filename()),
+            };
+        }
         models["manga_ocr"] = {
             {"installed", installed},
             {"size_mb", 424},
             {"downloaded_mb", round_2(static_cast<double>(actual_bytes) / (1024.0 * 1024.0))},
-            {"files", std::move(files)},
+            {"files", files},
             {"missing_files", std::move(missing)},
             {"format", active_format},
+            {"active_filename", onnx_mocr.has_value()
+                                    ? json(util::path_to_utf8(onnx_mocr->encoder_onnx.filename()) + " + " +
+                                           util::path_to_utf8(onnx_mocr->decoder_onnx.filename()))
+                                    : (installed ? json("pytorch_model.bin") : json(nullptr))},
+            {"active_files", std::move(active_mocr_files)},
+            {"active_path", onnx_mocr.has_value()
+                                ? json(util::path_to_utf8(onnx_mocr->encoder_onnx.parent_path()))
+                                : json(nullptr)},
             {"source", installed ? json(source) : json(nullptr)},
         };
     }
@@ -2334,6 +2389,7 @@ json ModelManager::get_status_json() const {
             {"files", std::move(files)},
             {"missing_files", std::move(missing)},
             {"is_koharu_manga", installed ? lama->is_koharu_manga : false},
+            {"active_filename", installed ? json(util::path_to_utf8(lama->model_path.filename())) : json(nullptr)},
             {"active_path", installed ? json(util::path_to_utf8(lama->model_path)) : json(nullptr)},
             {"source", installed ? json(lama->source) : json(nullptr)},
         };
@@ -2351,6 +2407,8 @@ json ModelManager::get_status_json() const {
         paddle_vl_json = {
             {"installed", true},
             {"source", gguf->source},
+            {"model_filename", util::path_to_utf8(gguf->model_gguf.filename())},
+            {"mmproj_filename", gguf->mmproj_gguf.empty() ? json(nullptr) : json(util::path_to_utf8(gguf->mmproj_gguf.filename()))},
             {"model_gguf", util::path_to_utf8(gguf->model_gguf)},
             {"mmproj_gguf", gguf->mmproj_gguf.empty() ? json(nullptr) : json(util::path_to_utf8(gguf->mmproj_gguf))},
             {"size_mb", round_2(static_cast<double>(sz_total) / (1024.0 * 1024.0))},
@@ -2433,7 +2491,7 @@ bool ModelManager::download_single_file_winhttp(
     }
 
     WinHttpHandle session(WinHttpOpen(
-        L"MangaFlowAI/2.0",
+        L"Vellum/2.0",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,

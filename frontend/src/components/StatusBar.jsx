@@ -121,7 +121,7 @@ export default function StatusBar({
     <footer
       className="h-6 min-h-[24px] max-h-[24px] shrink-0 border-t border-studio-border bg-studio-panel px-2.5 flex items-center justify-between gap-3 text-[11px] leading-none text-studio-text-secondary select-none z-30"
       role="status"
-      aria-label="Studio Status Bar"
+      aria-label="Vellum Status Bar"
     >
       {/* Left: Zoom %, Cursor XY, and Optional Active Document Telemetry */}
       <div className="flex items-center gap-2 min-w-0">

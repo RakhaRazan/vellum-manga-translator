@@ -1,4 +1,4 @@
-// MangaFlow AI — Native Modern C++17 Backend & WebView2 Desktop Host (Phase 10.3)
+// Vellum — Native Modern C++17 Backend & WebView2 Desktop Host (Phase 10.3)
 //
 // Runs an embedded cpp-httplib HTTP server on a background std::thread
 // (127.0.0.1:8000, or an OS-assigned free loopback port if busy), serves the
@@ -41,7 +41,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <future>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -61,7 +63,7 @@ namespace mangaflow {
 
 constexpr const char* kHost = "127.0.0.1";
 constexpr int kDefaultPort = 8000;
-constexpr const char* kWindowTitle = "MangaFlow AI";
+constexpr const char* kWindowTitle = "Vellum";
 constexpr int kWindowWidth = 1440;
 constexpr int kWindowHeight = 900;
 constexpr int kWindowMinWidth = 1024;
@@ -637,6 +639,16 @@ ParsedExportRequest parse_export_pages_request(const httplib::Request& req) {
 // Application Context & HTTP Route Registration
 // -----------------------------------------------------------------------------
 
+struct ExportSessionState {
+    std::string id;
+    std::string format = "cbz";  // "cbz" | "pdf"
+    std::optional<std::string> export_name;
+    ExportImageFormat image_format = ExportImageFormat::Original;
+    int jpeg_quality = 95;
+    fs::path session_dir;
+    std::map<int, DiskExportPageEntry> pages;
+};
+
 struct AppContext {
     fs::path exe_dir;
     fs::path frontend_dist_dir;
@@ -650,7 +662,141 @@ struct AppContext {
     FontManager font_manager;
     std::mutex inference_mutex;
     std::mutex import_mutex;
+    std::mutex export_sessions_mutex;
+    std::unordered_map<std::string, ExportSessionState> export_sessions;
+
+    // Live per-stage progress reporting for UI polling (`GET /api/pipeline/status`)
+    std::mutex progress_mutex;
+    bool stage_active = false;
+    std::string active_stage;
+    std::string active_stage_detail;
+    int active_stage_index = 0;
+    int active_total_stages = 4;
+
+    void set_live_stage(const std::string& stage, const std::string& detail, int idx, int total) {
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        stage_active = true;
+        active_stage = stage;
+        active_stage_detail = detail;
+        active_stage_index = idx;
+        active_total_stages = total;
+    }
+
+    void clear_live_stage() {
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        stage_active = false;
+        active_stage.clear();
+        active_stage_detail.clear();
+        active_stage_index = 0;
+    }
+
+    // Batch Session Keep-Alive & Deferred Idle VRAM Unload Watchdog
+    std::mutex unload_timer_mutex;
+    std::condition_variable unload_timer_cv;
+    uint64_t unload_generation = 0;
+    bool idle_unload_pending = false;
+    bool watchdog_stop = false;
+    std::chrono::steady_clock::time_point idle_unload_deadline{};
+    std::thread unload_watchdog_thread;
+
+    void unload_all_sessions() {
+        std::lock_guard<std::mutex> lock(inference_mutex);
+        if (detector) detector->unload();
+        if (ocr_engine) ocr_engine->unload();
+        if (inpainter) inpainter->unload();
+        pipeline::ModelManager::trim_process_heap();
+    }
+
+    void cancel_pending_unload() {
+        std::lock_guard<std::mutex> lock(unload_timer_mutex);
+        ++unload_generation;
+        idle_unload_pending = false;
+    }
+
+    void schedule_deferred_unload(int delay_seconds) {
+        {
+            std::lock_guard<std::mutex> lock(unload_timer_mutex);
+            ++unload_generation;
+            idle_unload_pending = true;
+            idle_unload_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(std::max(1, delay_seconds));
+        }
+        unload_timer_cv.notify_one();
+    }
+
+    void start_unload_watchdog() {
+        unload_watchdog_thread = std::thread([this]() {
+            std::unique_lock<std::mutex> lock(unload_timer_mutex);
+            while (!watchdog_stop) {
+                if (!idle_unload_pending) {
+                    unload_timer_cv.wait(lock, [this]() {
+                        return watchdog_stop || idle_unload_pending;
+                    });
+                    continue;
+                }
+                const uint64_t gen = unload_generation;
+                const auto deadline = idle_unload_deadline;
+                if (unload_timer_cv.wait_until(lock, deadline, [this, gen]() {
+                        return watchdog_stop || !idle_unload_pending || unload_generation != gen;
+                    })) {
+                    continue;
+                }
+                idle_unload_pending = false;
+                lock.unlock();
+                unload_all_sessions();
+                lock.lock();
+            }
+        });
+    }
+
+    void stop_unload_watchdog() {
+        {
+            std::lock_guard<std::mutex> lock(unload_timer_mutex);
+            watchdog_stop = true;
+            idle_unload_pending = false;
+        }
+        unload_timer_cv.notify_all();
+        if (unload_watchdog_thread.joinable()) {
+            unload_watchdog_thread.join();
+        }
+        unload_all_sessions();
+    }
 };
+
+struct BatchKeepAliveHint {
+    std::optional<bool> keep_alive;
+    bool unload_after = false;
+};
+
+BatchKeepAliveHint parse_batch_keep_alive(const httplib::Request& req) {
+    BatchKeepAliveHint hint;
+    for (const char* key : {"keep_alive", "keep_sessions_alive", "batch_mode"}) {
+        if (req.form.has_field(key)) {
+            const std::string raw = util::trim_ascii(req.form.get_field(key));
+            if (!raw.empty()) {
+                hint.keep_alive = parse_bool_param(raw, false);
+                break;
+            }
+        }
+    }
+    if (req.form.has_field("auto_unload")) {
+        const std::string raw = util::trim_ascii(req.form.get_field("auto_unload"));
+        if (!raw.empty()) {
+            hint.keep_alive = !parse_bool_param(raw, true);
+        }
+    }
+    for (const char* last_key : {"batch_is_last", "unload_after"}) {
+        if (req.form.has_field(last_key)) {
+            const std::string raw = util::trim_ascii(req.form.get_field(last_key));
+            if (!raw.empty() && parse_bool_param(raw, false)) {
+                hint.unload_after = true;
+                hint.keep_alive = false;
+                break;
+            }
+        }
+    }
+    return hint;
+}
 
 std::optional<float> parse_optional_float_field(const httplib::Request& req, const char* name) {
     if (!req.form.has_field(name)) {
@@ -786,7 +932,7 @@ json extract_multipart_translation_overrides(const httplib::Request& req) {
 
     for (const char* str_key : {
              "provider", "model", "base_url", "api_key",
-             "reasoning_effort", "custom_instructions"}) {
+             "reasoning_effort", "translation_tone", "custom_instructions"}) {
         if (req.form.has_field(str_key)) {
             const std::string val = util::trim_ascii(req.form.get_field(str_key));
             if (!val.empty()) {
@@ -877,12 +1023,24 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
         res.set_content(R"({"status":"ok"})", "application/json; charset=utf-8");
     });
 
+    server.Get("/api/pipeline/status", [&ctx](const httplib::Request&, httplib::Response& res) {
+        std::lock_guard<std::mutex> lock(ctx.progress_mutex);
+        send_json(res, {
+            {"active", ctx.stage_active},
+            {"stage", ctx.active_stage},
+            {"detail", ctx.active_stage_detail},
+            {"stage_index", ctx.active_stage_index},
+            {"total_stages", ctx.active_total_stages},
+        });
+    });
+
     server.Get("/api/health", [&ctx](const httplib::Request&, httplib::Response& res) {
         const json current_settings = ctx.settings_manager.load();
         const json models_status = ctx.model_manager->get_status_json();
         const auto lm_status = probe_lm_studio(ctx.settings_manager);
         const std::string sel_det = current_settings.value("detection_model", std::string("koharu-layout-rfdetr-seg-2xl"));
         const auto det = ctx.model_manager->resolve_detector_model(sel_det, /*allow_fallback=*/true);
+        const auto hw = pipeline::ModelManager::query_hardware_profile();
         const json payload = {
             {"status", "ok"},
             {"backend", "cpp-native"},
@@ -890,6 +1048,15 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             {"onnxruntime_version", ctx.ort_version},
             {"execution_provider", pipeline::ModelManager::get_primary_provider()},
             {"available_providers", ctx.available_providers},
+            {"hardware", {
+                {"total_ram_mb", hw.total_ram_mb},
+                {"available_ram_mb", hw.available_ram_mb},
+                {"memory_load_percent", hw.memory_load_percent},
+                {"dedicated_vram_mb", hw.dedicated_vram_mb},
+                {"logical_cpus", hw.logical_cpus},
+                {"gpu_name", hw.gpu_name},
+                {"low_memory_mode", hw.low_memory_mode},
+            }},
             {"models_ready", models_status.value("all_ready", false)},
             {"models_dir", models_status.value("models_dir", std::string(""))},
             {"detector_backend", det.has_value() ? json(pipeline::detector_backend_name(det->backend)) : json(nullptr)},
@@ -919,6 +1086,17 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
         const json current_settings = ctx.settings_manager.load();
         send_json(res, ctx.model_manager->get_pipeline_models_json(current_settings));
     });
+
+    auto handle_unload_sessions = [&ctx](const httplib::Request&, httplib::Response& res) {
+        ctx.cancel_pending_unload();
+        ctx.unload_all_sessions();
+        send_json(res, {
+            {"status", "ok"},
+            {"unloaded", true},
+        });
+    };
+    server.Post("/api/pipeline/unload", handle_unload_sessions);
+    server.Post("/api/models/unload", handle_unload_sessions);
 
     server.Post("/api/models/import-koharu", [&ctx](const httplib::Request& req, httplib::Response& res) {
         pipeline::KoharuImportOptions opts;
@@ -1126,7 +1304,14 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             return;
         }
 
+        const BatchKeepAliveHint keep_hint = parse_batch_keep_alive(req);
+        const bool want_auto_unload = opts.auto_unload;
+        if (keep_hint.keep_alive.value_or(false)) {
+            opts.auto_unload = false;
+        }
+
         try {
+            ctx.cancel_pending_unload();
             pipeline::DetectionResult det_result;
             {
                 std::lock_guard<std::mutex> lock(ctx.inference_mutex);
@@ -1134,6 +1319,13 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                     reinterpret_cast<const uint8_t*>(upload.content.data()),
                     upload.content.size(),
                     opts);
+            }
+            if (want_auto_unload) {
+                if (keep_hint.unload_after) {
+                    ctx.unload_all_sessions();
+                } else if (keep_hint.keep_alive.value_or(false)) {
+                    ctx.schedule_deferred_unload(60);
+                }
             }
 
             const auto mask_png = pipeline::TextDetector::encode_mask_png(
@@ -1297,7 +1489,14 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             }
         }
 
+        const BatchKeepAliveHint keep_hint = parse_batch_keep_alive(req);
+        const bool want_auto_unload = opts.auto_unload;
+        if (keep_hint.keep_alive.value_or(false)) {
+            opts.auto_unload = false;
+        }
+
         try {
+            ctx.cancel_pending_unload();
             pipeline::OcrStageResult ocr_res;
             {
                 std::lock_guard<std::mutex> lock(ctx.inference_mutex);
@@ -1306,6 +1505,13 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                     upload.content.size(),
                     parsed_bubbles,
                     opts);
+            }
+            if (want_auto_unload) {
+                if (keep_hint.unload_after) {
+                    ctx.unload_all_sessions();
+                } else if (keep_hint.keep_alive.value_or(false)) {
+                    ctx.schedule_deferred_unload(60);
+                }
             }
 
             json blocks_json = json::array();
@@ -1517,11 +1723,25 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
         }
         opts.refine_mask = (refine_mask && has_explicit_mask);
 
+        const BatchKeepAliveHint keep_hint = parse_batch_keep_alive(req);
+        const bool want_auto_unload = opts.auto_unload;
+        if (keep_hint.keep_alive.value_or(false)) {
+            opts.auto_unload = false;
+        }
+
         try {
+            ctx.cancel_pending_unload();
             pipeline::InpaintResult inpaint_res;
             {
                 std::lock_guard<std::mutex> lock(ctx.inference_mutex);
                 inpaint_res = ctx.inpainter->inpaint_rgb(rgb_image.data(), orig_w, orig_h, working_mask, opts);
+            }
+            if (want_auto_unload) {
+                if (keep_hint.unload_after) {
+                    ctx.unload_all_sessions();
+                } else if (keep_hint.keep_alive.value_or(false)) {
+                    ctx.schedule_deferred_unload(60);
+                }
             }
 
             const auto png_bytes = pipeline::LamaInpainter::encode_rgb_png(
@@ -1665,9 +1885,9 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 for (const char* top_key : {
                          "provider", "model", "base_url", "api_key",
                          "temperature", "top_p", "top_k", "max_tokens",
-                         "frequency_penalty", "reasoning_effort", "strip_thinking",
-                         "use_vision", "vision_max_side", "custom_instructions",
-                         "glossary", "timeout"}) {
+                         "frequency_penalty", "reasoning_effort", "translation_tone",
+                         "strip_thinking", "use_vision", "vision_max_side",
+                         "custom_instructions", "glossary", "timeout"}) {
                     if (body.contains(top_key) && !body[top_key].is_null() && !overrides.contains(top_key)) {
                         overrides[top_key] = body[top_key];
                     }
@@ -1803,9 +2023,9 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             for (const char* top_key : {
                      "provider", "model", "base_url", "api_key",
                      "temperature", "top_p", "top_k", "max_tokens",
-                     "frequency_penalty", "reasoning_effort", "strip_thinking",
-                     "use_vision", "vision_max_side", "custom_instructions",
-                     "glossary", "timeout"}) {
+                     "frequency_penalty", "reasoning_effort", "translation_tone",
+                     "strip_thinking", "use_vision", "vision_max_side",
+                     "custom_instructions", "glossary", "timeout"}) {
                 if (body.contains(top_key) && !body[top_key].is_null()) {
                     overrides[top_key] = body[top_key];
                 }
@@ -2105,12 +2325,39 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
         std::string cleaned_image_url;
         std::string cleaned_image_payload;
 
+        const BatchKeepAliveHint keep_hint = parse_batch_keep_alive(req);
+        const bool want_auto_unload = current_settings.value("auto_unload_vram", true);
+        const auto hw_profile = pipeline::ModelManager::query_hardware_profile();
+        const bool constrain_memory =
+            want_auto_unload &&
+            (hw_profile.low_memory_mode || pipeline::ModelManager::is_under_memory_pressure());
+
+        // Adaptive RAM/VRAM policy:
+        // - Standard/High-headroom PCs (e.g. >=12 GB RAM & >=6 GB VRAM): keep all 3 Ort::Sessions
+        //   cached across pages in a batch and unload VRAM once after the final page.
+        // - Low-spec PCs (<10 GB RAM or <5 GB VRAM) or live high RAM pressure (>=86% used / <1.5 GB free
+        //   while LM Studio is loaded): unload each stage immediately so peak VRAM stays <600 MB.
+        det_opts.auto_unload = constrain_memory;
+        ocr_opts.auto_unload = constrain_memory;
+        inpaint_opts.auto_unload = constrain_memory;
+
+        pipeline::PageTranslationResult translation_res;
+        std::future<pipeline::PageTranslationResult> trans_future;
+        bool trans_started = false;
+
+        struct LiveStageGuard {
+            AppContext& app;
+            ~LiveStageGuard() { app.clear_live_stage(); }
+        } live_stage_guard{ctx};
+
         try {
-            // Stages 1 -> 2 -> 3 serialized under inference_mutex, unloading each ONNX session immediately
+            ctx.cancel_pending_unload();
+            // Stages 1 -> 2 -> 3 serialized under inference_mutex with warm Ort::Session reuse
             {
                 std::lock_guard<std::mutex> lock(ctx.inference_mutex);
 
                 // Stage 1: Comic Text Detection + Reading-Order Sort + Binary Text Mask
+                ctx.set_live_stage("detect", det_selector, 1, 4);
                 det_result = ctx.detector->detect_rgb(rgb_image.data(), orig_w, orig_h, det_opts);
 
                 const auto mask_png = pipeline::TextDetector::encode_mask_png(
@@ -2118,6 +2365,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 std::tie(mask_id, mask_url) = save_mask_png_to_cache(mask_png);
 
                 // Stage 2: Multi-Language OCR Router (`manga-ocr` / `rapidocr-ppocrv4` / `paddleocr-vl-gguf`)
+                ctx.set_live_stage("ocr", ocr_opts.ocr_model.empty() ? "manga-ocr" : ocr_opts.ocr_model, 2, 4);
                 std::vector<pipeline::OcrBubbleInput> ocr_inputs;
                 ocr_inputs.reserve(det_result.bubbles.size());
                 std::vector<std::array<int, 4>> detected_bboxes;
@@ -2138,10 +2386,69 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 ocr_result = ctx.ocr_engine->recognize_rgb(
                     rgb_image.data(), orig_w, orig_h, ocr_inputs, ocr_opts);
 
+                // Launch Stage 4 (LLM Translation) asynchronously in parallel with Stage 3 (LaMa Inpainting)
+                // since translation only depends on OCR text (plus optional compressed vision JPEG).
+                const std::string active_llm_name = !translator->config().preferred_model.empty()
+                    ? translator->config().preferred_model
+                    : translator->config().provider;
+                ctx.set_live_stage("inpaint_translate", inpaint_opts.inpainting_model + " + " + active_llm_name, 3, 4);
+                std::vector<pipeline::DialogueBlockInput> async_dialogues;
+                async_dialogues.reserve(ocr_result.blocks.size());
+                for (const auto& b : ocr_result.blocks) {
+                    async_dialogues.push_back({b.id, b.source_text});
+                }
+                std::optional<std::string> async_vision_uri;
+                if (translator->config().use_vision) {
+                    try {
+                        async_vision_uri = pipeline::ComicTranslator::encode_rgb_for_vision(
+                            rgb_image.data(),
+                            orig_w,
+                            orig_h,
+                            translator->config().vision_max_side);
+                    } catch (...) {
+                        async_vision_uri = std::nullopt;
+                    }
+                }
+                pipeline::TranslateRequestOptions async_req_opts;
+                async_req_opts.source_lang = src_lang;
+                async_req_opts.target_lang = tgt_lang;
+                async_req_opts.page_image_data_uri = std::move(async_vision_uri);
+                async_req_opts.use_vision = translator->config().use_vision;
+
+                trans_future = std::async(
+                    std::launch::async,
+                    [&translator, dialogues = std::move(async_dialogues), req_opts = std::move(async_req_opts)]() {
+                        return translator->translate_blocks(dialogues, req_opts);
+                    });
+                trans_started = true;
+
                 // Stage 3: Tile-Based LaMa Inpainting (`lama-manga` / `lama-fp32`)
                 inpaint_opts.bboxes = detected_bboxes;
                 inpaint_result = ctx.inpainter->inpaint_rgb(
                     rgb_image.data(), orig_w, orig_h, det_result.mask, inpaint_opts);
+                ctx.set_live_stage("translate", active_llm_name, 4, 4);
+
+                // Unload VRAM immediately once after the final page of a batch (or under memory pressure)
+                if (want_auto_unload &&
+                    (constrain_memory ||
+                     keep_hint.unload_after ||
+                     (keep_hint.keep_alive.has_value() && !*keep_hint.keep_alive))) {
+                    if (ctx.detector) ctx.detector->unload();
+                    if (ctx.ocr_engine) ctx.ocr_engine->unload();
+                    if (ctx.inpainter) ctx.inpainter->unload();
+                    pipeline::ModelManager::trim_process_heap();
+                }
+            }
+
+            if (want_auto_unload && !constrain_memory) {
+                if (keep_hint.keep_alive.has_value() && *keep_hint.keep_alive) {
+                    // Safety fallback: unload VRAM if batch client disconnects mid-batch
+                    ctx.schedule_deferred_unload(60);
+                } else if (!keep_hint.unload_after && !keep_hint.keep_alive.has_value()) {
+                    // Automatic batch keep-alive: keep Ort::Sessions hot for back-to-back pages,
+                    // then unload once after 15s of inactivity when the batch finishes.
+                    ctx.schedule_deferred_unload(15);
+                }
             }
 
             const auto cleaned_png = pipeline::LamaInpainter::encode_rgb_png(
@@ -2151,42 +2458,31 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 ? ("data:image/png;base64," +
                    pipeline::TextDetector::base64_encode(cleaned_png.data(), cleaned_png.size()))
                 : cleaned_image_url;
+
+            // Free large per-page uncompressed image/mask buffers before waiting on Stage 4 LLM HTTP
+            det_result.mask.clear();
+            det_result.mask.shrink_to_fit();
+            inpaint_result.rgb.clear();
+            inpaint_result.rgb.shrink_to_fit();
+            rgb_image.clear();
+            rgb_image.shrink_to_fit();
         } catch (const std::invalid_argument& ex) {
+            if (trans_started && trans_future.valid()) {
+                try { trans_future.wait(); } catch (...) {}
+            }
             send_json(res, {{"detail", ex.what()}}, 400);
             return;
         } catch (const std::exception& ex) {
+            if (trans_started && trans_future.valid()) {
+                try { trans_future.wait(); } catch (...) {}
+            }
             send_json(res, {{"detail", std::string("Page CV/OCR/Inpaint pipeline failed: ") + ex.what()}}, 500);
             return;
         }
 
-        // Stage 4: Context-Aware Full-Page Translation via Multi-Provider LLM Engine
-        std::vector<pipeline::DialogueBlockInput> dialogue_inputs;
-        dialogue_inputs.reserve(ocr_result.blocks.size());
-        for (const auto& b : ocr_result.blocks) {
-            dialogue_inputs.push_back({b.id, b.source_text});
-        }
-
-        std::optional<std::string> page_image_data_uri;
-        if (translator->config().use_vision) {
-            try {
-                page_image_data_uri = pipeline::ComicTranslator::encode_rgb_for_vision(
-                    rgb_image.data(),
-                    orig_w,
-                    orig_h,
-                    translator->config().vision_max_side);
-            } catch (...) {
-                page_image_data_uri = std::nullopt;
-            }
-        }
-
-        pipeline::PageTranslationResult translation_res;
+        // Collect Stage 4 LLM Translation result (already running in parallel with Stage 3)
         try {
-            pipeline::TranslateRequestOptions req_opts;
-            req_opts.source_lang = src_lang;
-            req_opts.target_lang = tgt_lang;
-            req_opts.page_image_data_uri = page_image_data_uri;
-            req_opts.use_vision = translator->config().use_vision;
-            translation_res = translator->translate_blocks(dialogue_inputs, req_opts);
+            translation_res = trans_future.get();
         } catch (const pipeline::ProviderConnectionError& ex) {
             send_json(res, {{"detail", ex.what()}}, 503);
             return;
@@ -2726,6 +3022,272 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
         }
     });
 
+    // -------------------------------------------------------------------------
+    // Streamed Disk-Backed Export Sessions (O(1) RAM for 1,500 - 10,000+ Pages)
+    //   POST /api/export/session/start
+    //   POST /api/export/session/{id}/page
+    //   POST /api/export/session/{id}/finalize
+    //   POST /api/export/session/{id}/cancel
+    // -------------------------------------------------------------------------
+
+    server.Post("/api/export/session/start", [&ctx](const httplib::Request& req, httplib::Response& res) {
+        try {
+            json body = json::object();
+            if (!util::trim_ascii(req.body).empty()) {
+                body = json::parse(req.body, nullptr, false);
+                if (body.is_discarded() || !body.is_object()) {
+                    send_json(res, {{"detail", "Invalid JSON object for /api/export/session/start."}}, 400);
+                    return;
+                }
+            }
+
+            ExportSessionState st;
+            st.id = "exp_" + util::generate_uuid_hex();
+            const std::string fmt = util::to_lower_ascii(util::trim_ascii(body.value("format", std::string("cbz"))));
+            st.format = (fmt == "pdf") ? "pdf" : "cbz";
+            if (body.contains("filename") && body["filename"].is_string() &&
+                !util::trim_ascii(body["filename"].get<std::string>()).empty()) {
+                st.export_name = util::trim_ascii(body["filename"].get<std::string>());
+            }
+            if (body.contains("image_format") && body["image_format"].is_string()) {
+                st.image_format = parse_export_image_format(body["image_format"].get<std::string>());
+            }
+            if (body.contains("jpeg_quality") && body["jpeg_quality"].is_number()) {
+                st.jpeg_quality = std::max(50, std::min(100, body["jpeg_quality"].get<int>()));
+            }
+
+            st.session_dir = get_export_sessions_dir() / util::utf8_to_wide(st.id);
+            std::error_code ec;
+            fs::create_directories(st.session_dir, ec);
+            if (ec) {
+                throw std::runtime_error("Failed to create temporary export session directory.");
+            }
+
+            const std::string sid = st.id;
+            {
+                std::lock_guard<std::mutex> lock(ctx.export_sessions_mutex);
+                ctx.export_sessions[sid] = std::move(st);
+            }
+
+            send_json(res, {
+                {"status", "ok"},
+                {"session_id", sid},
+            });
+        } catch (const ComicExportError& ex) {
+            send_json(res, {{"detail", ex.what()}}, 400);
+        } catch (const std::exception& ex) {
+            send_json(res, {{"detail", std::string("Failed to start export session: ") + ex.what()}}, 500);
+        }
+    });
+
+    server.Post(R"(/api/export/session/([A-Za-z0-9_-]{1,64})/page)",
+        [&ctx](const httplib::Request& req, httplib::Response& res) {
+            const std::string sid = req.matches[1].str();
+            if (!req.is_multipart_form_data()) {
+                send_json(res, {{"detail", "Expected multipart/form-data with field 'image'."}}, 400);
+                return;
+            }
+            httplib::FormData upload;
+            if (req.form.has_file("image")) {
+                upload = req.form.get_file("image");
+            } else if (req.form.has_file("file")) {
+                upload = req.form.get_file("file");
+            } else {
+                send_json(res, {{"detail", "Missing 'image' file in export page upload."}}, 400);
+                return;
+            }
+            if (upload.content.empty()) {
+                send_json(res, {{"detail", "Uploaded export page image is empty."}}, 400);
+                return;
+            }
+
+            int page_index = -1;
+            if (req.form.has_field("index")) {
+                try {
+                    page_index = std::stoi(util::trim_ascii(req.form.get_field("index")));
+                } catch (...) {
+                    send_json(res, {{"detail", "Invalid integer for 'index'."}}, 400);
+                    return;
+                }
+            }
+
+            std::optional<std::string> page_filename;
+            if (req.form.has_field("filename") && !util::trim_ascii(req.form.get_field("filename")).empty()) {
+                page_filename = util::trim_ascii(req.form.get_field("filename"));
+            } else if (!upload.filename.empty()) {
+                page_filename = upload.filename;
+            }
+
+            fs::path session_dir;
+            int assigned_index = 0;
+            {
+                std::lock_guard<std::mutex> lock(ctx.export_sessions_mutex);
+                auto it = ctx.export_sessions.find(sid);
+                if (it == ctx.export_sessions.end()) {
+                    send_json(res, {{"detail", "Export session not found or already finalized."}}, 404);
+                    return;
+                }
+                session_dir = it->second.session_dir;
+                assigned_index = (page_index >= 0)
+                    ? page_index
+                    : (it->second.pages.empty() ? 0 : (it->second.pages.rbegin()->first + 1));
+            }
+
+            char fname_buf[64]{};
+            std::snprintf(fname_buf, sizeof(fname_buf), "p_%06d.img", assigned_index);
+            const fs::path page_path = session_dir / util::utf8_to_wide(fname_buf);
+
+            std::string write_err;
+            if (!util::atomic_write_bytes(
+                    page_path,
+                    reinterpret_cast<const uint8_t*>(upload.content.data()),
+                    upload.content.size(),
+                    &write_err)) {
+                send_json(res, {{"detail", "Failed to write export page to disk: " + write_err}}, 500);
+                return;
+            }
+
+            size_t count_now = 0;
+            {
+                std::lock_guard<std::mutex> lock(ctx.export_sessions_mutex);
+                auto it = ctx.export_sessions.find(sid);
+                if (it == ctx.export_sessions.end()) {
+                    std::error_code ec;
+                    fs::remove(page_path, ec);
+                    send_json(res, {{"detail", "Export session closed during upload."}}, 404);
+                    return;
+                }
+                it->second.pages[assigned_index] = DiskExportPageEntry{page_path, std::move(page_filename)};
+                count_now = it->second.pages.size();
+            }
+
+            send_json(res, {
+                {"status", "ok"},
+                {"index", assigned_index},
+                {"received_pages", count_now},
+            });
+        });
+
+    server.Post(R"(/api/export/session/([A-Za-z0-9_-]{1,64})/finalize)",
+        [&ctx](const httplib::Request& req, httplib::Response& res) {
+            const std::string sid = req.matches[1].str();
+            ExportSessionState st;
+            {
+                std::lock_guard<std::mutex> lock(ctx.export_sessions_mutex);
+                auto it = ctx.export_sessions.find(sid);
+                if (it == ctx.export_sessions.end()) {
+                    send_json(res, {{"detail", "Export session not found or already finalized."}}, 404);
+                    return;
+                }
+                st = std::move(it->second);
+                ctx.export_sessions.erase(it);
+            }
+
+            auto cleanup_dir = [dir = st.session_dir]() {
+                std::error_code ec;
+                fs::remove_all(dir, ec);
+            };
+
+            try {
+                std::vector<DiskExportPageEntry> ordered_pages;
+                ordered_pages.reserve(st.pages.size());
+                for (auto& kv : st.pages) {
+                    ordered_pages.push_back(std::move(kv.second));
+                }
+                if (ordered_pages.empty()) {
+                    cleanup_dir();
+                    send_json(res, {{"detail", "Export session has no uploaded pages."}}, 400);
+                    return;
+                }
+
+                const std::string download_name = sanitize_export_filename(st.export_name, st.format);
+                const fs::path out_file = st.session_dir / util::utf8_to_wide("output." + st.format);
+                const std::string mime = (st.format == "pdf")
+                    ? "application/pdf"
+                    : "application/vnd.comicbook+zip";
+
+                if (st.format == "pdf") {
+                    build_pdf_to_file(ordered_pages, out_file);
+                } else {
+                    build_cbz_to_file(ordered_pages, out_file, st.image_format, st.jpeg_quality);
+                }
+
+                std::error_code sz_ec;
+                const uint64_t file_size = fs::file_size(out_file, sz_ec);
+                if (sz_ec || file_size == 0) {
+                    cleanup_dir();
+                    send_json(res, {{"detail", "Finalized export file is missing or empty."}}, 500);
+                    return;
+                }
+
+                auto stream_file = std::make_shared<std::ifstream>(out_file, std::ios::binary);
+                if (!stream_file->is_open()) {
+                    cleanup_dir();
+                    send_json(res, {{"detail", "Failed to open finalized export file for streaming."}}, 500);
+                    return;
+                }
+
+                apply_cors_headers(res);
+                res.set_header("Content-Disposition", "attachment; filename=\"" + download_name + "\"");
+                res.set_header("X-Page-Count", std::to_string(ordered_pages.size()));
+
+                const fs::path dir_to_clean = st.session_dir;
+                res.set_content_provider(
+                    static_cast<size_t>(file_size),
+                    mime,
+                    [stream_file](size_t offset, size_t length, httplib::DataSink& sink) -> bool {
+                        constexpr size_t kChunk = 1024ULL * 1024ULL;  // 1 MiB stream chunks
+                        std::vector<char> buf(std::min(length, kChunk));
+                        stream_file->clear();
+                        stream_file->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+                        size_t remaining = length;
+                        while (remaining > 0) {
+                            const size_t to_read = std::min(remaining, buf.size());
+                            stream_file->read(buf.data(), static_cast<std::streamsize>(to_read));
+                            const std::streamsize got = stream_file->gcount();
+                            if (got <= 0) {
+                                return false;
+                            }
+                            if (!sink.write(buf.data(), static_cast<size_t>(got))) {
+                                return false;
+                            }
+                            remaining -= static_cast<size_t>(got);
+                        }
+                        return true;
+                    },
+                    [stream_file, dir_to_clean](bool /*success*/) {
+                        stream_file->close();
+                        std::error_code ec;
+                        fs::remove_all(dir_to_clean, ec);
+                    });
+            } catch (const ComicExportError& ex) {
+                cleanup_dir();
+                send_json(res, {{"detail", ex.what()}}, 400);
+            } catch (const std::exception& ex) {
+                cleanup_dir();
+                send_json(res, {{"detail", std::string("Streamed export failed: ") + ex.what()}}, 500);
+            }
+        });
+
+    server.Post(R"(/api/export/session/([A-Za-z0-9_-]{1,64})/cancel)",
+        [&ctx](const httplib::Request& req, httplib::Response& res) {
+            const std::string sid = req.matches[1].str();
+            fs::path dir;
+            {
+                std::lock_guard<std::mutex> lock(ctx.export_sessions_mutex);
+                auto it = ctx.export_sessions.find(sid);
+                if (it != ctx.export_sessions.end()) {
+                    dir = it->second.session_dir;
+                    ctx.export_sessions.erase(it);
+                }
+            }
+            if (!dir.empty()) {
+                std::error_code ec;
+                fs::remove_all(dir, ec);
+            }
+            send_json(res, {{"status", "ok"}, {"cancelled", true}});
+        });
+
     // Clean JSON fallback for unknown /api/* routes
     server.Get(R"(/api/.*)", [](const httplib::Request& req, httplib::Response& res) {
         send_json(
@@ -2925,11 +3487,47 @@ void show_error_dialog(const std::wstring& message) {
     MessageBoxW(
         nullptr,
         message.c_str(),
-        L"MangaFlow AI — Startup Error",
+        L"Vellum — Startup Error",
         MB_OK | MB_ICONERROR);
 }
 
 }  // namespace mangaflow
+
+void register_cuda_dll_paths(const fs::path& exe_dir) {
+    std::vector<fs::path> roots;
+    roots.push_back(exe_dir / "cuda");
+    roots.push_back(fs::path(L"C:\\FILE SOFTWARE\\Koharu\\store\\cuda"));
+    if (const wchar_t* local_app = _wgetenv(L"LOCALAPPDATA")) {
+        roots.push_back(fs::path(local_app) / L"Koharu" / L"store" / L"cuda");
+    }
+
+    std::wstring extra_paths;
+    std::error_code ec;
+    for (const auto& root : roots) {
+        if (!fs::is_directory(root, ec) || ec) continue;
+        for (const auto& entry : fs::recursive_directory_iterator(
+                 root, fs::directory_options::skip_permission_denied, ec)) {
+            if (ec) break;
+            if (!entry.is_directory(ec) || ec) continue;
+            const std::wstring name = entry.path().filename().wstring();
+            if (name == L"bin" || name == L"x86_64") {
+                extra_paths += entry.path().wstring();
+                extra_paths += L";";
+            }
+        }
+    }
+
+    if (!extra_paths.empty()) {
+        const DWORD len = GetEnvironmentVariableW(L"PATH", nullptr, 0);
+        std::wstring cur_path(len > 0 ? len : 0, L'\0');
+        if (len > 0) {
+            GetEnvironmentVariableW(L"PATH", cur_path.data(), len);
+            if (!cur_path.empty() && cur_path.back() == L'\0') cur_path.pop_back();
+        }
+        const std::wstring combined = extra_paths + cur_path;
+        SetEnvironmentVariableW(L"PATH", combined.c_str());
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Win32 GUI Entry Point (Zero Black Console Window)
@@ -2947,6 +3545,7 @@ int WINAPI WinMain(
                           cmd_line.find("--headless") != std::string::npos;
 
     const fs::path exe_dir = get_executable_dir();
+    register_cuda_dll_paths(exe_dir);
     const auto frontend_dist = resolve_frontend_dist(exe_dir);
     if (!frontend_dist.has_value() && !headless) {
         show_error_dialog(
@@ -2967,6 +3566,7 @@ int WINAPI WinMain(
     ctx.detector = std::make_unique<pipeline::TextDetector>(*ctx.model_manager);
     ctx.ocr_engine = std::make_unique<pipeline::OcrEngine>(*ctx.model_manager);
     ctx.inpainter = std::make_unique<pipeline::LamaInpainter>(*ctx.model_manager);
+    ctx.start_unload_watchdog();
 
     // Pre-load persistent settings so execution_mode (`MANGA_FORCE_CPU`) is synced at startup
     const json initial_settings = ctx.settings_manager.load();
@@ -2975,10 +3575,10 @@ int WINAPI WinMain(
     }
 
     httplib::Server server;
-    server.set_read_timeout(120, 0);
-    server.set_write_timeout(300, 0);
-    server.set_keep_alive_max_count(100);
-    server.set_payload_max_length(512ULL * 1024ULL * 1024ULL);  // 512 MiB for archives & exports
+    server.set_read_timeout(300, 0);
+    server.set_write_timeout(600, 0);
+    server.set_keep_alive_max_count(10000);
+    server.set_payload_max_length(2ULL * 1024ULL * 1024ULL * 1024ULL);  // 2 GiB for large archives & exports
     register_routes(server, ctx);
 
     int preferred_port = kDefaultPort;
@@ -3009,11 +3609,12 @@ int WINAPI WinMain(
         }
     });
 
-    auto stop_server = [&server, &server_thread]() {
+    auto stop_server = [&server, &server_thread, &ctx]() {
         server.stop();
         if (server_thread.joinable()) {
             server_thread.join();
         }
+        ctx.stop_unload_watchdog();
     };
 
     if (!wait_for_server_ready(bound_port, server_failed)) {
@@ -3029,6 +3630,7 @@ int WINAPI WinMain(
         if (server_thread.joinable()) {
             server_thread.join();
         }
+        ctx.stop_unload_watchdog();
         return server_failed.load() ? 1 : 0;
     }
 
