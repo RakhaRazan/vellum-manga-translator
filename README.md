@@ -144,9 +144,26 @@ Measured on Windows x64 (`Release` build with MSVC `/O2 /GL /LTCG /OPT:REF /OPT:
    - Extract `Vellum-Windows-x64.zip` anywhere on your PC.
    - Open `Vellum/` and double-click **`Vellum.exe`** (or double-click root **`Vellum.exe`** when built locally).
    - The native desktop studio opens immediately (`<1s`) with zero terminal window or external browser required. *(Requires Windows 10/11 x64 with Microsoft Edge WebView2 Runtime, pre-installed on modern Windows.)*
-3. **First-Launch Model Setup**:
-   - On first launch, Vellum checks `%LOCALAPPDATA%\ComicTranslator\models` (and automatically detects any existing local Koharu model cache if present).
-   - If any ONNX weights are missing, the built-in **DownloadModal** streams them automatically from Hugging Face with real-time progress bars.
+3. **First-Launch & Local `models/` Setup**:
+   - Place ONNX model weights directly in the local **`models/`** folder beside `Vellum.exe` (or let Vellum manage them in `%LOCALAPPDATA%\ComicTranslator\models`; you can also override via `MANGA_MODELS_DIR`).
+   - Expected `models/` layout:
+     ```text
+     models/
+     ├── koharu-layout-rfdetr-seg-2xl-1152.onnx   # Stage 1: RF-DETR-Seg-2XL detector (recommended)
+     ├── comictextdetector.pt.onnx                # Stage 1: ComicTextDetector fallback
+     ├── lama_manga.onnx                          # Stage 3: Screentone-tuned manga LaMa inpainter
+     ├── lama_fp32.onnx                           # Stage 3: Standard LaMa inpainter fallback
+     ├── manga-ocr/
+     │   ├── encoder_model.onnx                   # Stage 2: Japanese Manga OCR encoder
+     │   ├── decoder_model.onnx                   # Stage 2: Japanese Manga OCR decoder
+     │   └── vocab.txt
+     ├── rapidocr/
+     │   ├── ch_PP-OCRv4_det_infer.onnx           # Stage 2: Chinese/Korean PP-OCRv4 detector
+     │   ├── ch_PP-OCRv4_rec_infer.onnx           # Stage 2: Chinese PP-OCRv4 recognizer
+     │   └── korean_PP-OCRv4_rec_infer.onnx       # Stage 2: Korean PP-OCRv4 recognizer
+     └── paddleocr-vl-gguf/                       # Optional: PaddleOCR-VL-1.6 GGUF for LM Studio
+     ```
+   - If any ONNX weights are missing on first launch, the built-in **DownloadModal** streams them automatically from Hugging Face with real-time progress bars (or detects any existing local Koharu model cache).
 4. **Connect LM Studio (Port `1235`) or Cloud Provider**:
    - **Recommended Local Setup (LM Studio)**: Load a model (e.g., `Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P`), start LM Studio's Local Server on port **`1235`**, and enable **CORS**.
    - **Or use Ollama / Cloud APIs**: Open **Settings → Providers** to configure Ollama, OpenAI, Gemini, Anthropic, DeepSeek, OpenRouter, or any custom OpenAI-compatible endpoint.

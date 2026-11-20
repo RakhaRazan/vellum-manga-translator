@@ -2494,13 +2494,26 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             return;
         }
 
+        std::unordered_map<std::string, const pipeline::DetectedBubble*> det_by_id;
+        det_by_id.reserve(det_result.bubbles.size());
+        for (const auto& db : det_result.bubbles) {
+            det_by_id[db.id] = &db;
+        }
+
         json processed_blocks = json::array();
         for (const auto& b : ocr_result.blocks) {
             const auto it = translation_res.translations.find(b.id);
             const std::string trans_text =
                 (it != translation_res.translations.end()) ? it->second : b.source_text;
             const std::string sizing_text = trans_text.empty() ? b.source_text : trans_text;
-            const int fsize = estimate_font_size(b.bbox, sizing_text);
+
+            std::array<int, 4> bubble_bb = b.bbox;
+            std::array<int, 4> safe_bb = b.bbox;
+            if (const auto dit = det_by_id.find(b.id); dit != det_by_id.end() && dit->second != nullptr) {
+                bubble_bb = dit->second->bubble_bbox;
+                safe_bb = dit->second->safe_bbox;
+            }
+            const int fsize = estimate_font_size(safe_bb, sizing_text);
 
             json poly_json = json::array();
             for (const auto& pt : b.polygon) {
@@ -2514,6 +2527,8 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 {"id", b.id},
                 {"order", b.order},
                 {"bbox", json::array({b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]})},
+                {"bubble_bbox", json::array({bubble_bb[0], bubble_bb[1], bubble_bb[2], bubble_bb[3]})},
+                {"safe_bbox", json::array({safe_bb[0], safe_bb[1], safe_bb[2], safe_bb[3]})},
                 {"polygon", std::move(poly_json)},
                 {"original_text", b.source_text},
                 {"source_text", b.source_text},

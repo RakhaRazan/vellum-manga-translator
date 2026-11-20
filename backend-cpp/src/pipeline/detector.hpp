@@ -27,7 +27,9 @@ namespace mangaflow::pipeline {
 struct DetectedBubble {
     std::string id;
     int order = 0;
-    std::array<int, 4> bbox{0, 0, 0, 0};  // [x1, y1, x2, y2]
+    std::array<int, 4> bbox{0, 0, 0, 0};         // [x1, y1, x2, y2] tight text bbox
+    std::array<int, 4> bubble_bbox{0, 0, 0, 0};  // [x1, y1, x2, y2] enclosing speech bubble / traced interior
+    std::array<int, 4> safe_bbox{0, 0, 0, 0};    // [x1, y1, x2, y2] 8% H / 8% V safe inset inside bubble_bbox
     std::array<std::array<int, 2>, 4> polygon{};
     float confidence = 0.0f;
     std::string text_direction = "horizontal";  // "horizontal" | "vertical"
@@ -186,6 +188,15 @@ private:
         int width,
         int height,
         int kernel_size);
+
+    static void populate_bubble_and_safe_bboxes(
+        std::vector<DetectedBubble>& bubbles,
+        const uint8_t* rgb_data,
+        int orig_w,
+        int orig_h,
+        const std::vector<LayoutRegion>* speech_bubbles,
+        const std::vector<LayoutRegion>* panels,
+        const std::vector<uint8_t>* text_mask = nullptr);
 
     const ModelManager& model_manager_;
     std::optional<OrtSessionHandle> cached_session_;

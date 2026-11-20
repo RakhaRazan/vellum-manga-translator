@@ -135,7 +135,8 @@ private:
         const uint8_t* rgb_data,
         int img_w,
         int img_h,
-        const std::array<int, 4>& bbox);
+        const std::array<int, 4>& bbox,
+        bool erase_border_ink = false);
     static void erase_border_touching_ink(RgbImage& crop);
     static RgbImage pad_rgb_white(
         const RgbImage& src,

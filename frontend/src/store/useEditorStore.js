@@ -777,76 +777,85 @@ export function normalizeBlocks(rawBlocks = [], options = null) {
     const panelIdx = findContainingRegion([x1, y1, x2, y2], panels, 0.45);
     const matchedPanel = panelIdx >= 0 ? panels[panelIdx] : null;
 
-    if (isHorizontalTarget && matchedBubble && Array.isArray(matchedBubble.bbox)) {
-      // Fit translated horizontal text strictly inside the detected speech bubble interior
-      const bx1 = Number(matchedBubble.bbox[0]) || 0;
-      const by1 = Number(matchedBubble.bbox[1]) || 0;
-      const bx2 = Number(matchedBubble.bbox[2]) || bx1 + bboxWidth;
-      const by2 = Number(matchedBubble.bbox[3]) || by1 + bboxHeight;
-      const bw = Math.max(24, bx2 - bx1);
-      const bh = Math.max(24, by2 - by1);
+    const backendSafeBox =
+      Array.isArray(b.safe_bbox) &&
+      b.safe_bbox.length >= 4 &&
+      Number(b.safe_bbox[2]) > Number(b.safe_bbox[0]) &&
+      Number(b.safe_bbox[3]) > Number(b.safe_bbox[1])
+        ? [
+            Number(b.safe_bbox[0]) || 0,
+            Number(b.safe_bbox[1]) || 0,
+            Number(b.safe_bbox[2]) || 0,
+            Number(b.safe_bbox[3]) || 0,
+          ]
+        : null;
 
-      const padX = bw >= 48 ? Math.max(6, Math.round(bw * 0.12)) : 3;
-      const padY = bh >= 36 ? Math.max(4, Math.round(bh * 0.10)) : 3;
+    const rawBubbleBox =
+      Array.isArray(b.bubble_bbox) &&
+      b.bubble_bbox.length >= 4 &&
+      Number(b.bubble_bbox[2]) > Number(b.bubble_bbox[0]) &&
+      Number(b.bubble_bbox[3]) > Number(b.bubble_bbox[1])
+        ? [
+            Number(b.bubble_bbox[0]) || 0,
+            Number(b.bubble_bbox[1]) || 0,
+            Number(b.bubble_bbox[2]) || 0,
+            Number(b.bubble_bbox[3]) || 0,
+          ]
+        : matchedBubble && Array.isArray(matchedBubble.bbox) && matchedBubble.bbox.length >= 4
+        ? [
+            Number(matchedBubble.bbox[0]) || 0,
+            Number(matchedBubble.bbox[1]) || 0,
+            Number(matchedBubble.bbox[2]) || 0,
+            Number(matchedBubble.bbox[3]) || 0,
+          ]
+        : null;
+
+    if (
+      isHorizontalTarget &&
+      backendSafeBox &&
+      (bubbleIdx < 0 || (bubbleUsageCount.get(bubbleIdx) || 1) === 1)
+    ) {
+      // Strictly constrain layout box to backend safe_bbox
+      defaultX = backendSafeBox[0];
+      defaultY = backendSafeBox[1];
+      defaultWidth = Math.max(20, backendSafeBox[2] - backendSafeBox[0]);
+      defaultHeight = Math.max(20, backendSafeBox[3] - backendSafeBox[1]);
+    } else if (isHorizontalTarget && rawBubbleBox) {
+      // Fallback: inset bubble_bbox by 8% padding on all sides (never wider than the bubble)
+      const [bx1, by1, bx2, by2] = rawBubbleBox;
+      const bw = Math.max(20, bx2 - bx1);
+      const bh = Math.max(20, by2 - by1);
+      const padX = Math.round(bw * 0.08);
+      const padY = Math.round(bh * 0.08);
       const innerX1 = bx1 + padX;
-      const innerX2 = Math.max(innerX1 + 24, bx2 - padX);
+      const innerX2 = Math.max(innerX1 + 16, bx2 - padX);
       const innerY1 = by1 + padY;
-      const innerY2 = Math.max(innerY1 + 20, by2 - padY);
-      const innerW = Math.max(24, innerX2 - innerX1);
-      const innerH = Math.max(20, innerY2 - innerY1);
+      const innerY2 = Math.max(innerY1 + 16, by2 - padY);
+      const innerW = Math.max(16, innerX2 - innerX1);
+      const innerH = Math.max(16, innerY2 - innerY1);
 
-      if ((bubbleUsageCount.get(bubbleIdx) || 1) === 1) {
+      if (bubbleIdx < 0 || (bubbleUsageCount.get(bubbleIdx) || 1) === 1) {
         defaultX = innerX1;
         defaultY = innerY1;
         defaultWidth = innerW;
         defaultHeight = innerH;
       } else {
-        const desiredW =
-          bboxHeight > bboxWidth * 1.5
-            ? Math.min(innerW, Math.max(bboxWidth, Math.round(bboxHeight * 0.65)))
-            : Math.min(innerW, bboxWidth);
-        const centerX = x1 + bboxWidth / 2;
-        defaultWidth = Math.max(24, desiredW);
+        // Multiple blocks sharing one bubble: clamp strictly inside inner bubble bounds
+        defaultWidth = Math.max(16, Math.min(bboxWidth, innerW));
         defaultX = Math.max(
           innerX1,
-          Math.min(Math.round(centerX - defaultWidth / 2), innerX2 - defaultWidth)
+          Math.min(x1, innerX2 - defaultWidth)
         );
-        defaultY = Math.max(innerY1, Math.min(y1, innerY2 - 20));
-        defaultHeight = Math.max(20, Math.min(bboxHeight, innerY2 - defaultY));
+        defaultY = Math.max(innerY1, Math.min(y1, innerY2 - 16));
+        defaultHeight = Math.max(16, Math.min(bboxHeight, innerY2 - defaultY));
       }
-    } else if (isHorizontalTarget && bboxHeight > bboxWidth * 1.5) {
-      // Fallback for narration/SFX without a detected bubble: conservative horizontal reshape
-      const maxCap = imgWidth > 0 ? imgWidth * 0.20 : bboxHeight * 0.50;
-      const expandedWidth = Math.round(
-        Math.max(
-          bboxWidth,
-          Math.min(bboxWidth * 2.2, bboxHeight * 0.50, maxCap)
-        )
-      );
-      const centerX = x1 + bboxWidth / 2;
-      let centeredX = Math.round(centerX - expandedWidth / 2);
-
-      if (matchedPanel && Array.isArray(matchedPanel.bbox)) {
-        const px1 = (Number(matchedPanel.bbox[0]) || 0) + 4;
-        const px2 = (Number(matchedPanel.bbox[2]) || px1 + expandedWidth) - 4;
-        const panelAvailW = Math.max(bboxWidth, px2 - px1);
-        defaultWidth = Math.min(expandedWidth, panelAvailW);
-        centeredX = Math.max(
-          px1,
-          Math.min(Math.round(centerX - defaultWidth / 2), px2 - defaultWidth)
-        );
-      } else {
-        defaultWidth = expandedWidth;
-        if (imgWidth > 0) {
-          centeredX = Math.max(
-            0,
-            Math.min(centeredX, Math.max(0, imgWidth - defaultWidth))
-          );
-        } else {
-          centeredX = Math.max(0, centeredX);
-        }
-      }
-      defaultX = centeredX;
+    } else if (matchedPanel && Array.isArray(matchedPanel.bbox)) {
+      // Clamp unbubbled text strictly inside its containing panel
+      const px1 = (Number(matchedPanel.bbox[0]) || 0) + 4;
+      const px2 = (Number(matchedPanel.bbox[2]) || px1 + bboxWidth) - 4;
+      const panelAvailW = Math.max(20, px2 - px1);
+      defaultWidth = Math.min(bboxWidth, panelAvailW);
+      defaultX = Math.max(px1, Math.min(x1, px2 - defaultWidth));
     }
 
     const fontSize = b.font_size || b.style?.font_size || 18;
@@ -869,7 +878,8 @@ export function normalizeBlocks(rawBlocks = [], options = null) {
       id: b.id || `block_${String(index + 1).padStart(3, '0')}`,
       order: b.order ?? index + 1,
       bbox: [x1, y1, x1 + bboxWidth, y1 + bboxHeight],
-      bubble_bbox: matchedBubble?.bbox ? [...matchedBubble.bbox] : b.bubble_bbox,
+      bubble_bbox: rawBubbleBox ? [...rawBubbleBox] : b.bubble_bbox,
+      safe_bbox: backendSafeBox ? [...backendSafeBox] : b.safe_bbox,
       panel_bbox: matchedPanel?.bbox ? [...matchedPanel.bbox] : b.panel_bbox,
       polygon: Array.isArray(b.polygon)
         ? b.polygon.map((pt) => (Array.isArray(pt) ? [...pt] : pt))

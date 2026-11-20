@@ -34,6 +34,9 @@ Vellum/
 release/
 *.exe
 *.dll
+*.zip
+*.cbz
+*.pdf
 
 # Optional standalone Python CLI helper caches (packaging/convert_koharu_to_onnx.py)
 venv/

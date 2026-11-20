@@ -2555,6 +2555,8 @@ std::string ComicTranslator::build_system_prompt(
         oss << next_rule++ << ". Casual Tone: Use relaxed, natural everyday spoken slang and punchy conversational rhythm.\n";
     }
 
+    oss << next_rule++ << ". Never output bracketed placeholders, notes, or meta-text like [unclear] or [part of the word]; "
+        << "reconstruct minor OCR typos naturally from surrounding dialogue.\n";
     oss << next_rule << ". Return ONLY valid JSON: "
         << "{\"dialogues\":[{\"id\":\"<id>\",\"translated_text\":\"<text>\"}]}. Keep every 'id' exact.";
 

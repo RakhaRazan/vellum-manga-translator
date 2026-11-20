@@ -623,7 +623,8 @@ OcrEngine::RgbImage OcrEngine::crop_bbox_clean(
     const uint8_t* rgb_data,
     int img_w,
     int img_h,
-    const std::array<int, 4>& bbox) {
+    const std::array<int, 4>& bbox,
+    bool erase_border_ink) {
     int x1 = clampi(bbox[0], 0, img_w);
     int y1 = clampi(bbox[1], 0, img_h);
     int x2 = clampi(bbox[2], 0, img_w);
@@ -753,7 +754,9 @@ OcrEngine::RgbImage OcrEngine::crop_bbox_clean(
         std::memcpy(drow, srow, row_bytes);
     }
 
-    erase_border_touching_ink(crop);
+    if (erase_border_ink) {
+        erase_border_touching_ink(crop);
+    }
     return crop;
 }
 
@@ -1691,7 +1694,10 @@ OcrStageResult OcrEngine::recognize_rgb(
     }
 
     for (const auto& b : bubbles) {
-        const RgbImage clean_crop = crop_bbox_clean(rgb_data, width, height, b.bbox);
+        // MangaOCR & PaddleOCR-VL were trained on raw manga crops (with borders/screentones);
+        // running erase_border_touching_ink on tight crops can wipe out edge characters.
+        const bool clean_border = (effective_model == "rapidocr-ppocrv4");
+        const RgbImage clean_crop = crop_bbox_clean(rgb_data, width, height, b.bbox, clean_border);
         std::string text;
         if (effective_model == "manga-ocr") {
             text = recognize_ja_crop(clean_crop, b.text_direction);

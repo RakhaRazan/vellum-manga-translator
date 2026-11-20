@@ -245,6 +245,8 @@ json DetectedBubble::to_json() const {
         {"id", id},
         {"order", order},
         {"bbox", {bbox[0], bbox[1], bbox[2], bbox[3]}},
+        {"bubble_bbox", {bubble_bbox[0], bubble_bbox[1], bubble_bbox[2], bubble_bbox[3]}},
+        {"safe_bbox", {safe_bbox[0], safe_bbox[1], safe_bbox[2], safe_bbox[3]}},
         {"polygon", std::move(poly)},
         {"confidence", conf_rounded},
         {"text_direction", text_direction},
@@ -815,6 +817,284 @@ DetectionResult TextDetector::detect_rgb(
     return run_comic_text_detector(rgb_data, width, height, *resolved, normalized_opts);
 }
 
+void TextDetector::populate_bubble_and_safe_bboxes(
+    std::vector<DetectedBubble>& bubbles,
+    const uint8_t* rgb_data,
+    int orig_w,
+    int orig_h,
+    const std::vector<LayoutRegion>* speech_bubbles,
+    const std::vector<LayoutRegion>* panels,
+    const std::vector<uint8_t>* text_mask) {
+    if (bubbles.empty() || orig_w <= 0 || orig_h <= 0) {
+        return;
+    }
+
+    auto pixel_luma = [&](int x, int y) -> uint8_t {
+        if (!rgb_data) return 255;
+        const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(orig_w) + static_cast<size_t>(x)) * 3ULL;
+        const float yv = 0.299f * static_cast<float>(rgb_data[idx + 0]) +
+                         0.587f * static_cast<float>(rgb_data[idx + 1]) +
+                         0.114f * static_cast<float>(rgb_data[idx + 2]);
+        return static_cast<uint8_t>(clampi(static_cast<int>(std::lround(yv)), 0, 255));
+    };
+
+    auto is_dark_border = [&](int x, int y) -> bool {
+        if (x < 0 || x >= orig_w || y < 0 || y >= orig_h) return true;
+        if (text_mask && text_mask->size() >= static_cast<size_t>(orig_w) * static_cast<size_t>(orig_h)) {
+            if ((*text_mask)[static_cast<size_t>(y) * static_cast<size_t>(orig_w) + static_cast<size_t>(x)] > 0) {
+                return false;  // Ignore text strokes when tracing outward to bubble/frame ink
+            }
+        }
+        return pixel_luma(x, y) < 90;
+    };
+
+    auto inter_area = [](const std::array<int, 4>& a, const std::array<int, 4>& b) -> double {
+        const int ix1 = std::max(a[0], b[0]);
+        const int iy1 = std::max(a[1], b[1]);
+        const int ix2 = std::min(a[2], b[2]);
+        const int iy2 = std::min(a[3], b[3]);
+        if (ix2 <= ix1 || iy2 <= iy1) return 0.0;
+        return static_cast<double>(ix2 - ix1) * static_cast<double>(iy2 - iy1);
+    };
+
+    for (auto& b : bubbles) {
+        const auto& tb = b.bbox;
+        const int tw = std::max(1, tb[2] - tb[0]);
+        const int th = std::max(1, tb[3] - tb[1]);
+        const double text_area = static_cast<double>(tw) * static_cast<double>(th);
+        const int cx = (tb[0] + tb[2]) / 2;
+        const int cy = (tb[1] + tb[3]) / 2;
+
+        // 1. Match enclosing RF-DETR speech bubble where >50% of text_bbox lies inside bubble_bbox
+        bool matched_bubble = false;
+        std::array<int, 4> resolved_bubble = tb;
+        if (speech_bubbles && !speech_bubbles->empty()) {
+            double best_overlap = 0.50;
+            double best_area = std::numeric_limits<double>::max();
+            for (const auto& lb : *speech_bubbles) {
+                const double ov = inter_area(tb, lb.bbox) / text_area;
+                if (ov <= 0.50) continue;
+                const double lb_area = static_cast<double>(std::max(1, lb.bbox[2] - lb.bbox[0])) *
+                                       static_cast<double>(std::max(1, lb.bbox[3] - lb.bbox[1]));
+                if (ov > best_overlap + 0.05 || (std::abs(ov - best_overlap) <= 0.05 && lb_area < best_area)) {
+                    best_overlap = ov;
+                    best_area = lb_area;
+                    resolved_bubble = lb.bbox;
+                    matched_bubble = true;
+                }
+            }
+        }
+
+        // Helper: trace outward from text_bbox center along 3 horizontal scanlines (25%, 50%, 75% of text_bbox.height)
+        // until hitting dark ink border pixels (luma < 90) or search boundaries, returning the conservative inner median.
+        struct HorizontalTrace {
+            int left = 0;
+            int right = 0;
+            int left_hits = 0;
+            int right_hits = 0;
+        };
+        auto trace_horizontal_walls = [&](int search_x1, int search_x2) -> HorizontalTrace {
+            const std::array<int, 3> y_scans = {
+                clampi(tb[1] + th / 4, 0, orig_h - 1),
+                clampi(tb[1] + th / 2, 0, orig_h - 1),
+                clampi(tb[1] + (th * 3) / 4, 0, orig_h - 1),
+            };
+            const int start_left = text_mask ? cx : (tb[0] - 1);
+            const int start_right = text_mask ? cx : tb[2];
+
+            std::array<int, 3> left_walls{};
+            std::array<int, 3> right_walls{};
+            int left_hits = 0;
+            int right_hits = 0;
+
+            for (size_t si = 0; si < 3; ++si) {
+                const int sy = y_scans[si];
+
+                int lx = search_x1;
+                for (int x = clampi(start_left, search_x1, orig_w - 1); x >= search_x1; --x) {
+                    if (is_dark_border(x, sy)) {
+                        lx = x + 1;
+                        ++left_hits;
+                        break;
+                    }
+                }
+                left_walls[si] = lx;
+
+                int rx = search_x2;
+                for (int x = clampi(start_right, 0, std::max(0, search_x2 - 1)); x < search_x2; ++x) {
+                    if (is_dark_border(x, sy)) {
+                        rx = x;
+                        ++right_hits;
+                        break;
+                    }
+                }
+                right_walls[si] = rx;
+            }
+
+            std::sort(left_walls.begin(), left_walls.end());
+            std::sort(right_walls.begin(), right_walls.end());
+            return HorizontalTrace{left_walls[1], right_walls[1], left_hits, right_hits};
+        };
+
+        // 2. White-interior bubble wall tracing:
+        //    - When RF-DETR matched a bubble, tighten oversized horizontal bounds (e.g. long tails) to actual ink walls.
+        //    - Otherwise (CTD / narration boxes / unbubbled text), trace outward within panel bounds and safe maxWidth.
+        if (matched_bubble && rgb_data != nullptr) {
+            const int rb_w = std::max(1, resolved_bubble[2] - resolved_bubble[0]);
+            const auto traced = trace_horizontal_walls(resolved_bubble[0], resolved_bubble[2]);
+            if (traced.left_hits >= 2 && traced.right_hits >= 2) {
+                const int tx1 = std::max(resolved_bubble[0], traced.left);
+                const int tx2 = std::min(resolved_bubble[2], traced.right);
+                const int min_valid_w = std::max(tw, static_cast<int>(std::lround(static_cast<double>(rb_w) * 0.45)));
+                if ((tx2 - tx1) >= min_valid_w) {
+                    resolved_bubble[0] = tx1;
+                    resolved_bubble[2] = tx2;
+                }
+            }
+        } else if (!matched_bubble && rgb_data != nullptr) {
+            int lim_x1 = 0;
+            int lim_y1 = 0;
+            int lim_x2 = orig_w;
+            int lim_y2 = orig_h;
+
+            if (panels && !panels->empty()) {
+                double best_ov = 0.50;
+                double best_area = std::numeric_limits<double>::max();
+                for (const auto& p : *panels) {
+                    const double ov = inter_area(tb, p.bbox) / text_area;
+                    if (ov <= 0.50) continue;
+                    const double pa = static_cast<double>(std::max(1, p.bbox[2] - p.bbox[0])) *
+                                      static_cast<double>(std::max(1, p.bbox[3] - p.bbox[1]));
+                    if (ov > best_ov + 0.05 || (std::abs(ov - best_ov) <= 0.05 && pa < best_area)) {
+                        best_ov = ov;
+                        best_area = pa;
+                        lim_x1 = p.bbox[0];
+                        lim_y1 = p.bbox[1];
+                        lim_x2 = p.bbox[2];
+                        lim_y2 = p.bbox[3];
+                    }
+                }
+            }
+
+            // Clamp safely to maxWidth = min(text_bbox.height * 0.68, img_width * 0.24) (never narrower than text_bbox)
+            const double max_w_cap = std::min(
+                static_cast<double>(th) * 0.68,
+                static_cast<double>(orig_w) * 0.24);
+            const int max_w = std::max(tw, static_cast<int>(std::lround(max_w_cap)));
+            const int max_h = std::max(
+                th,
+                static_cast<int>(std::lround(std::min(
+                    static_cast<double>(th) * 1.45,
+                    static_cast<double>(orig_h) * 0.28))));
+
+            const int search_x1 = std::max(lim_x1, cx - max_w / 2);
+            const int search_x2 = std::min(lim_x2, cx + (max_w + 1) / 2);
+            const int search_y1 = std::max(lim_y1, cy - max_h / 2);
+            const int search_y2 = std::min(lim_y2, cy + (max_h + 1) / 2);
+
+            const auto h_trace = trace_horizontal_walls(search_x1, search_x2);
+            int bx1 = h_trace.left;
+            int bx2 = h_trace.right;
+            if ((bx2 - bx1) < tw) {
+                bx1 = tb[0];
+                bx2 = tb[2];
+            }
+
+            // Trace vertical walls along 3 vertical scanlines (25%, 50%, 75% of text_bbox.width)
+            const std::array<int, 3> x_scans = {
+                clampi(tb[0] + tw / 4, 0, orig_w - 1),
+                clampi(tb[0] + tw / 2, 0, orig_w - 1),
+                clampi(tb[0] + (tw * 3) / 4, 0, orig_w - 1),
+            };
+            const int start_top = text_mask ? cy : (tb[1] - 1);
+            const int start_bottom = text_mask ? cy : tb[3];
+
+            std::array<int, 3> top_walls{};
+            std::array<int, 3> bottom_walls{};
+            for (size_t si = 0; si < 3; ++si) {
+                const int sx = x_scans[si];
+
+                int ty = search_y1;
+                for (int y = clampi(start_top, search_y1, orig_h - 1); y >= search_y1; --y) {
+                    if (is_dark_border(sx, y)) {
+                        ty = y + 1;
+                        break;
+                    }
+                }
+                top_walls[si] = ty;
+
+                int by = search_y2;
+                for (int y = clampi(start_bottom, 0, std::max(0, search_y2 - 1)); y < search_y2; ++y) {
+                    if (is_dark_border(sx, y)) {
+                        by = y;
+                        break;
+                    }
+                }
+                bottom_walls[si] = by;
+            }
+            std::sort(top_walls.begin(), top_walls.end());
+            std::sort(bottom_walls.begin(), bottom_walls.end());
+            int by1 = top_walls[1];
+            int by2 = bottom_walls[1];
+            if ((by2 - by1) < th) {
+                by1 = tb[1];
+                by2 = tb[3];
+            }
+
+            if ((bx2 - bx1) > max_w) {
+                const int mid_x = (bx1 + bx2) / 2;
+                bx1 = clampi(mid_x - max_w / 2, lim_x1, lim_x2);
+                bx2 = clampi(bx1 + max_w, lim_x1, lim_x2);
+            }
+            if ((by2 - by1) > max_h) {
+                const int mid_y = (by1 + by2) / 2;
+                by1 = clampi(mid_y - max_h / 2, lim_y1, lim_y2);
+                by2 = clampi(by1 + max_h, lim_y1, lim_y2);
+            }
+
+            resolved_bubble = {
+                clampi(bx1, 0, orig_w),
+                clampi(by1, 0, orig_h),
+                clampi(std::max(bx1 + 1, bx2), 0, orig_w),
+                clampi(std::max(by1 + 1, by2), 0, orig_h),
+            };
+        }
+
+        b.bubble_bbox = resolved_bubble;
+
+        // 3. Balanced 8% inner margin inside interior bubble box so horizontal lines never touch curved oval borders
+        const int bw = std::max(1, b.bubble_bbox[2] - b.bubble_bbox[0]);
+        const int bh = std::max(1, b.bubble_bbox[3] - b.bubble_bbox[1]);
+        const int pad_x = static_cast<int>(std::lround(static_cast<double>(bw) * 0.08));
+        const int pad_y = static_cast<int>(std::lround(static_cast<double>(bh) * 0.08));
+
+        int sx1 = b.bubble_bbox[0] + pad_x;
+        int sx2 = b.bubble_bbox[2] - pad_x;
+        if ((sx2 - sx1) < 16) {
+            const int min_w = std::min(bw, 16);
+            const int mid_x = (b.bubble_bbox[0] + b.bubble_bbox[2]) / 2;
+            sx1 = clampi(mid_x - min_w / 2, b.bubble_bbox[0], b.bubble_bbox[2]);
+            sx2 = clampi(sx1 + min_w, sx1 + 1, b.bubble_bbox[2]);
+        }
+
+        int sy1 = b.bubble_bbox[1] + pad_y;
+        int sy2 = b.bubble_bbox[3] - pad_y;
+        if ((sy2 - sy1) < 16) {
+            const int min_h = std::min(bh, 16);
+            const int mid_y = (b.bubble_bbox[1] + b.bubble_bbox[3]) / 2;
+            sy1 = clampi(mid_y - min_h / 2, b.bubble_bbox[1], b.bubble_bbox[3]);
+            sy2 = clampi(sy1 + min_h, sy1 + 1, b.bubble_bbox[3]);
+        }
+
+        b.safe_bbox = {
+            clampi(sx1, 0, orig_w),
+            clampi(sy1, 0, orig_h),
+            clampi(std::max(sx1 + 1, sx2), 0, orig_w),
+            clampi(std::max(sy1 + 1, sy2), 0, orig_h),
+        };
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Backend 1: Koharu RF-DETR-Seg-2XL (`koharu-layout-rfdetr-seg-2xl-1152.onnx`)
 // -----------------------------------------------------------------------------
@@ -1155,6 +1435,9 @@ DetectionResult TextDetector::run_rfdetr(
         }
     }
 
+    populate_bubble_and_safe_bboxes(
+        bubbles, rgb_data, orig_w, orig_h, &speech_bubbles, &panels, &binary_mask);
+
     DetectionResult result;
     result.width = orig_w;
     result.height = orig_h;
@@ -1374,6 +1657,9 @@ DetectionResult TextDetector::run_comic_text_detector(
             binary_mask[i] &= roi_mask[i];
         }
     }
+
+    populate_bubble_and_safe_bboxes(
+        bubbles, rgb_data, orig_w, orig_h, nullptr, nullptr, &binary_mask);
 
     DetectionResult result;
     result.width = orig_w;

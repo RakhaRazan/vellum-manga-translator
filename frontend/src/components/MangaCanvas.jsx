@@ -237,60 +237,83 @@ function useMaskOverlayCanvas(maskSrc, maskImg) {
 
 /**
  * Extract canonical geometry `{ x, y, width, height, rotation }` from a block.
- * Automatically reshapes tall narrow vertical Japanese strips into readable
- * horizontal boxes when targeting horizontal languages (EN, ID, etc.).
+ * Strictly constrains unpositioned blocks to `safe_bbox` (or `bubble_bbox` inset by 12%),
+ * never expanding wider than the actual speech bubble.
  */
-export function getBlockGeometry(block, imgWidth = 0, targetLang = null) {
-  let x = typeof block?.x === 'number' ? block.x : block?.bbox?.[0] ?? 0;
+export function getBlockGeometry(block) {
+  const rotation = typeof block?.rotation === 'number' ? block.rotation : 0;
+
+  if (
+    typeof block?.x === 'number' &&
+    typeof block?.y === 'number' &&
+    typeof block?.width === 'number' &&
+    typeof block?.height === 'number'
+  ) {
+    return {
+      x: block.x,
+      y: block.y,
+      width: Math.max(20, block.width),
+      height: Math.max(20, block.height),
+      rotation,
+    };
+  }
+
+  if (
+    Array.isArray(block?.safe_bbox) &&
+    block.safe_bbox.length >= 4 &&
+    Number(block.safe_bbox[2]) > Number(block.safe_bbox[0]) &&
+    Number(block.safe_bbox[3]) > Number(block.safe_bbox[1])
+  ) {
+    const sx1 = Number(block.safe_bbox[0]) || 0;
+    const sy1 = Number(block.safe_bbox[1]) || 0;
+    const sx2 = Number(block.safe_bbox[2]) || sx1 + 40;
+    const sy2 = Number(block.safe_bbox[3]) || sy1 + 24;
+    return {
+      x: sx1,
+      y: sy1,
+      width: Math.max(20, sx2 - sx1),
+      height: Math.max(20, sy2 - sy1),
+      rotation,
+    };
+  }
+
+  if (
+    Array.isArray(block?.bubble_bbox) &&
+    block.bubble_bbox.length >= 4 &&
+    Number(block.bubble_bbox[2]) > Number(block.bubble_bbox[0]) &&
+    Number(block.bubble_bbox[3]) > Number(block.bubble_bbox[1])
+  ) {
+    const bx1 = Number(block.bubble_bbox[0]) || 0;
+    const by1 = Number(block.bubble_bbox[1]) || 0;
+    const bx2 = Number(block.bubble_bbox[2]) || bx1 + 40;
+    const by2 = Number(block.bubble_bbox[3]) || by1 + 24;
+    const bw = Math.max(20, bx2 - bx1);
+    const bh = Math.max(20, by2 - by1);
+    const padX = Math.round(bw * 0.08);
+    const padY = Math.round(bh * 0.08);
+    const ix1 = bx1 + padX;
+    const iy1 = by1 + padY;
+    const ix2 = Math.max(ix1 + 16, bx2 - padX);
+    const iy2 = Math.max(iy1 + 16, by2 - padY);
+    return {
+      x: ix1,
+      y: iy1,
+      width: Math.max(16, ix2 - ix1),
+      height: Math.max(16, iy2 - iy1),
+      rotation,
+    };
+  }
+
+  const x = typeof block?.x === 'number' ? block.x : block?.bbox?.[0] ?? 0;
   const y = typeof block?.y === 'number' ? block.y : block?.bbox?.[1] ?? 0;
-  let width =
+  const width =
     typeof block?.width === 'number'
-      ? Math.max(32, block.width)
-      : Math.max(40, (block?.bbox?.[2] ?? 140) - (block?.bbox?.[0] ?? 0));
+      ? Math.max(20, block.width)
+      : Math.max(20, (block?.bbox?.[2] ?? 140) - (block?.bbox?.[0] ?? 0));
   const height =
     typeof block?.height === 'number'
       ? Math.max(20, block.height)
-      : Math.max(24, (block?.bbox?.[3] ?? 60) - (block?.bbox?.[1] ?? 0));
-  const rotation = typeof block?.rotation === 'number' ? block.rotation : 0;
-
-  const resolvedTargetLang = String(
-    targetLang || useEditorStore.getState()?.pipelineConfig?.targetLang || 'id'
-  ).toLowerCase();
-  const isHorizontalTarget = !['ja', 'ja-vert'].includes(resolvedTargetLang);
-
-  if (
-    isHorizontalTarget &&
-    typeof block?.width !== 'number' &&
-    !Array.isArray(block?.bubble_bbox) &&
-    Array.isArray(block?.bbox) &&
-    block.bbox.length >= 4
-  ) {
-    const bx1 = Number(block.bbox[0]) || 0;
-    const by1 = Number(block.bbox[1]) || 0;
-    const bx2 = Number(block.bbox[2]) || bx1 + width;
-    const by2 = Number(block.bbox[3]) || by1 + height;
-    const bboxWidth = Math.max(1, bx2 - bx1);
-    const bboxHeight = Math.max(1, by2 - by1);
-
-    if (bboxHeight > bboxWidth * 1.5 && Math.abs(width - bboxWidth) <= 2) {
-      const maxCap = imgWidth > 0 ? imgWidth * 0.32 : bboxHeight * 0.72;
-      const expandedWidth = Math.round(
-        Math.max(bboxWidth, Math.min(bboxHeight * 0.72, maxCap))
-      );
-      const centerX = bx1 + bboxWidth / 2;
-      let centeredX = Math.round(centerX - expandedWidth / 2);
-      if (imgWidth > 0) {
-        centeredX = Math.max(
-          0,
-          Math.min(centeredX, Math.max(0, imgWidth - expandedWidth))
-        );
-      } else {
-        centeredX = Math.max(0, centeredX);
-      }
-      x = centeredX;
-      width = expandedWidth;
-    }
-  }
+      : Math.max(20, (block?.bbox?.[3] ?? 60) - (block?.bbox?.[1] ?? 0));
 
   return { x, y, width, height, rotation };
 }
@@ -304,71 +327,172 @@ function getMeasureCanvasCtx() {
   return _measureCanvasCtx;
 }
 
-function computeAutoFitFontSize({
-  text,
-  width,
-  height,
-  fontFamily,
-  lineHeight = 1.18,
-  padding = 4,
-  minFontSize = 14,
-  maxFontSize = 28,
-}) {
-  const ctx = getMeasureCanvasCtx();
-  const availW = Math.max(24, width - padding * 2);
-  const availH = Math.max(20, height - padding * 2);
-  const cleanText = String(text || '').trim();
-  if (!ctx || !cleanText) return minFontSize;
+/**
+ * Compute resolution-proportional font bounds from actual page pixel width.
+ * On a 2580px-wide page with defaultFontSize=18: effectiveMaxFont ~ 46px, effectiveMinFont ~ 34px.
+ */
+export function getResolutionFontBounds(imgWidth = 1000, defaultFontSize = 18) {
+  const resScale = Math.max(1, (Number(imgWidth) || 1000) / 1000);
+  const effectiveMaxFont = Math.round((Number(defaultFontSize) || 18) * resScale);
+  const effectiveMinFont = Math.max(12, Math.round(13 * resScale));
+  return {
+    resScale,
+    effectiveMaxFont: Math.max(effectiveMinFont, effectiveMaxFont),
+    effectiveMinFont,
+  };
+}
 
+/**
+ * 2D iterative auto-fit solver (width + height) using offscreen Canvas `measureText`
+ * word-wrapping. Steps `fontSize` down from `effectiveMaxFont` by 1px until BOTH:
+ *   - widest wrapped line <= boxWidth * 0.94
+ *   - total wrapped paragraph height <= boxHeight * 0.94
+ * If a dense paragraph still overflows at `effectiveMinFont`, steps further down safely
+ * so text never overflows outside speech bubble ink borders.
+ */
+export function fitTextToBox(
+  text,
+  boxWidth,
+  boxHeight,
+  fontFamily,
+  effectiveMaxFont = 18,
+  effectiveMinFontOrOpts = 12,
+  extraOpts = {}
+) {
+  const opts =
+    typeof effectiveMinFontOrOpts === 'object' && effectiveMinFontOrOpts !== null
+      ? effectiveMinFontOrOpts
+      : { minFontSize: effectiveMinFontOrOpts, ...extraOpts };
+  const lineHeight = opts.lineHeight ?? 1.18;
+  const cleanText = String(text || '').trim();
+  const minSize = Math.max(10, Math.round(Number(opts.minFontSize) || 12));
+  const startSize = Math.max(minSize, Math.round(Number(effectiveMaxFont) || 18));
+  const ctx = getMeasureCanvasCtx();
+  if (!ctx || !cleanText) {
+    return { fontSize: startSize, text: cleanText };
+  }
+
+  const availW = Math.max(12, Math.min(boxWidth * 0.94, boxWidth - 4));
+  const availH = Math.max(12, Math.min(boxHeight * 0.94, boxHeight - 4));
   const paragraphs = cleanText.split(/\r?\n/);
-  const fitsAtSize = (size) => {
+
+  const breakLongWord = (word) => {
+    const chunks = [];
+    let chunk = '';
+    for (let i = 0; i < word.length; i += 1) {
+      const next = chunk + word[i];
+      if (chunk.length > 0 && ctx.measureText(next).width > availW) {
+        chunks.push(chunk);
+        chunk = word[i];
+      } else {
+        chunk = next;
+      }
+    }
+    if (chunk) chunks.push(chunk);
+    return chunks;
+  };
+
+  const simulateWrap = (size, allowWordBreak) => {
     ctx.font = `bold ${size}px ${fontFamily || 'sans-serif'}`;
-    let lineCount = 0;
+    const lines = [];
+    let maxLineWidth = 0;
+    let hadOversizedWord = false;
+
     for (const para of paragraphs) {
       const words = para.split(/\s+/).filter(Boolean);
       if (words.length === 0) {
-        lineCount += 1;
+        lines.push('');
         continue;
       }
-      let currentLine = words[0];
-      for (let i = 1; i < words.length; i += 1) {
-        const candidate = `${currentLine} ${words[i]}`;
-        if (ctx.measureText(candidate).width <= availW) {
+      let currentLine = '';
+      for (let i = 0; i < words.length; i += 1) {
+        const word = words[i];
+        const wordW = ctx.measureText(word).width;
+        if (wordW > availW) {
+          if (!allowWordBreak) {
+            hadOversizedWord = true;
+            return { fits: false, lines, maxLineWidth: wordW, hadOversizedWord };
+          }
+          if (currentLine) {
+            const lw = ctx.measureText(currentLine).width;
+            if (lw > maxLineWidth) maxLineWidth = lw;
+            lines.push(currentLine);
+            currentLine = '';
+          }
+          const pieces = breakLongWord(word);
+          for (let p = 0; p < pieces.length - 1; p += 1) {
+            const pw = ctx.measureText(pieces[p]).width;
+            if (pw > maxLineWidth) maxLineWidth = pw;
+            lines.push(pieces[p]);
+          }
+          currentLine = pieces[pieces.length - 1] || '';
+          continue;
+        }
+
+        const candidate = currentLine ? `${currentLine} ${word}` : word;
+        const candW = ctx.measureText(candidate).width;
+        if (candW <= availW) {
           currentLine = candidate;
         } else {
-          lineCount += 1;
-          currentLine = words[i];
+          if (currentLine) {
+            const lw = ctx.measureText(currentLine).width;
+            if (lw > maxLineWidth) maxLineWidth = lw;
+            lines.push(currentLine);
+          }
+          currentLine = word;
         }
       }
-      lineCount += 1;
+      if (currentLine) {
+        const lw = ctx.measureText(currentLine).width;
+        if (lw > maxLineWidth) maxLineWidth = lw;
+        lines.push(currentLine);
+      }
     }
-    return lineCount * size * lineHeight <= availH;
+
+    const totalHeight = lines.length * size * lineHeight;
+    const fits = maxLineWidth <= availW && totalHeight <= availH;
+    return { fits, lines, maxLineWidth, totalHeight, hadOversizedWord };
   };
 
-  let best = minFontSize;
-  let lo = minFontSize;
-  let hi = Math.max(minFontSize, Math.round(maxFontSize));
-  while (lo <= hi) {
-    const mid = Math.floor((lo + hi) / 2);
-    if (fitsAtSize(mid)) {
-      best = mid;
-      lo = mid + 1;
-    } else {
-      hi = mid - 1;
+  // Pass 1: Step down fontSize cleanly from effectiveMaxFont to effectiveMinFont without mid-word breaks
+  for (let size = startSize; size >= minSize; size -= 1) {
+    const res = simulateWrap(size, false);
+    if (res.fits) {
+      return { fontSize: size, text: cleanText };
     }
   }
-  return Math.max(minFontSize, best);
+
+  // Pass 2: Safety overflow prevention for unusually cramped/dense bubbles (never spill outside ink borders)
+  const hardMinSize = Math.max(10, Math.round(minSize * 0.5));
+  for (let size = minSize - 1; size >= hardMinSize; size -= 1) {
+    const res = simulateWrap(size, false);
+    if (res.fits) {
+      return { fontSize: size, text: cleanText };
+    }
+  }
+
+  // Pass 3: Allow clean long-word breaking if a single word still exceeded availW
+  for (let size = startSize; size >= hardMinSize; size -= 1) {
+    const res = simulateWrap(size, true);
+    if (res.fits) {
+      return { fontSize: size, text: res.lines.join('\n') };
+    }
+  }
+
+  const fallback = simulateWrap(hardMinSize, true);
+  return { fontSize: hardMinSize, text: fallback.lines.join('\n') || cleanText };
 }
 
 /**
  * Extract canonical Konva typography props shared 1:1 between live canvas and native export.
  */
-export function getBlockTextStyle(block, geom = null, imgWidth = 0) {
+export function getBlockTextStyle(block, geom = null, imgWidth = 1000) {
   const ts = useEditorStore.getState().typesetting;
-  const resolvedImgWidth = Math.max(1, Number(imgWidth) || 1000);
-  const dynamicMinFontSize = Math.max(14, Math.round(resolvedImgWidth * 0.015));
-  const baseFontSize =
-    block?.font_size || block?.style?.font_size || ts?.defaultFontSize || 18;
+  const defaultFontSize = Number(ts?.defaultFontSize) || 18;
+  const { effectiveMaxFont, effectiveMinFont } = getResolutionFontBounds(
+    imgWidth,
+    defaultFontSize
+  );
   const rawFontFamily =
     block?.style?.font_family || block?.font_family || ts?.fontFamily || DEFAULT_FONT_FAMILY;
   const fontFamily = buildKonvaFontFamily(rawFontFamily, ts?.fontFallbackChain);
@@ -390,27 +514,26 @@ export function getBlockTextStyle(block, geom = null, imgWidth = 0) {
       ? Boolean(block.style.all_caps)
       : Boolean(ts?.allCaps);
   const rawText = block?.translated_text || '';
-  const displayText = useAllCaps ? rawText.toUpperCase() : rawText;
+  let displayText = useAllCaps ? rawText.toUpperCase() : rawText;
 
-  let fontSize = baseFontSize;
+  let fontSize = effectiveMaxFont;
   if (ts?.autoFitFontSize !== false && geom && displayText) {
-    const maxFontSize = Math.max(
-      dynamicMinFontSize,
-      baseFontSize,
-      Math.round(resolvedImgWidth * 0.022)
-    );
-    fontSize = computeAutoFitFontSize({
-      text: displayText,
-      width: geom.width,
-      height: geom.height,
+    const fitted = fitTextToBox(
+      displayText,
+      geom.width,
+      geom.height,
       fontFamily,
-      lineHeight,
-      padding: 4,
-      minFontSize: dynamicMinFontSize,
-      maxFontSize,
-    });
-  } else if (ts?.autoFitFontSize !== false) {
-    fontSize = Math.max(dynamicMinFontSize, baseFontSize);
+      effectiveMaxFont,
+      effectiveMinFont,
+      { lineHeight }
+    );
+    fontSize = fitted.fontSize;
+    displayText = fitted.text;
+  } else {
+    const manualSize = Number(block?.font_size || block?.style?.font_size);
+    if (manualSize && manualSize !== defaultFontSize) {
+      fontSize = Math.max(10, Math.round(manualSize));
+    }
   }
 
   return {
@@ -427,7 +550,7 @@ export function getBlockTextStyle(block, geom = null, imgWidth = 0) {
     verticalAlign: 'middle',
     lineHeight,
     wrap: 'word',
-    padding: 4,
+    padding: 2,
   };
 }
 
@@ -851,7 +974,7 @@ const MemoTextNode = React.memo(
         verticalAlign="middle"
         lineHeight={style.lineHeight}
         wrap="word"
-        padding={4}
+        padding={2}
         opacity={isEditingInline ? 0.08 : 1}
         draggable={isInteractive && !isEditingInline}
         listening={isInteractive}
@@ -873,6 +996,7 @@ const MemoTextNode = React.memo(
   },
   (prev, next) =>
     prev.block === next.block &&
+    prev.imgWidth === next.imgWidth &&
     prev.fontRenderKey === next.fontRenderKey &&
     prev.isInteractive === next.isInteractive &&
     prev.isEditingInline === next.isEditingInline &&
@@ -1096,6 +1220,8 @@ const MangaCanvas = forwardRef(function MangaCanvas(
     fontLoadVersion,
     typesettingFontFamily,
     typesettingAllCaps,
+    typesettingDefaultFontSize,
+    typesettingAutoFit,
     canUndo,
     canRedo,
     undoCount,
@@ -1125,6 +1251,8 @@ const MangaCanvas = forwardRef(function MangaCanvas(
       fontLoadVersion: s.fontLoadVersion,
       typesettingFontFamily: s.typesetting?.fontFamily || '',
       typesettingAllCaps: Boolean(s.typesetting?.allCaps),
+      typesettingDefaultFontSize: Number(s.typesetting?.defaultFontSize) || 18,
+      typesettingAutoFit: s.typesetting?.autoFitFontSize !== false,
       canUndo: s.history.past.length > 0,
       canRedo: s.history.future.length > 0,
       undoCount: s.history.past.length,
@@ -1188,7 +1316,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
   const textNodeRefs = useRef({});
   const guideNodeRefs = useRef({});
 
-  const fontRenderKey = `${fontLoadVersion}|${typesettingFontFamily}|${typesettingAllCaps}`;
+  const fontRenderKey = `${fontLoadVersion}|${typesettingFontFamily}|${typesettingAllCaps}|${typesettingDefaultFontSize}|${typesettingAutoFit}`;
 
   // Repaint Konva text nodes instantaneously whenever a dynamic FontFace finishes loading
   // or the global Font Fallback Chain / ALL-CAPS typesetting config changes.
@@ -2031,6 +2159,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
     const nodes = tr.nodes();
     if (nodes.length === 0) return;
 
+    const ts = useEditorStore.getState().typesetting;
     const patches = {};
     for (let i = 0; i < nodes.length; i += 1) {
       const node = nodes[i];
@@ -2041,13 +2170,52 @@ const MangaCanvas = forwardRef(function MangaCanvas(
 
       const newX = Math.round(node.x());
       const newY = Math.round(node.y());
-      const newWidth = Math.round(Math.max(32, node.width() * Math.abs(sx)));
+      const newWidth = Math.round(Math.max(20, node.width() * Math.abs(sx)));
       const newHeight = Math.round(Math.max(20, node.height() * Math.abs(sy)));
       const newRotation = Number(node.rotation().toFixed(2));
 
       node.position({ x: newX, y: newY });
       node.width(newWidth);
       node.height(newHeight);
+
+      const block = (blocks || []).find((b) => b.id === node.id());
+      const { effectiveMaxFont, effectiveMinFont } = getResolutionFontBounds(
+        imageDimsRef.current.width,
+        ts?.defaultFontSize || 18
+      );
+      let nextFontSize = effectiveMaxFont;
+      if (block && ts?.autoFitFontSize !== false) {
+        const rawFontFamily =
+          block?.style?.font_family || block?.font_family || ts?.fontFamily || DEFAULT_FONT_FAMILY;
+        const fontFamily = buildKonvaFontFamily(rawFontFamily, ts?.fontFallbackChain);
+        const lineHeight =
+          block?.style?.line_height || block?.line_height || ts?.defaultLineHeight || 1.18;
+        const useAllCaps =
+          block?.all_caps !== undefined
+            ? Boolean(block.all_caps)
+            : block?.style?.all_caps !== undefined
+            ? Boolean(block.style.all_caps)
+            : Boolean(ts?.allCaps);
+        const rawText = block?.translated_text || '';
+        const displayText = useAllCaps ? rawText.toUpperCase() : rawText;
+        if (displayText) {
+          const fitted = fitTextToBox(
+            displayText,
+            newWidth,
+            newHeight,
+            fontFamily,
+            effectiveMaxFont,
+            effectiveMinFont,
+            { lineHeight }
+          );
+          nextFontSize = fitted.fontSize;
+          node.fontSize(fitted.fontSize);
+          node.text(fitted.text);
+        }
+      } else if (block) {
+        nextFontSize = block?.font_size || block?.style?.font_size || effectiveMaxFont;
+      }
+
       syncGuideNodeToTextNode(node.id(), node);
 
       patches[node.id()] = {
@@ -2057,6 +2225,11 @@ const MangaCanvas = forwardRef(function MangaCanvas(
         height: newHeight,
         rotation: newRotation,
         bbox: [newX, newY, newX + newWidth, newY + newHeight],
+        font_size: nextFontSize,
+        style: {
+          ...(block?.style || {}),
+          font_size: nextFontSize,
+        },
       };
     }
 
@@ -2071,7 +2244,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
     } else if (changedIds.length > 0) {
       updateBlocksBatch(patches, { recordHistory: true });
     }
-  }, [onUpdateBlock, syncGuideNodeToTextNode, updateBlocksBatch]);
+  }, [blocks, onUpdateBlock, syncGuideNodeToTextNode, updateBlocksBatch]);
 
   // ── 60fps Wheel Zoom (rAF Smooth Interpolation) ────────────────────────────
   const handleWheel = useCallback(
@@ -2552,7 +2725,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
     const block = blocks.find((b) => b.id === inlineEditState.id);
     if (!block) return null;
     const geom = getBlockGeometry(block);
-    const style = getBlockTextStyle(block);
+    const style = getBlockTextStyle(block, geom, imageWidth);
     const { scale, x, y } = transformRef.current;
 
     return {
@@ -2568,7 +2741,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
       transform: geom.rotation ? `rotate(${geom.rotation}deg)` : undefined,
       transformOrigin: 'top left',
     };
-  }, [inlineEditState, blocks]);
+  }, [inlineEditState, blocks, imageWidth]);
 
   // ── File Drag & Drop Import ────────────────────────────────────────────────
   const handleDragOver = (e) => {
