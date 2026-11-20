@@ -1,4 +1,4 @@
-# Vellum — Pure Native C++17 + React Manga, Manhwa & Manhua Translator Studio
+# Vellum - Pure Native C++17 + React Manga, Manhwa & Manhua Translator Studio
 
 [![C++17](https://img.shields.io/badge/Backend-C%2B%2B17%20Native-00599C?logo=cplusplus&logoColor=white)](backend-cpp/CMakeLists.txt)
 [![ONNX Runtime](https://img.shields.io/badge/Inference-ONNX%20Runtime%20DirectML%20%7C%20CUDA%20%7C%20CPU-5C2D91)](backend-cpp/src/pipeline/model_manager.cpp)
