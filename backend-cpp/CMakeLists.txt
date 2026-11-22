@@ -4,9 +4,9 @@ if(POLICY CMP0135)
     cmake_policy(SET CMP0135 NEW)
 endif()
 
-project(MangaFlowAI
+project(Vellum
     VERSION 2.0.0
-    DESCRIPTION "MangaFlow AI Native Modern C++17 Backend & WebView2 Desktop Host"
+    DESCRIPTION "Vellum Native Modern C++17 Backend & WebView2 Desktop Host"
     LANGUAGES C CXX
 )
 
@@ -15,11 +15,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(NOT WIN32)
-    message(FATAL_ERROR "MangaFlowAI currently targets Windows x64 (MSVC).")
+    message(FATAL_ERROR "Vellum currently targets Windows x64 (MSVC).")
 endif()
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "MangaFlowAI requires a 64-bit (x64) build. Configure with `-A x64`.")
+    message(FATAL_ERROR "Vellum requires a 64-bit (x64) build. Configure with `-A x64`.")
 endif()
 
 include(FetchContent)
@@ -89,6 +89,9 @@ FetchContent_MakeAvailable(webview)
 # ------------------------------------------------------------------------------
 # 4. Official Prebuilt ONNX Runtime (win-x64: DirectML / CUDA / CPU)
 # ------------------------------------------------------------------------------
+if(DEFINED VELLUM_ORT_BACKEND AND NOT DEFINED MANGAFLOW_ORT_BACKEND)
+    set(MANGAFLOW_ORT_BACKEND "${VELLUM_ORT_BACKEND}")
+endif()
 set(MANGAFLOW_ORT_BACKEND "DIRECTML" CACHE STRING "ONNX Runtime prebuilt backend: DIRECTML, CUDA, or CPU")
 set_property(CACHE MANGAFLOW_ORT_BACKEND PROPERTY STRINGS DIRECTML CUDA CPU)
 set(MANGAFLOW_ORT_URL "" CACHE STRING "Optional custom URL to an official onnxruntime-win-x64 zip/nupkg archive")

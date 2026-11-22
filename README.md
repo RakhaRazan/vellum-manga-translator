@@ -2,7 +2,7 @@
 
 A local desktop app for translating and typesetting Japanese manga, Korean manhwa, and Chinese manhua on Windows.
 
-It runs a native C++17 backend (ONNX Runtime + Edge WebView2) with a React + Konva canvas editor, so you don't need Python, PyTorch, or Electron installed to use it. The whole Windows release zip is under 8 MB.
+It runs as a 100% native Windows desktop application with a pure modern C++17 backend (ONNX Runtime C++ API + Microsoft Edge WebView2) and a React + Konva canvas editor. `Vellum.exe` runs completely standalone with **zero Python runtime dependency** (no Python, PyTorch, CUDA toolkit, or Electron installation required). The whole Windows release zip is under 8 MB.
 
 ## Download
 
@@ -41,7 +41,7 @@ Vellum runs ONNX Runtime with `CUDA -> DirectML -> CPU` fallback (you can force 
 | OCR | `manga-ocr` (JA), `RapidOCR PP-OCRv4` (KO/ZH), `PaddleOCR-VL-1.6` GGUF (optional) |
 | Inpainting | `lama_manga.onnx`, `lama_fp32.onnx` |
 
-If you have an existing Koharu Hugging Face cache with `.safetensors` weights and want to convert them locally, there's a helper script in `packaging/convert_koharu_to_onnx.bat` (requires Python with `torch`, `safetensors`, `onnx`, `transformers`, and `timm`).
+If you have an existing Koharu Hugging Face cache with `.safetensors` weights and want to convert them locally to `.onnx`, an optional standalone developer conversion script is provided in `packaging/convert_koharu_to_onnx.bat` / `packaging/convert_koharu_to_onnx.py` (which requires Python with `torch`, `safetensors`, `onnx`, `transformers`, and `timm`). Note that this is strictly an optional developer helper—standard Vellum users do **not** need Python installed, as pre-converted ONNX models download directly.
 
 ## Building from source
 
@@ -81,13 +81,14 @@ cmake -B build -A x64
 cmake --build build --config Release --parallel
 ```
 
-To build against CUDA or CPU-only ONNX Runtime instead of DirectML, pass `-DMANGAFLOW_ORT_BACKEND=CUDA` or `-DMANGAFLOW_ORT_BACKEND=CPU` to CMake.
+To build against CUDA or CPU-only ONNX Runtime instead of DirectML, pass `-DVELLUM_ORT_BACKEND=CUDA` or `-DVELLUM_ORT_BACKEND=CPU` (or `-DMANGAFLOW_ORT_BACKEND=...`) to CMake.
 
 ### Useful flags & env vars
 
-- `--headless` / `MANGAFLOW_HEADLESS=1` - run the HTTP backend without opening the WebView2 window
-- `MANGAFLOW_DEBUG=1` - enable WebView2 DevTools (`F12`)
-- `MANGAFLOW_PORT=8000` - override the local backend port
+- `--headless` / `VELLUM_HEADLESS=1` (or `MANGAFLOW_HEADLESS=1`) - run the HTTP backend without opening the WebView2 window
+- `VELLUM_DEBUG=1` (or `MANGAFLOW_DEBUG=1`) - enable WebView2 DevTools (`F12`)
+- `VELLUM_PORT=8000` (or `MANGAFLOW_PORT=8000`) - override the local backend port
+- `VELLUM_FRONTEND_DIST=<path>` - specify an explicit directory for `index.html` frontend assets
 - `MANGA_MODELS_DIR=<path>` - use a custom models directory
 - `KOHARU_HF_CACHE=<path>` - point to a custom Koharu Hugging Face cache
 

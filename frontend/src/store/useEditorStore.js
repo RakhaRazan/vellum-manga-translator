@@ -1,10 +1,10 @@
 import { create } from 'zustand';
 
 export const MAX_HISTORY_STEPS = 50;
-export const THEME_STORAGE_KEY = 'mangaflow.theme';
-export const ACCENT_STORAGE_KEY = 'mangaflow.accent';
-export const DENSITY_STORAGE_KEY = 'mangaflow.density';
-export const SETTINGS_STORAGE_KEY = 'mangaflow.settings';
+export const THEME_STORAGE_KEY = 'vellum.theme';
+export const ACCENT_STORAGE_KEY = 'vellum.accent';
+export const DENSITY_STORAGE_KEY = 'vellum.density';
+export const SETTINGS_STORAGE_KEY = 'vellum.settings';
 export const VALID_THEMES = ['dark', 'light', 'system'];
 export const VALID_ACCENTS = ['amber', 'teal', 'crimson', 'slate'];
 export const VALID_DENSITIES = ['compact', 'comfortable'];
@@ -298,10 +298,10 @@ export function buildKonvaFontFamily(
 }
 
 /**
- * Resolve the default FastAPI base URL:
+ * Resolve the default backend API base URL:
  * - Honors `VITE_API_BASE_URL` when explicitly provided.
  * - Defaults to `''` (relative `/api/...` paths) so production builds served directly
- *   by FastAPI (e.g. inside `pywebview` on any dynamically picked loopback port) and
+ *   by the native C++17 HTTP backend (e.g. inside Microsoft Edge WebView2 on any loopback port) and
  *   Vite dev builds (via the `/api` proxy in `vite.config.js`) both work seamlessly
  *   against the active origin with zero hardcoded host/port coupling.
  */
@@ -1101,7 +1101,11 @@ export function applyDensityToDocument(uiDensity) {
 function readStoredValue(key, validList, fallback) {
   if (typeof window === 'undefined') return fallback;
   try {
-    const saved = window.localStorage.getItem(key);
+    let saved = window.localStorage.getItem(key);
+    if (!saved && key.startsWith('vellum.')) {
+      const legacyKey = key.replace(/^vellum\./, 'mangaflow.');
+      saved = window.localStorage.getItem(legacyKey);
+    }
     if (validList.includes(saved)) {
       return saved;
     }
@@ -1114,7 +1118,10 @@ function readStoredValue(key, validList, fallback) {
 function readStoredSettingsSnapshot() {
   if (typeof window === 'undefined') return null;
   try {
-    const raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+    let raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw && SETTINGS_STORAGE_KEY.startsWith('vellum.')) {
+      raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY.replace(/^vellum\./, 'mangaflow.'));
+    }
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     return parsed && typeof parsed === 'object' ? parsed : null;

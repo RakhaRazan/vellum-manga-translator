@@ -3,7 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vellum</title>
+    <meta name="description" content="Vellum - 100% Native C++17 + ONNX Runtime + WebView2 Comic Translation & Typesetting Desktop Studio" />
+    <title>Vellum - Comic Translation & Typesetting Studio</title>
     <link rel="icon" type="image/svg+xml" href="/vellum-logo.svg" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -14,7 +15,10 @@
     <script>
       (function () {
         try {
-          var saved = window.localStorage.getItem('mangaflow.theme') || 'dark';
+          var saved =
+            window.localStorage.getItem('vellum.theme') ||
+            window.localStorage.getItem('mangaflow.theme') ||
+            'dark';
           var resolved =
             saved === 'light'
               ? 'light'

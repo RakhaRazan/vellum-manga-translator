@@ -1106,16 +1106,17 @@ export default function MenuBar({
                     Vellum
                   </div>
                   <div className="text-[11px] font-mono text-studio-text-muted">
-                    v2 Lightweight Local Architecture
+                    v2 Native C++17 + ONNX Runtime · Zero Python
                   </div>
                 </div>
               </div>
 
               <p className="text-studio-text-secondary leading-relaxed">
-                Local-first, offline-capable studio for translating Japanese
-                Manga, Korean Manhwa, and Chinese Manhua using Comic Text
-                Detector (ONNX), manga-ocr / RapidOCR, tile-based LaMa
-                inpainting, and context-aware LLM translation.
+                100% native C++17 desktop application powered by ONNX Runtime C++
+                and Microsoft Edge WebView2. Translates Japanese Manga, Korean Manhwa,
+                and Chinese Manhua using Koharu RF-DETR / Comic Text Detector, manga-ocr /
+                RapidOCR, tile-based LaMa inpainting, and context-aware LLM translation
+                with zero Python runtime dependency.
               </p>
 
               <div className="rounded-studio border border-studio-border bg-studio-surface p-2.5 space-y-1.5 font-mono text-[11px]">

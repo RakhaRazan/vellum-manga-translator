@@ -1,6 +1,6 @@
 #pragma once
 
-// MangaFlow AI — Native C++17 Text & Layout Detector (Phase 10.1)
+// Vellum — Native C++17 Text & Layout Detector (Phase 10.1)
 //
 // Supports:
 //   1. Primary : Koharu RF-DETR-Seg-2XL (`koharu-layout-rfdetr-seg-2xl-1152.onnx`)

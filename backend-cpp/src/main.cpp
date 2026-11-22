@@ -103,7 +103,11 @@ std::optional<fs::path> resolve_frontend_dist(const fs::path& exe_dir) {
                fs::is_regular_file(candidate / L"index.html", ec);
     };
 
-    if (auto env_dist = util::get_env_wide(L"MANGAFLOW_FRONTEND_DIST")) {
+    auto env_dist = util::get_env_wide(L"VELLUM_FRONTEND_DIST");
+    if (!env_dist.has_value()) {
+        env_dist = util::get_env_wide(L"MANGAFLOW_FRONTEND_DIST");
+    }
+    if (env_dist.has_value()) {
         fs::path candidate(*env_dist);
         if (is_valid_dist(candidate)) {
             std::error_code ec;
@@ -3556,7 +3560,8 @@ int WINAPI WinMain(
     using namespace mangaflow;
 
     const std::string cmd_line = lpCmdLine ? std::string(lpCmdLine) : std::string();
-    const bool headless = util::env_flag_enabled(L"MANGAFLOW_HEADLESS") ||
+    const bool headless = util::env_flag_enabled(L"VELLUM_HEADLESS") ||
+                          util::env_flag_enabled(L"MANGAFLOW_HEADLESS") ||
                           cmd_line.find("--headless") != std::string::npos;
 
     const fs::path exe_dir = get_executable_dir();
@@ -3597,7 +3602,11 @@ int WINAPI WinMain(
     register_routes(server, ctx);
 
     int preferred_port = kDefaultPort;
-    if (auto env_port = util::get_env_utf8(L"MANGAFLOW_PORT")) {
+    auto env_port = util::get_env_utf8(L"VELLUM_PORT");
+    if (!env_port) {
+        env_port = util::get_env_utf8(L"MANGAFLOW_PORT");
+    }
+    if (env_port) {
         try {
             preferred_port = std::stoi(*env_port);
         } catch (...) {
@@ -3654,7 +3663,8 @@ int WINAPI WinMain(
 
     int exit_code = 0;
     try {
-        const bool debug_devtools = util::env_flag_enabled(L"MANGAFLOW_DEBUG");
+        const bool debug_devtools = util::env_flag_enabled(L"VELLUM_DEBUG") ||
+                                    util::env_flag_enabled(L"MANGAFLOW_DEBUG");
         webview::webview window(debug_devtools, nullptr);
 
         if (auto native_win = window.window(); native_win.ok()) {

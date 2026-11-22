@@ -1,6 +1,6 @@
 #pragma once
 
-// MangaFlow AI — Native C++17 Tile-Based LaMa ONNX Inpainter (Phase 10.2)
+// Vellum — Native C++17 Tile-Based LaMa ONNX Inpainter (Phase 10.2)
 //
 // Uses local LaMa ONNX weights via `ModelManager::resolve_lama_model()`
 // (prefers Koharu's manga screentone `lama_manga.onnx`, falls back to `lama_fp32.onnx`).

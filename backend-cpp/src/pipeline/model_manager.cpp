@@ -357,7 +357,11 @@ std::optional<fs::path> find_koharu_converter_script(const std::optional<fs::pat
 
 std::optional<fs::path> find_python_executable(const fs::path& repo_root) {
     std::error_code ec;
-    if (auto env_py = util::get_env_wide(L"MANGA_PYTHON_EXE"); env_py.has_value() && !env_py->empty()) {
+    auto env_py = util::get_env_wide(L"VELLUM_PYTHON_EXE");
+    if (!env_py.has_value() || env_py->empty()) {
+        env_py = util::get_env_wide(L"MANGA_PYTHON_EXE");
+    }
+    if (env_py.has_value() && !env_py->empty()) {
         const fs::path p(*env_py);
         if (fs::is_regular_file(p, ec) && !ec) {
             return p;

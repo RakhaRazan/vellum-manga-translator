@@ -2159,7 +2159,7 @@ export default function SettingsModal({
 
                 <SectionCard
                   title="Memory & VRAM Lifecycle"
-                  subtitle="Follows SPEC.md v2 aggressive lazy-loading and session-unloading architecture."
+                  subtitle="Native C++17 ONNX Runtime lazy-loading and session-unloading lifecycle."
                 >
                   <div className="space-y-3">
                     <div className="flex items-center justify-between gap-3">
@@ -2171,7 +2171,7 @@ export default function SettingsModal({
                           Auto-Unload VRAM After Each Stage
                         </label>
                         <p className="text-[11px] text-studio-text-muted">
-                          Immediately runs <code>unload()</code> + <code>gc.collect()</code> after Detect, OCR, and LaMa so idle VRAM stays near zero.
+                          Immediately releases and resets ONNX Runtime sessions after Detect, OCR, and LaMa so idle VRAM and memory stay near zero.
                         </p>
                       </div>
                       <ToggleSwitch

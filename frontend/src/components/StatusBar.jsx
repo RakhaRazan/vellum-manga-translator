@@ -45,7 +45,7 @@ export function formatShortModelName(modelName) {
 
 /**
  * Compact 24px native desktop studio bottom status bar.
- * Displays live zoom %, cursor XY coordinates, active ONNX GPU/CPU provider,
+ * Displays live zoom %, cursor XY coordinates, active ONNX Runtime GPU/CPU provider,
  * and active LLM provider/model telemetry.
  */
 export default function StatusBar({

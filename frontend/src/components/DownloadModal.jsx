@@ -226,7 +226,7 @@ export default function DownloadModal({
       setStreamStatus((prev) => {
         if (prev === 'completed') return prev;
         setErrorMessage(
-          `Lost connection to backend SSE endpoint (${apiBaseUrl}/api/models/download). Ensure FastAPI server is running.`
+          `Lost connection to backend SSE endpoint (${apiBaseUrl}/api/models/download). Ensure native C++17 backend server is running.`
         );
         return 'error';
       });

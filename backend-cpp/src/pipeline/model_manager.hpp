@@ -1,6 +1,6 @@
 #pragma once
 
-// MangaFlow AI — Native C++17 Model Manager & ONNX Runtime Session Factory (Phase 10.1)
+// Vellum — Native C++17 Model Manager & ONNX Runtime Session Factory (Phase 10.1)
 //
 // Features:
 // - Persistent model storage at `<portable_root>\models` (or `MANGA_MODELS_DIR`).

@@ -1,6 +1,6 @@
 #pragma once
 
-// MangaFlow AI — Native C++17 Multi-Language OCR Router (Phase 10.2)
+// Vellum — Native C++17 Multi-Language OCR Router (Phase 10.2)
 //
 // Routes speech bubble OCR per `source_lang` using ONNX Runtime C++ API (`Ort::Session`)
 // and `stb_image.h` (zero OpenCV / Python dependency):

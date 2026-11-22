@@ -317,7 +317,7 @@ export default function App() {
     setSupportedTargetLanguages,
   ]);
 
-  // 1. Startup Check: Query GET /api/models/status (with retry while FastAPI backend initializes)
+  // 1. Startup Check: Query GET /api/models/status (with retry while native C++17 backend initializes)
   const checkModelsStatus = useCallback(async () => {
     setStartupChecking(true);
     setStartupError(null);
@@ -359,7 +359,7 @@ export default function App() {
       apiBaseUrl || (typeof window !== 'undefined' ? window.location.origin : '');
     setStartupError(
       lastErr?.message ||
-        `Unable to reach FastAPI backend at ${displayOrigin}/api/models/status`
+        `Unable to reach native C++17 backend at ${displayOrigin}/api/models/status`
     );
     setIsWorkspaceUnlocked(false);
     setStartupChecking(false);
@@ -1220,7 +1220,7 @@ export default function App() {
     [activePage, apiBaseUrl, targetLang, importBaseName]
   );
 
-  // Export multi-page project as 1:1 native-resolution .cbz or .pdf via FastAPI exporter endpoints
+  // Export multi-page project as 1:1 native-resolution .cbz or .pdf via native C++17 exporter endpoints
   const handleExportMultiPage = useCallback(
     async (format) => {
       if (pages.length === 0) return;
@@ -1406,10 +1406,9 @@ export default function App() {
           type: blob.type || 'image/jpeg',
         });
 
-        const archiveLabel = data.archive_name || archiveFile.name || '';
-        const archiveStem = archiveLabel.replace(/\.[^/.]+$/, '');
-        if (archiveStem) {
-          setImportBaseName(archiveStem);
+        const sampleStem = filename.replace(/\.[^/.]+$/, '');
+        if (sampleStem) {
+          setImportBaseName(sampleStem);
         }
 
         const timestamp = Date.now();

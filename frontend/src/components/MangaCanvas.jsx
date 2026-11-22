@@ -729,7 +729,7 @@ export async function compositePageToBlob(
 }
 
 /**
- * Composite multiple pages at exact 1:1 native resolution and submit to FastAPI
+ * Composite multiple pages at exact 1:1 native resolution and submit to native C++17 backend
  * `/api/export/cbz` or `/api/export/pdf`.
  */
 export async function exportPagesArchive(

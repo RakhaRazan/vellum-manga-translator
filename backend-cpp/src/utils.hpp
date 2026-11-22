@@ -1,6 +1,6 @@
 #pragma once
 
-// Shared lightweight Windows/UTF-8/filesystem/encoding utilities for MangaFlow AI C++17 modules.
+// Shared lightweight Windows/UTF-8/filesystem/encoding utilities for Vellum C++17 modules.
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -167,7 +167,7 @@ inline fs::path get_portable_root_dir() {
         return exe_dir;
     }
 
-    // Support running from `Manga/MangaFlow_Cpp/` or `Manga/backend-cpp/build/Release/`
+    // Support running from Vellum directory or backend-cpp/build/Release/
     // by walking up to the portable root `Manga/` directory if present.
     fs::path cursor = exe_dir;
     for (int depth = 0; depth < 4; ++depth) {
