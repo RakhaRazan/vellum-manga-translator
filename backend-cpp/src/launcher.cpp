@@ -1,4 +1,4 @@
-// Vellum — One-Click Native Win32 Launcher (`Vellum.exe`)
+// Vellum - One-Click Native Win32 Launcher (`Vellum.exe`)
 //
 // Zero-console, zero-.NET, <5ms native Win32 launcher placed in the root
 // folder. Double-clicking it immediately spawns

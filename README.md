@@ -41,7 +41,7 @@ Vellum runs ONNX Runtime with `CUDA -> DirectML -> CPU` fallback (you can force 
 | OCR | `manga-ocr` (JA), `RapidOCR PP-OCRv4` (KO/ZH), `PaddleOCR-VL-1.6` GGUF (optional) |
 | Inpainting | `lama_manga.onnx`, `lama_fp32.onnx` |
 
-If you have an existing Koharu Hugging Face cache with `.safetensors` weights and want to convert them locally to `.onnx`, an optional standalone developer conversion script is provided in `packaging/convert_koharu_to_onnx.bat` / `packaging/convert_koharu_to_onnx.py` (which requires Python with `torch`, `safetensors`, `onnx`, `transformers`, and `timm`). Note that this is strictly an optional developer helper—standard Vellum users do **not** need Python installed, as pre-converted ONNX models download directly.
+If you have an existing Koharu Hugging Face cache with `.safetensors` weights and want to convert them locally to `.onnx`, an optional standalone developer conversion script is provided in `packaging/convert_koharu_to_onnx.bat` / `packaging/convert_koharu_to_onnx.py` (which requires Python with `torch`, `safetensors`, `onnx`, `transformers`, and `timm`). Note that this is strictly an optional developer helper-standard Vellum users do **not** need Python installed, as pre-converted ONNX models download directly.
 
 ## Building from source
 

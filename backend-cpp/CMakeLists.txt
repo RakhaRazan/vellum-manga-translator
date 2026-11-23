@@ -92,27 +92,47 @@ FetchContent_MakeAvailable(webview)
 if(DEFINED VELLUM_ORT_BACKEND AND NOT DEFINED MANGAFLOW_ORT_BACKEND)
     set(MANGAFLOW_ORT_BACKEND "${VELLUM_ORT_BACKEND}")
 endif()
-set(MANGAFLOW_ORT_BACKEND "DIRECTML" CACHE STRING "ONNX Runtime prebuilt backend: DIRECTML, CUDA, or CPU")
-set_property(CACHE MANGAFLOW_ORT_BACKEND PROPERTY STRINGS DIRECTML CUDA CPU)
+set(MANGAFLOW_ORT_BACKEND "AUTO" CACHE STRING "ONNX Runtime prebuilt backend: AUTO, CUDA, DIRECTML, or CPU")
+set_property(CACHE MANGAFLOW_ORT_BACKEND PROPERTY STRINGS AUTO CUDA DIRECTML CPU)
 set(MANGAFLOW_ORT_URL "" CACHE STRING "Optional custom URL to an official onnxruntime-win-x64 zip/nupkg archive")
+
+set(_RESOLVED_ORT_BACKEND "${MANGAFLOW_ORT_BACKEND}")
+if(_RESOLVED_ORT_BACKEND STREQUAL "AUTO")
+    # Probe CUDA 12 + cuDNN 9 DLLs on PATH, CUDA_PATH, NVIDIA Toolkit, or LM Studio before falling back to DirectML
+    set(_CUDA_SEARCH_DIRS "")
+    if(DEFINED ENV{CUDA_PATH} AND EXISTS "$ENV{CUDA_PATH}/bin")
+        list(APPEND _CUDA_SEARCH_DIRS "$ENV{CUDA_PATH}/bin")
+    endif()
+    file(GLOB _NVIDIA_CUDA_BINS "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.*/bin")
+    list(APPEND _CUDA_SEARCH_DIRS ${_NVIDIA_CUDA_BINS})
+    find_file(_FOUND_CUBLAS12 NAMES cublas64_12.dll PATHS ${_CUDA_SEARCH_DIRS})
+    find_file(_FOUND_CUDNN9 NAMES cudnn64_9.dll PATHS ${_CUDA_SEARCH_DIRS})
+    if(_FOUND_CUBLAS12 AND _FOUND_CUDNN9)
+        set(_RESOLVED_ORT_BACKEND "CUDA")
+        message(STATUS "[Vellum] Detected CUDA 12 + cuDNN 9 (${_FOUND_CUBLAS12}) -> selecting CUDAExecutionProvider")
+    else()
+        set(_RESOLVED_ORT_BACKEND "DIRECTML")
+        message(STATUS "[Vellum] CUDA 12 + cuDNN 9 DLLs not found on system -> selecting DmlExecutionProvider")
+    endif()
+endif()
 
 if(MANGAFLOW_ORT_URL)
     set(_ORT_DOWNLOAD_URL "${MANGAFLOW_ORT_URL}")
     set(_ORT_DOWNLOAD_NAME "onnxruntime-win-x64-custom.zip")
-elseif(MANGAFLOW_ORT_BACKEND STREQUAL "DIRECTML")
+elseif(_RESOLVED_ORT_BACKEND STREQUAL "DIRECTML")
     set(_ORT_VERSION "1.24.4")
     set(_ORT_DOWNLOAD_URL "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/${_ORT_VERSION}/microsoft.ml.onnxruntime.directml.${_ORT_VERSION}.nupkg")
     set(_ORT_DOWNLOAD_NAME "onnxruntime-win-x64-directml-${_ORT_VERSION}.zip")
-elseif(MANGAFLOW_ORT_BACKEND STREQUAL "CUDA")
-    set(_ORT_VERSION "1.32.0")
+elseif(_RESOLVED_ORT_BACKEND STREQUAL "CUDA")
+    set(_ORT_VERSION "1.24.4")
     set(_ORT_DOWNLOAD_URL "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.gpu.windows/${_ORT_VERSION}/microsoft.ml.onnxruntime.gpu.windows.${_ORT_VERSION}.nupkg")
     set(_ORT_DOWNLOAD_NAME "onnxruntime-win-x64-gpu-${_ORT_VERSION}.zip")
-elseif(MANGAFLOW_ORT_BACKEND STREQUAL "CPU")
-    set(_ORT_VERSION "1.32.0")
+elseif(_RESOLVED_ORT_BACKEND STREQUAL "CPU")
+    set(_ORT_VERSION "1.24.4")
     set(_ORT_DOWNLOAD_URL "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${_ORT_VERSION}/microsoft.ml.onnxruntime.${_ORT_VERSION}.nupkg")
     set(_ORT_DOWNLOAD_NAME "onnxruntime-win-x64-${_ORT_VERSION}.zip")
 else()
-    message(FATAL_ERROR "Invalid MANGAFLOW_ORT_BACKEND='${MANGAFLOW_ORT_BACKEND}'. Choose DIRECTML, CUDA, or CPU.")
+    message(FATAL_ERROR "Invalid MANGAFLOW_ORT_BACKEND='${MANGAFLOW_ORT_BACKEND}'. Choose AUTO, CUDA, DIRECTML, or CPU.")
 endif()
 
 FetchContent_Declare(
@@ -200,7 +220,7 @@ set_target_properties(stb::headers PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${stb_headers_SOURCE_DIR}"
 )
 
-message(STATUS "[Vellum] ONNX Runtime backend : ${MANGAFLOW_ORT_BACKEND}")
+message(STATUS "[Vellum] ONNX Runtime backend : ${MANGAFLOW_ORT_BACKEND} (resolved: ${_RESOLVED_ORT_BACKEND})")
 message(STATUS "[Vellum] ONNX Runtime include : ${ONNXRUNTIME_INCLUDE_DIR}")
 message(STATUS "[Vellum] ONNX Runtime lib dir : ${ONNXRUNTIME_LIB_DIR}")
 message(STATUS "[Vellum] DirectML header      : ${MANGAFLOW_HAS_DML}")
@@ -228,6 +248,19 @@ add_executable(MangaFlowAI WIN32
     src/settings_manager.cpp
     src/font_manager.cpp
     src/exporter.cpp
+    src/detector/detector_types.hpp
+    src/detector/detector_engine.hpp
+    src/detector/detector_engine.cpp
+    src/detector/geometry_postproc.hpp
+    src/detector/geometry_postproc.cpp
+    src/detector/yolo_seg_backend.hpp
+    src/detector/yolo_seg_backend.cpp
+    src/detector/rfdetr_seg_backend.hpp
+    src/detector/rfdetr_seg_backend.cpp
+    src/detector/adaptive_tiler.hpp
+    src/detector/adaptive_tiler.cpp
+    src/detector/export_artifacts.hpp
+    src/detector/export_artifacts.cpp
     src/pipeline/model_manager.cpp
     src/pipeline/detector.cpp
     src/pipeline/ocr.cpp
@@ -336,3 +369,64 @@ if(MSVC)
         $<$<CONFIG:Release>:/OPT:ICF>
     )
 endif()
+
+# ------------------------------------------------------------------------------
+# 8. Standalone Detector Engine v2 Benchmark CLI (`vellum_det_bench.exe`)
+# ------------------------------------------------------------------------------
+add_executable(vellum_det_bench
+    src/detector/vellum_det_bench.cpp
+    src/detector/detector_types.hpp
+    src/detector/detector_engine.hpp
+    src/detector/detector_engine.cpp
+    src/detector/geometry_postproc.hpp
+    src/detector/geometry_postproc.cpp
+    src/detector/yolo_seg_backend.hpp
+    src/detector/yolo_seg_backend.cpp
+    src/detector/rfdetr_seg_backend.hpp
+    src/detector/rfdetr_seg_backend.cpp
+    src/detector/adaptive_tiler.hpp
+    src/detector/adaptive_tiler.cpp
+    src/detector/export_artifacts.hpp
+    src/detector/export_artifacts.cpp
+    src/pipeline/detector.cpp
+    src/pipeline/model_manager.cpp
+)
+
+target_compile_features(vellum_det_bench PRIVATE cxx_std_17)
+
+target_compile_definitions(vellum_det_bench PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    _WIN32_WINNT=0x0A00
+    MANGAFLOW_HAS_DML=${MANGAFLOW_HAS_DML}
+)
+
+if(MSVC)
+    target_compile_options(vellum_det_bench PRIVATE
+        /W4
+        /utf-8
+        /permissive-
+        /EHsc
+        /MP
+        $<$<CONFIG:Release>:/O2>
+        $<$<CONFIG:Release>:/GL>
+        $<$<CONFIG:Release>:/Gy>
+        $<$<CONFIG:Release>:/Gw>
+    )
+    target_link_options(vellum_det_bench PRIVATE
+        $<$<CONFIG:Release>:/LTCG>
+        $<$<CONFIG:Release>:/INCREMENTAL:NO>
+        $<$<CONFIG:Release>:/OPT:REF>
+        $<$<CONFIG:Release>:/OPT:ICF>
+    )
+endif()
+
+target_link_libraries(vellum_det_bench PRIVATE
+    nlohmann_json::nlohmann_json
+    onnxruntime::onnxruntime
+    stb::headers
+    psapi
+    dxgi
+    winhttp
+    ws2_32
+)

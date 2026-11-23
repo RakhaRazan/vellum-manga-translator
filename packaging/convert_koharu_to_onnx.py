@@ -1371,7 +1371,7 @@ def main() -> int:
         else {m.strip().lower() for m in args.models.split(",") if m.strip()}
     )
 
-    print("=== Vellum — Koharu 4-Model Cache Bridge ===")
+    print("=== Vellum - Koharu 4-Model Cache Bridge ===")
     print(f"  Koharu cache : {cache_root}")
     print(f"  Output dir   : {output_dir}")
     print(f"  Selected     : {sorted(selected)}")

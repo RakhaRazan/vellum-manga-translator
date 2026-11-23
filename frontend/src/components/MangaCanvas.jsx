@@ -517,7 +517,10 @@ export function getBlockTextStyle(block, geom = null, imgWidth = 1000) {
   let displayText = useAllCaps ? rawText.toUpperCase() : rawText;
 
   let fontSize = effectiveMaxFont;
-  if (ts?.autoFitFontSize !== false && geom && displayText) {
+  const manualSize = Number(block?.font_size || block?.style?.font_size);
+  if (block?.manualFontSize && manualSize > 0) {
+    fontSize = Math.max(8, Math.round(manualSize));
+  } else if (ts?.autoFitFontSize !== false && geom && displayText) {
     const fitted = fitTextToBox(
       displayText,
       geom.width,
@@ -529,11 +532,8 @@ export function getBlockTextStyle(block, geom = null, imgWidth = 1000) {
     );
     fontSize = fitted.fontSize;
     displayText = fitted.text;
-  } else {
-    const manualSize = Number(block?.font_size || block?.style?.font_size);
-    if (manualSize && manualSize !== defaultFontSize) {
-      fontSize = Math.max(10, Math.round(manualSize));
-    }
+  } else if (manualSize && manualSize !== defaultFontSize) {
+    fontSize = Math.max(10, Math.round(manualSize));
   }
 
   return {
@@ -650,8 +650,7 @@ export function compositePageToDataUrl(
     baseImageEl,
     format
   );
-  const resolvedPixelRatio =
-    pixelRatio ?? (Math.max(width, height) > 2800 ? 1.5 : 2);
+  const resolvedPixelRatio = pixelRatio ?? 1;
   try {
     return stage.toDataURL({
       x: 0,
@@ -700,8 +699,7 @@ export async function compositePageToBlob(
     baseImg,
     format
   );
-  const resolvedPixelRatio =
-    pixelRatio ?? (Math.max(width, height) > 2800 ? 1.5 : 2);
+  const resolvedPixelRatio = pixelRatio ?? 1;
 
   try {
     const canvas = stage.toCanvas({
@@ -839,7 +837,7 @@ export async function exportPagesArchive(
         onProgress({ current: uploadedCount, total: pages.length, phase: 'finalizing' });
       }
       const finResp = await fetch(
-        `${base}/api/export/session/${encodeURIComponent(sessionId)}/finalize`,
+        `${base}/api/export/session/${encodeURIComponent(sessionId)}/finalize?return_url=true`,
         { method: 'POST' }
       );
       if (!finResp.ok) {
@@ -847,11 +845,12 @@ export async function exportPagesArchive(
         throw new Error(errJson?.detail || `Export finalize HTTP ${finResp.status}`);
       }
 
-      const outBlob = await finResp.blob();
+      const finJson = await finResp.json();
+      const downloadUrl = resolveImageSrc(finJson.download_url, apiBaseUrl);
       return {
-        blob: outBlob,
-        filename: `${filename}.${fmt}`,
-        pageCount: uploadedCount,
+        downloadUrl,
+        filename: finJson.filename || `${filename}.${fmt}`,
+        pageCount: finJson.page_count || uploadedCount,
       };
     } catch (err) {
       fetch(`${base}/api/export/session/${encodeURIComponent(sessionId)}/cancel`, {
@@ -2226,6 +2225,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
         rotation: newRotation,
         bbox: [newX, newY, newX + newWidth, newY + newHeight],
         font_size: nextFontSize,
+        manualFontSize: false,
         style: {
           ...(block?.style || {}),
           font_size: nextFontSize,
@@ -2941,7 +2941,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
           onMouseLeave={handleStagePointerLeave}
           onTouchStart={handleStagePointerDown}
         >
-          {/* LAYER 1: Dedicated Static Base / Inpainted Image Layer — listening={false} for 60fps */}
+          {/* LAYER 1: Dedicated Static Base / Inpainted Image Layer - listening={false} for 60fps */}
           <Layer ref={baseLayerRef} listening={false} perfectDrawEnabled={false}>
             {/* Subtle page backdrop & drop shadow */}
             <KonvaRect
@@ -3000,7 +3000,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
             )}
           </Layer>
 
-          {/* LAYER 2: Dedicated Inpaint Mask Overlay Layer — listening={false} */}
+          {/* LAYER 2: Dedicated Inpaint Mask Overlay Layer - listening={false} */}
           <Layer
             ref={maskLayerRef}
             listening={false}
@@ -3070,7 +3070,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
             </KonvaGroup>
           </Layer>
 
-          {/* LAYER 4: Bounding Boxes & Reading Order #1/#2 Guides — listening={false} */}
+          {/* LAYER 4: Bounding Boxes & Reading Order #1/#2 Guides - listening={false} */}
           <Layer
             ref={boxesLayerRef}
             listening={false}
@@ -3322,7 +3322,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
               type="button"
               onClick={undo}
               disabled={!canUndo}
-              title={canUndo ? `Undo (${undoCount}) — Ctrl+Z` : 'Undo (Ctrl+Z)'}
+              title={canUndo ? `Undo (${undoCount}) - Ctrl+Z` : 'Undo (Ctrl+Z)'}
               aria-label="Undo"
               data-testid="canvas-undo-btn"
               className="h-6 w-6 inline-flex items-center justify-center rounded-studio-sm text-studio-text-secondary hover:text-studio-text hover:bg-studio-hover disabled:opacity-35 disabled:pointer-events-none transition-colors cursor-pointer"
@@ -3333,7 +3333,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
               type="button"
               onClick={redo}
               disabled={!canRedo}
-              title={canRedo ? `Redo (${redoCount}) — Ctrl+Y` : 'Redo (Ctrl+Y)'}
+              title={canRedo ? `Redo (${redoCount}) - Ctrl+Y` : 'Redo (Ctrl+Y)'}
               aria-label="Redo"
               data-testid="canvas-redo-btn"
               className="h-6 w-6 inline-flex items-center justify-center rounded-studio-sm text-studio-text-secondary hover:text-studio-text hover:bg-studio-hover disabled:opacity-35 disabled:pointer-events-none transition-colors cursor-pointer"

@@ -1043,7 +1043,7 @@ export default function TextSidebar({
                   onChange={(e) =>
                     onUpdateBlock(
                       selectedBlock.id,
-                      { font_size: Number(e.target.value) },
+                      { font_size: Number(e.target.value), manualFontSize: true },
                       { coalesceKey: `fontsize:${selectedBlock.id}` }
                     )
                   }
@@ -1062,6 +1062,7 @@ export default function TextSidebar({
                           8,
                           Math.min(96, Number(e.target.value) || 18)
                         ),
+                        manualFontSize: true,
                       },
                       { coalesceKey: `fontsize:${selectedBlock.id}` }
                     )

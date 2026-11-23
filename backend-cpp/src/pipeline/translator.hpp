@@ -1,6 +1,6 @@
 #pragma once
 
-// Vellum — Native C++17 Multi-Provider Context-Aware Comic Translator (Phase 10.3)
+// Vellum - Native C++17 Multi-Provider Context-Aware Comic Translator (Phase 10.3)
 //
 // Koharu-style multi-provider LLM translation engine using:
 //   - `cpp-httplib` for local/plain HTTP endpoints (`lmstudio`, `ollama`, HTTP `custom`)

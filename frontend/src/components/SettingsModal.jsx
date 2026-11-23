@@ -238,6 +238,7 @@ function mergePipelineModelOptions(defaults, apiEntries) {
     return {
       id: item.id,
       label: item.label || live?.name || item.name || item.id,
+      hardwareTag: item.hardwareTag || live?.hardware_target || null,
       description: live?.description || item.description || '',
       installed,
       readyForInference,
@@ -263,6 +264,7 @@ function mergePipelineModelOptions(defaults, apiEntries) {
       merged.push({
         id: live.id,
         label: live.name || live.id,
+        hardwareTag: live.hardware_target || null,
         description: live.description || '',
         installed,
         readyForInference,
@@ -317,7 +319,7 @@ function ModelStatusBadge({ model, isLoading, testId }) {
   }
 
   const missingTip = model.needsConversion
-    ? 'Cached in Koharu as .safetensors — click "Import Local Koharu Models" to convert to ONNX.'
+    ? 'Cached in Koharu as .safetensors - click "Import Local Koharu Models" to convert to ONNX.'
     : 'Model weights are not installed locally.';
 
   return (
@@ -327,7 +329,105 @@ function ModelStatusBadge({ model, isLoading, testId }) {
       className="inline-flex items-center gap-1.5 rounded-studio-sm border border-studio-warning/40 bg-studio-warning/10 px-2 py-0.5 text-[10px] font-mono font-medium text-studio-warning shrink-0"
     >
       <span className="h-1.5 w-1.5 rounded-full bg-studio-warning" />
-      <span>Not Installed</span>
+      <span>Missing .onnx</span>
+    </span>
+  );
+}
+
+function normalizeExecMode(mode) {
+  const m = String(mode || 'hybrid').toLowerCase();
+  if (m === 'cpu' || m === 'cpu_only') return 'cpu_only';
+  if (m === 'gpu' || m === 'force_gpu') return 'force_gpu';
+  return 'hybrid';
+}
+
+function StageHardwareBadge({
+  stage,
+  draftMode,
+  selectedModel,
+  modelInfo,
+  runtimeStatus,
+  testId,
+}) {
+  const mode = normalizeExecMode(draftMode);
+  const liveProvider =
+    stage === 'detect'
+      ? runtimeStatus?.detectorProvider
+      : stage === 'ocr'
+      ? runtimeStatus?.ocrProvider
+      : runtimeStatus?.inpainterProvider;
+
+  let isGpu = false;
+  let label = 'CPU (Fast AVX2)';
+
+  const modelId = String(selectedModel || modelInfo?.id || '').toLowerCase();
+
+  if (mode === 'cpu_only') {
+    isGpu = false;
+    label = 'CPU (Fast AVX2)';
+  } else if (stage === 'ocr') {
+    if (modelId === 'paddleocr-vl-1.6' || modelId === 'paddleocr-vl-gguf') {
+      isGpu = true;
+      label = 'VLM • Multi-Lang';
+    } else if (modelId === 'manga-ocr') {
+      isGpu = mode === 'force_gpu';
+      label = mode === 'force_gpu' ? 'GPU • Japanese' : 'CPU • Japanese';
+    } else if (modelId === 'baberu-ocr') {
+      isGpu = mode === 'force_gpu';
+      label = mode === 'force_gpu' ? 'GPU • JA/ZH/EN Fast' : 'CPU • JA/ZH/EN Fast';
+    } else if (modelId === 'hayai-ocr') {
+      isGpu = true;
+      label = 'GPU/CPU • JA/ZH/KO/EN';
+    } else if (mode === 'force_gpu') {
+      isGpu = true;
+      label =
+        liveProvider === 'CUDAExecutionProvider'
+          ? 'GPU (RTX CUDA)'
+          : 'GPU (RTX/DirectML)';
+    } else {
+      isGpu = false;
+      label = modelInfo?.hardwareTag || 'CPU (Fast AVX2)';
+    }
+  } else if (stage === 'inpaint') {
+    isGpu = true;
+    if (modelId === 'lama-manga') {
+      label = 'GPU • Screentone';
+    } else if (modelId === 'aot-inpainting') {
+      label = 'GPU • Ultra-Fast';
+    } else if (modelId === 'flux-2-klein') {
+      label = 'Generative • 8GB+ VRAM';
+    } else if (modelId === 'rorem-mixed') {
+      label = 'Generative • Manga GGUF';
+    } else {
+      label =
+        liveProvider === 'CUDAExecutionProvider'
+          ? 'GPU (RTX CUDA)'
+          : 'GPU (RTX/DirectML)';
+    }
+  } else {
+    isGpu = true;
+    label =
+      liveProvider === 'CUDAExecutionProvider'
+        ? 'GPU (RTX CUDA)'
+        : 'GPU (RTX/DirectML)';
+  }
+
+  return (
+    <span
+      data-testid={testId}
+      title={`Live execution target: ${liveProvider || label}`}
+      className={`mt-1 inline-flex items-center gap-1 rounded-studio-sm border px-1.5 py-0.5 text-[10px] font-mono font-medium ${
+        isGpu
+          ? 'border-studio-accent/40 bg-studio-accent/10 text-studio-accent'
+          : 'border-studio-border-strong bg-studio-canvas text-studio-text-secondary'
+      }`}
+    >
+      <span
+        className={`h-1.5 w-1.5 rounded-full ${
+          isGpu ? 'bg-studio-accent' : 'bg-studio-text-muted'
+        }`}
+      />
+      <span>{label}</span>
     </span>
   );
 }
@@ -357,11 +457,11 @@ function glossaryRowsToDict(rows) {
  * Koharu-style 5-Tab Settings Modal synced with `/api/settings` and `useEditorStore`.
  *
  * Tabs:
- * 1. Appearance  — Dark / Light / System theme, Accent presets, UI density
- * 2. Pipeline    — Auto GPU/CPU vs CPU Only, detection threshold, bbox padding, LaMa tile size, reading order, auto-unload VRAM
- * 3. Providers   — 8 Koharu-style providers (LM Studio :1235, Ollama, OpenAI, Gemini, Anthropic, DeepSeek, OpenRouter, Custom), Base URL, masked API key toggle, Test Connection, Fetch Models
- * 4. Translation — Provider & Model, Target Language++ (16 langs), Sampling sliders, Reasoning + strip <think>, Vision toggle, Instruction Bar, Glossary table
- * 5. Typesetting — Searchable Font Picker (/api/fonts/list + catalog downloader + Import .ttf/.otf), ordered Font Fallback Chain, auto-fit, default size, stroke, line height, ALL-CAPS
+ * 1. Appearance  - Dark / Light / System theme, Accent presets, UI density
+ * 2. Pipeline    - Auto GPU/CPU vs CPU Only, detection threshold, bbox padding, LaMa tile size, reading order, auto-unload VRAM
+ * 3. Providers   - 8 Koharu-style providers (LM Studio :1235, Ollama, OpenAI, Gemini, Anthropic, DeepSeek, OpenRouter, Custom), Base URL, masked API key toggle, Test Connection, Fetch Models
+ * 4. Translation - Provider & Model, Target Language++ (16 langs), Sampling sliders, Reasoning + strip <think>, Vision toggle, Instruction Bar, Glossary table
+ * 5. Typesetting - Searchable Font Picker (/api/fonts/list + catalog downloader + Import .ttf/.otf), ordered Font Fallback Chain, auto-fit, default size, stroke, line height, ALL-CAPS
  */
 export default function SettingsModal({
   isOpen,
@@ -628,13 +728,21 @@ export default function SettingsModal({
         headers: { Accept: 'application/json' },
       }).then((res) => (res.ok ? res.json() : null)),
       fetchPipelineModels(),
+      fetch(`${apiBaseUrl}/api/models/status`, {
+        headers: { Accept: 'application/json' },
+      }).then((res) => (res.ok ? res.json() : null)),
     ])
-      .then(([settingsRes, modelsRes]) => {
+      .then(([settingsRes, modelsRes, statusRes]) => {
         if (cancelled) return;
         const settingsData =
           settingsRes.status === 'fulfilled' ? settingsRes.value : null;
         const modelsData =
           modelsRes.status === 'fulfilled' ? modelsRes.value : null;
+        const statusData =
+          statusRes.status === 'fulfilled' ? statusRes.value : null;
+        if (statusData) {
+          setModelsStatus(statusData);
+        }
 
         if (settingsData) {
           if (settingsData.settings_path) setSettingsPath(settingsData.settings_path);
@@ -1033,12 +1141,21 @@ export default function SettingsModal({
     const mergedPipeline = {
       ...draftPipeline,
       detectionModel:
-        draftPipeline.detectionModel || 'koharu-layout-rfdetr-seg-2xl',
+        draftPipeline.detectionModel || 'vellum-det-yolo11m-seg-1024-fp16',
       textThreshold: normalizeOptionalThreshold(draftPipeline.textThreshold),
       bubbleThreshold: normalizeOptionalThreshold(draftPipeline.bubbleThreshold),
       panelThreshold: normalizeOptionalThreshold(draftPipeline.panelThreshold),
+      whisperThreshold: normalizeOptionalThreshold(draftPipeline.whisperThreshold),
+      borderlessThreshold: normalizeOptionalThreshold(
+        draftPipeline.borderlessThreshold
+      ),
+      enableAdaptiveTiling: Boolean(draftPipeline.enableAdaptiveTiling ?? true),
+      sfxSuppressIou: Number(draftPipeline.sfxSuppressIou ?? 0.60),
       ocrModel: draftPipeline.ocrModel || 'auto',
       inpaintingModel: draftPipeline.inpaintingModel || 'lama-manga',
+      inpaintApiUrl:
+        (draftPipeline.inpaintApiUrl || 'http://127.0.0.1:8188').trim() ||
+        'http://127.0.0.1:8188',
       baseUrl: activeProfile.base_url ?? draftPipeline.baseUrl,
       apiKey: activeProfile.api_key ?? draftPipeline.apiKey,
       model: activeProfile.model ?? draftPipeline.model,
@@ -1094,13 +1211,18 @@ export default function SettingsModal({
     } else if (activeTab === 'pipeline') {
       setDraftPipeline((prev) => ({
         ...prev,
-        detectionModel: 'koharu-layout-rfdetr-seg-2xl',
+        detectionModel: 'vellum-det-yolo11m-seg-1024-fp16',
         textThreshold: null,
         bubbleThreshold: null,
         panelThreshold: null,
+        whisperThreshold: null,
+        borderlessThreshold: null,
+        enableAdaptiveTiling: true,
+        sfxSuppressIou: 0.60,
         ocrModel: 'auto',
         inpaintingModel: 'lama-manga',
-        executionMode: 'auto',
+        inpaintApiUrl: 'http://127.0.0.1:8188',
+        executionMode: 'hybrid',
         confThreshold: 0.35,
         nmsThreshold: 0.45,
         maskThreshold: 0.5,
@@ -1185,7 +1307,7 @@ export default function SettingsModal({
     () =>
       detectionModelOptions.find(
         (m) =>
-          m.id === (draftPipeline.detectionModel || 'koharu-layout-rfdetr-seg-2xl')
+          m.id === (draftPipeline.detectionModel || 'vellum-det-yolo11m-seg-1024-fp16')
       ) || detectionModelOptions[0],
     [detectionModelOptions, draftPipeline.detectionModel]
   );
@@ -1441,9 +1563,11 @@ export default function SettingsModal({
                 <div className="flex items-center justify-between gap-1">
                   <span className="text-studio-text-muted">Engine</span>
                   <span className="text-studio-text truncate">
-                    {draftPipeline.executionMode === 'cpu'
+                    {normalizeExecMode(draftPipeline.executionMode) === 'cpu_only'
                       ? 'CPU Only'
-                      : hwProviderMeta.short}
+                      : normalizeExecMode(draftPipeline.executionMode) === 'force_gpu'
+                      ? `GPU (${hwProviderMeta.short})`
+                      : 'Hybrid GPU+CPU'}
                   </span>
                 </div>
                 <div className="flex items-center justify-between gap-1">
@@ -1465,7 +1589,7 @@ export default function SettingsModal({
           {/* Right Content Pane */}
           <div className="flex-1 min-w-0 overflow-y-auto p-4 sm:p-5 space-y-4">
             {/* ==============================================================
-             * TAB 1 — APPEARANCE
+             * TAB 1 - APPEARANCE
              * ============================================================== */}
             {activeTab === 'appearance' && (
               <div className="space-y-4" data-testid="settings-panel-appearance">
@@ -1642,7 +1766,7 @@ export default function SettingsModal({
             )}
 
             {/* ==============================================================
-             * TAB 2 — PIPELINE
+             * TAB 2 - PIPELINE
              * ============================================================== */}
             {activeTab === 'pipeline' && (
               <div className="space-y-4" data-testid="settings-panel-pipeline">
@@ -1699,7 +1823,7 @@ export default function SettingsModal({
                   )}
 
                   <div className="space-y-2.5" data-testid="processing-card-rows">
-                    {/* Row 1 — Detection */}
+                    {/* Row 1 - Detection */}
                     <div
                       className="rounded-studio border border-studio-border bg-studio-panel p-3 flex flex-col sm:flex-row sm:items-start gap-3"
                       data-testid="processing-row-detection"
@@ -1718,6 +1842,12 @@ export default function SettingsModal({
                           <p className="text-[11px] text-studio-text-muted mt-0.5 leading-snug">
                             Find text, speech bubbles, and panels.
                           </p>
+                          <StageHardwareBadge
+                            stage="detect"
+                            draftMode={draftPipeline.executionMode}
+                            runtimeStatus={runtimeStatus}
+                            testId="detection-hardware-badge"
+                          />
                         </div>
                       </div>
 
@@ -1728,7 +1858,7 @@ export default function SettingsModal({
                             data-testid="pipeline-detection-model-select"
                             value={
                               draftPipeline.detectionModel ||
-                              'koharu-layout-rfdetr-seg-2xl'
+                              'vellum-det-yolo11m-seg-1024-fp16'
                             }
                             onChange={(e) =>
                               setDraftPipeline((prev) => ({
@@ -1812,10 +1942,101 @@ export default function SettingsModal({
                             </div>
                           ))}
                         </div>
+
+                        {/* Detector Engine v2 controls: Whisper/Borderless thresholds + Adaptive Tiling & SFX Filter */}
+                        <div className="grid grid-cols-2 gap-2 pt-0.5">
+                          {[
+                            {
+                              key: 'whisperThreshold',
+                              id: 'pipeline-whisper-threshold',
+                              label: 'Whisper threshold',
+                              defaultHint: 0.25,
+                            },
+                            {
+                              key: 'borderlessThreshold',
+                              id: 'pipeline-borderless-threshold',
+                              label: 'Borderless threshold',
+                              defaultHint: 0.28,
+                            },
+                          ].map((field) => (
+                            <div key={field.key} className="space-y-1 min-w-0">
+                              <label
+                                htmlFor={field.id}
+                                className="text-[10px] font-medium text-studio-text-secondary block truncate"
+                              >
+                                {field.label}
+                              </label>
+                              <input
+                                id={field.id}
+                                data-testid={field.id}
+                                type="number"
+                                inputMode="decimal"
+                                min={0.05}
+                                max={0.95}
+                                step={0.01}
+                                placeholder="Default"
+                                title={`Leave empty for model default (${field.defaultHint.toFixed(2)})`}
+                                value={draftPipeline[field.key] ?? ''}
+                                onChange={(e) =>
+                                  handleOptionalThresholdChange(
+                                    field.key,
+                                    e.target.value
+                                  )
+                                }
+                                onBlur={() =>
+                                  handleOptionalThresholdBlur(field.key)
+                                }
+                                className="studio-input w-full h-7 px-2 text-xs font-mono tabular-nums select-text"
+                              />
+                            </div>
+                          ))}
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-4 pt-1">
+                          <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              data-testid="pipeline-adaptive-tiling-toggle"
+                              checked={Boolean(
+                                draftPipeline.enableAdaptiveTiling ?? true
+                              )}
+                              onChange={(e) =>
+                                setDraftPipeline((prev) => ({
+                                  ...prev,
+                                  enableAdaptiveTiling: e.target.checked,
+                                }))
+                              }
+                              className="h-3.5 w-3.5 rounded border-studio-border accent-[var(--studio-accent)] cursor-pointer"
+                            />
+                            <span className="text-[11px] text-studio-text-secondary">
+                              Adaptive Tiling (Webtoon &amp; Ultra-HD)
+                            </span>
+                          </label>
+
+                          <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              data-testid="pipeline-sfx-suppress-toggle"
+                              checked={
+                                Number(draftPipeline.sfxSuppressIou ?? 0.6) < 0.99
+                              }
+                              onChange={(e) =>
+                                setDraftPipeline((prev) => ({
+                                  ...prev,
+                                  sfxSuppressIou: e.target.checked ? 0.6 : 1.0,
+                                }))
+                              }
+                              className="h-3.5 w-3.5 rounded border-studio-border accent-[var(--studio-accent)] cursor-pointer"
+                            />
+                            <span className="text-[11px] text-studio-text-secondary">
+                              SFX Suppression Filter
+                            </span>
+                          </label>
+                        </div>
                       </div>
                     </div>
 
-                    {/* Row 2 — OCR */}
+                    {/* Row 2 - OCR */}
                     <div
                       className="rounded-studio border border-studio-border bg-studio-panel p-3 flex flex-col sm:flex-row sm:items-center gap-3"
                       data-testid="processing-row-ocr"
@@ -1834,6 +2055,14 @@ export default function SettingsModal({
                           <p className="text-[11px] text-studio-text-muted mt-0.5 leading-snug">
                             Read the source text inside detected regions.
                           </p>
+                          <StageHardwareBadge
+                            stage="ocr"
+                            draftMode={draftPipeline.executionMode}
+                            selectedModel={draftPipeline.ocrModel}
+                            modelInfo={selectedOcrModelInfo}
+                            runtimeStatus={runtimeStatus}
+                            testId="ocr-hardware-badge"
+                          />
                         </div>
                       </div>
 
@@ -1863,7 +2092,8 @@ export default function SettingsModal({
                             testId="ocr-model-status-badge"
                           />
                         </div>
-                        {selectedOcrModelInfo?.id === 'paddleocr-vl-gguf' && (
+                        {(selectedOcrModelInfo?.id === 'paddleocr-vl-1.6' ||
+                          selectedOcrModelInfo?.id === 'paddleocr-vl-gguf') && (
                           <p className="text-[10px] text-studio-text-muted leading-snug">
                             {selectedOcrModelInfo.lmStudioHint ||
                               'Uses LM Studio Vision-OCR endpoint with PaddleOCR-VL-1.6-GGUF loaded.'}
@@ -1872,7 +2102,7 @@ export default function SettingsModal({
                       </div>
                     </div>
 
-                    {/* Row 3 — Inpainting */}
+                    {/* Row 3 - Inpainting */}
                     <div
                       className="rounded-studio border border-studio-border bg-studio-panel p-3 flex flex-col sm:flex-row sm:items-center gap-3"
                       data-testid="processing-row-inpainting"
@@ -1891,33 +2121,78 @@ export default function SettingsModal({
                           <p className="text-[11px] text-studio-text-muted mt-0.5 leading-snug">
                             Rebuild artwork beneath removed text.
                           </p>
+                          <StageHardwareBadge
+                            stage="inpaint"
+                            draftMode={draftPipeline.executionMode}
+                            selectedModel={draftPipeline.inpaintingModel}
+                            modelInfo={selectedInpaintingModelInfo}
+                            runtimeStatus={runtimeStatus}
+                            testId="inpainting-hardware-badge"
+                          />
                         </div>
                       </div>
 
-                      <div className="flex-1 min-w-0 flex items-center gap-2">
-                        <select
-                          id="pipeline-inpainting-model"
-                          data-testid="pipeline-inpainting-model-select"
-                          value={draftPipeline.inpaintingModel || 'lama-manga'}
-                          onChange={(e) =>
-                            setDraftPipeline((prev) => ({
-                              ...prev,
-                              inpaintingModel: e.target.value,
-                            }))
-                          }
-                          className="studio-input flex-1 min-w-0 h-8 px-2.5 text-xs cursor-pointer"
-                        >
-                          {inpaintingModelOptions.map((opt) => (
-                            <option key={opt.id} value={opt.id}>
-                              {opt.label}
-                            </option>
-                          ))}
-                        </select>
-                        <ModelStatusBadge
-                          model={selectedInpaintingModelInfo}
-                          isLoading={isLoadingPipelineModels}
-                          testId="inpainting-model-status-badge"
-                        />
+                      <div className="flex-1 min-w-0 space-y-2">
+                        <div className="flex items-center gap-2">
+                          <select
+                            id="pipeline-inpainting-model"
+                            data-testid="pipeline-inpainting-model-select"
+                            value={draftPipeline.inpaintingModel || 'lama-manga'}
+                            onChange={(e) =>
+                              setDraftPipeline((prev) => ({
+                                ...prev,
+                                inpaintingModel: e.target.value,
+                              }))
+                            }
+                            className="studio-input flex-1 min-w-0 h-8 px-2.5 text-xs cursor-pointer"
+                          >
+                            {inpaintingModelOptions.map((opt) => (
+                              <option key={opt.id} value={opt.id}>
+                                {opt.label}
+                              </option>
+                            ))}
+                          </select>
+                          <ModelStatusBadge
+                            model={selectedInpaintingModelInfo}
+                            isLoading={isLoadingPipelineModels}
+                            testId="inpainting-model-status-badge"
+                          />
+                        </div>
+
+                        {(draftPipeline.inpaintingModel === 'flux-2-klein' ||
+                          draftPipeline.inpaintingModel === 'rorem-mixed') && (
+                          <div
+                            className="rounded-studio border border-studio-border/80 bg-studio-surface px-2.5 py-2 space-y-1"
+                            data-testid="inpainting-diffusion-url-box"
+                          >
+                            <label
+                              htmlFor="pipeline-inpaint-api-url"
+                              className="block text-[10px] font-semibold uppercase tracking-wider text-studio-text-secondary"
+                            >
+                              Local Diffusion API URL
+                            </label>
+                            <input
+                              id="pipeline-inpaint-api-url"
+                              data-testid="pipeline-inpaint-api-url-input"
+                              type="text"
+                              value={
+                                draftPipeline.inpaintApiUrl ??
+                                'http://127.0.0.1:8188'
+                              }
+                              onChange={(e) =>
+                                setDraftPipeline((prev) => ({
+                                  ...prev,
+                                  inpaintApiUrl: e.target.value,
+                                }))
+                              }
+                              placeholder="http://127.0.0.1:8188 or http://127.0.0.1:7860"
+                              className="studio-input w-full h-7 px-2 text-xs font-mono"
+                            />
+                            <p className="text-[10px] text-studio-text-muted leading-snug">
+                              Connects to local ComfyUI / A1111 / sd-server diffusion worker on tight text-stroke ROIs (auto-falls back to GPU AOT/LaMa when offline).
+                            </p>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -1925,25 +2200,32 @@ export default function SettingsModal({
 
                 <SectionCard
                   title="Execution Provider"
-                  subtitle={`Detected runtime hardware: ${runtimeStatus.executionProvider || 'Auto-detecting…'}`}
+                  subtitle={`Detected hardware: ${runtimeStatus.executionProvider || 'Auto-detecting…'} · OCR: ${runtimeStatus.ocrProvider || 'CPUExecutionProvider'}`}
                 >
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                     {[
                       {
-                        id: 'auto',
-                        label: 'Auto GPU/CPU',
-                        desc: 'Prefers CUDA → DirectML (Windows GPU) with automatic CPU fallback',
+                        id: 'hybrid',
+                        label: 'Smart Hybrid (Recommended: Vision GPU + OCR CPU)',
+                        desc: 'Runs YOLO11m-Seg & LaMa on GPU while keeping Manga-OCR / RapidOCR on fast AVX2 CPU, saving ~650 MB VRAM for LM Studio',
                         icon: Cpu,
                       },
                       {
-                        id: 'cpu',
+                        id: 'force_gpu',
+                        label: 'Force All GPU',
+                        desc: 'Routes Detection, OCR encoders, and LaMa Inpainting onto GPU (CUDA / DirectML)',
+                        icon: Sparkles,
+                      },
+                      {
+                        id: 'cpu_only',
                         label: 'CPU Only',
-                        desc: 'Forces ONNX CPUExecutionProvider for maximum stability & zero VRAM use',
+                        desc: 'Forces all ONNX models (including INT8 detector) onto CPUExecutionProvider with zero VRAM use',
                         icon: HardDrive,
                       },
                     ].map((opt) => {
                       const Icon = opt.icon;
-                      const isActive = (draftPipeline.executionMode || 'auto') === opt.id;
+                      const isActive =
+                        normalizeExecMode(draftPipeline.executionMode) === opt.id;
                       return (
                         <button
                           key={opt.id}
@@ -2213,13 +2495,55 @@ export default function SettingsModal({
                         }
                       />
                     </div>
+
+                    <div className="h-px bg-studio-border" />
+
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <span className="text-xs font-medium text-studio-text block">
+                          Purge Temp Image Cache
+                        </span>
+                        <p className="text-[11px] text-studio-text-muted">
+                          Wipes unpinned temporary images in <code className="font-mono">./cache/images/</code> to reclaim SSD space between 3,000-page volumes (pinned project caches remain intact).
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        data-testid="pipeline-purge-temp-cache-btn"
+                        onClick={async (e) => {
+                          const btn = e.currentTarget;
+                          const origText = btn.textContent;
+                          btn.disabled = true;
+                          btn.textContent = 'Purging…';
+                          try {
+                            const resp = await fetch(`${apiBaseUrl}/api/cache/clear`, {
+                              method: 'POST',
+                            });
+                            const data = await resp.json().catch(() => ({}));
+                            const count = data?.deleted_files ?? 0;
+                            const mb = ((data?.freed_bytes ?? 0) / (1024 * 1024)).toFixed(1);
+                            btn.textContent = `Cleared ${count} (${mb} MB)`;
+                          } catch {
+                            btn.textContent = 'Purge Failed';
+                          } finally {
+                            setTimeout(() => {
+                              btn.disabled = false;
+                              btn.textContent = origText || 'Purge Temp Image Cache';
+                            }, 2500);
+                          }
+                        }}
+                        className="studio-btn-secondary h-7 px-2.5 text-[11px] font-medium shrink-0 cursor-pointer"
+                      >
+                        Purge Temp Image Cache
+                      </button>
+                    </div>
                   </div>
                 </SectionCard>
               </div>
             )}
 
             {/* ==============================================================
-             * TAB 3 — PROVIDERS (KOHARU-STYLE)
+             * TAB 3 - PROVIDERS (KOHARU-STYLE)
              * ============================================================== */}
             {activeTab === 'providers' && (
               <div
@@ -2564,7 +2888,7 @@ export default function SettingsModal({
                         {selectedProviderTest.models?.length > 0 && (
                           <div className="space-y-1.5 pt-1 border-t border-studio-border/60">
                             <div className="text-[10px] font-mono uppercase tracking-wider text-studio-text-muted">
-                              Fetched Models ({selectedProviderTest.models.length}) — click to select
+                              Fetched Models ({selectedProviderTest.models.length}) - click to select
                             </div>
                             <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto pr-1">
                               {selectedProviderTest.models.map((mid) => {
@@ -2607,7 +2931,7 @@ export default function SettingsModal({
             )}
 
             {/* ==============================================================
-             * TAB 4 — TRANSLATION
+             * TAB 4 - TRANSLATION
              * ============================================================== */}
             {activeTab === 'translation' && (
               <div className="space-y-4" data-testid="settings-panel-translation">
@@ -2740,7 +3064,7 @@ export default function SettingsModal({
                         {supportedTargetLanguages.map((lang) => (
                           <option key={lang.code} value={lang.code}>
                             {lang.name}
-                            {lang.native_name ? ` — ${lang.native_name}` : ''} ({lang.code})
+                            {lang.native_name ? ` - ${lang.native_name}` : ''} ({lang.code})
                           </option>
                         ))}
                       </select>
@@ -3251,7 +3575,7 @@ export default function SettingsModal({
             )}
 
             {/* ==============================================================
-             * TAB 5 — TYPESETTING
+             * TAB 5 - TYPESETTING
              * ============================================================== */}
             {activeTab === 'typesetting' && (
               <div className="space-y-4" data-testid="settings-panel-typesetting">

@@ -1,6 +1,6 @@
 #pragma once
 
-// Vellum — Native C++17 Tile-Based LaMa ONNX Inpainter (Phase 10.2)
+// Vellum - Native C++17 Tile-Based LaMa ONNX Inpainter (Phase 10.2)
 //
 // Uses local LaMa ONNX weights via `ModelManager::resolve_lama_model()`
 // (prefers Koharu's manga screentone `lama_manga.onnx`, falls back to `lama_fp32.onnx`).
@@ -25,7 +25,8 @@ namespace mangaflow::pipeline {
 
 struct InpaintOptions {
     std::optional<std::vector<std::array<int, 4>>> bboxes;
-    std::string inpainting_model = "lama-manga";  // "lama-manga" | "lama-fp32" | "auto"
+    std::string inpainting_model = "lama-manga";  // "lama-manga" | "aot-inpainting" | "flux-2-klein" | "rorem-mixed" | "lama-fp32" | "auto"
+    std::string inpaint_api_url = "http://127.0.0.1:8188";
     int tile_size = 512;                          // Context ROI window size (256..1024; ONNX native is 512x512)
     int tile_padding = 32;
     int dilate_kernel_size = 9;
@@ -101,18 +102,25 @@ public:
         int width,
         int height);
 
-    // Explicitly unload any cached LaMa ONNX session from RAM/VRAM.
+    // Explicitly unload any cached LaMa / AOT ONNX session from RAM/VRAM.
     void unload();
-    bool is_loaded() const noexcept { return cached_session_.has_value(); }
+    bool is_loaded() const noexcept { return cached_session_.has_value() || cached_aot_session_.has_value(); }
 
 private:
     OrtSessionHandle& ensure_session(const ResolvedLamaModel& resolved, bool force_cpu);
+    OrtSessionHandle& ensure_aot_session(const ResolvedAotModel& resolved, bool force_cpu);
 
-    // Execute LaMa ONNX on a single `512x512` RGB tile + binary mask -> inpainted `512x512` RGB.
+    // Execute LaMa or AOT ONNX on a single `512x512` RGB tile + binary mask -> inpainted `512x512` RGB.
     std::vector<uint8_t> run_tile_512(
         const uint8_t* tile_rgb,
         const uint8_t* tile_mask,
         const ResolvedLamaModel& resolved,
+        bool force_cpu);
+
+    std::vector<uint8_t> run_aot_tile_512(
+        const uint8_t* tile_rgb,
+        const uint8_t* tile_mask,
+        const ResolvedAotModel& resolved,
         bool force_cpu);
 
     // Inpaint a single padded ROI `[x1, y1, x2, y2]` and composite only masked pixels onto `canvas`.
@@ -144,6 +152,9 @@ private:
     std::optional<OrtSessionHandle> cached_session_;
     std::filesystem::path cached_model_path_;
     bool cached_force_cpu_ = false;
+    std::optional<OrtSessionHandle> cached_aot_session_;
+    std::filesystem::path cached_aot_path_;
+    bool cached_aot_force_cpu_ = false;
 };
 
 }  // namespace mangaflow::pipeline

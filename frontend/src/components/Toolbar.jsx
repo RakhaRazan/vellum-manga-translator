@@ -172,7 +172,7 @@ export default function Toolbar({
             onClick={undo}
             disabled={!canUndo}
             className="h-7 w-7 inline-flex items-center justify-center text-studio-text hover:bg-studio-hover disabled:opacity-35 disabled:pointer-events-none transition-colors cursor-pointer"
-            title={canUndo ? `Undo (${undoCount}) — Ctrl+Z` : 'Undo (Ctrl+Z)'}
+            title={canUndo ? `Undo (${undoCount}) - Ctrl+Z` : 'Undo (Ctrl+Z)'}
             aria-label="Undo"
           >
             <Undo2 className="h-3.5 w-3.5" />
@@ -183,7 +183,7 @@ export default function Toolbar({
             onClick={redo}
             disabled={!canRedo}
             className="h-7 w-7 inline-flex items-center justify-center text-studio-text hover:bg-studio-hover disabled:opacity-35 disabled:pointer-events-none transition-colors cursor-pointer"
-            title={canRedo ? `Redo (${redoCount}) — Ctrl+Y` : 'Redo (Ctrl+Y)'}
+            title={canRedo ? `Redo (${redoCount}) - Ctrl+Y` : 'Redo (Ctrl+Y)'}
             aria-label="Redo"
           >
             <Redo2 className="h-3.5 w-3.5" />

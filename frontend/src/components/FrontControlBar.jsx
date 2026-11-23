@@ -6,6 +6,7 @@ import {
   Loader2,
   Play,
   Settings,
+  Square,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import useEditorStore from '../store/useEditorStore.js';
@@ -37,9 +38,12 @@ const PIPELINE_STAGES = [
  */
 export default function FrontControlBar({
   onRun,
+  onCancel,
   onOpenSettings,
   isProcessing = false,
   isWorkspaceUnlocked = true,
+  skipCompleted = true,
+  onToggleSkipCompleted,
 }) {
   const {
     model,
@@ -310,6 +314,23 @@ export default function FrontControlBar({
           </select>
         </div>
 
+        {/* Skip Completed (Resume) Toggle for Project batch */}
+        {scope === 'project' && onToggleSkipCompleted && (
+          <label
+            title="Skip pages already marked done so a 500-page batch can resume after a stop or crash"
+            className="flex items-center gap-1.5 text-[11px] text-studio-text-secondary hover:text-studio-text cursor-pointer select-none px-1.5 py-0.5 rounded border border-studio-border bg-studio-bg-deep/60 shrink-0"
+          >
+            <input
+              type="checkbox"
+              checked={Boolean(skipCompleted)}
+              onChange={onToggleSkipCompleted}
+              disabled={isProcessing}
+              className="accent-studio-accent h-3 w-3 cursor-pointer"
+            />
+            <span>Skip Done</span>
+          </label>
+        )}
+
         {/* Primary Run Button */}
         <button
           type="button"
@@ -331,6 +352,20 @@ export default function FrontControlBar({
             </>
           )}
         </button>
+
+        {/* Stop / Cancel Batch Button */}
+        {isProcessing && onCancel && (
+          <button
+            type="button"
+            data-testid="front-control-cancel-btn"
+            onClick={onCancel}
+            title="Stop batch cleanly after the current request"
+            className="h-6 px-2.5 text-[11px] font-medium rounded flex items-center gap-1 bg-red-600 hover:bg-red-500 text-white transition-colors cursor-pointer shrink-0"
+          >
+            <Square className="h-2.5 w-2.5 fill-current" />
+            <span>Stop</span>
+          </button>
+        )}
 
         {/* Settings Gear Button */}
         <button

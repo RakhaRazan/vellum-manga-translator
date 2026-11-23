@@ -1,4 +1,4 @@
-# Vellum Comic Translator — System Specification (v2 Native C++17)
+# Vellum Comic Translator - System Specification (v2 Native C++17)
 
 ## 1. Overview & Project Vision
 

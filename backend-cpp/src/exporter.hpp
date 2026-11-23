@@ -53,11 +53,15 @@ enum class ExportImageFormat {
     Jpg,
 };
 
-// Local image cache utilities (`/api/cache/images/{image_id}.{ext}`)
+// Local image cache utilities (`/api/cache/images/{image_id}.{ext}`) & pinned project cache
 std::filesystem::path get_image_cache_dir();
+std::filesystem::path get_projects_cache_dir();
 std::filesystem::path get_export_sessions_dir();
-void prune_image_cache(const std::filesystem::path& cache_dir, size_t max_files = 10000);
+void prune_image_cache(const std::filesystem::path& cache_dir, size_t max_files = 50000);
 std::filesystem::path resolve_cached_image_path(const std::string& id_or_url);
+std::filesystem::path resolve_pinned_project_image_path(
+    const std::string& project_id,
+    const std::string& filename);
 std::string media_type_for_cache_ext(const std::string& ext_lower);
 
 // Natural sorting & filename sanitization
@@ -71,13 +75,22 @@ ExportImageFormat parse_export_image_format(const std::optional<std::string>& ra
 // Decode a JSON export image reference (`data:image/...;base64,...`, raw base64, or `/api/cache/images/...`)
 std::vector<uint8_t> decode_export_image_reference(const std::string& ref, int page_index);
 
-// `POST /api/import/archive` — extract valid comic page images from `.cbz`/`.zip` in natural page order
+constexpr size_t kMaxArchivePages = 25000;
+constexpr uint64_t kMaxArchiveUncompressedBytes = 32ULL * 1024ULL * 1024ULL * 1024ULL;  // 32 GiB
+
+// `POST /api/import/archive` - extract valid comic page images from `.cbz`/`.zip` in natural page order
 std::vector<ExtractedArchivePage> extract_archive_pages(
     const std::vector<uint8_t>& archive_bytes,
     const std::filesystem::path& output_dir,
-    size_t max_pages = 10000);
+    size_t max_pages = kMaxArchivePages);
 
-// `POST /api/export/cbz` — package ordered pages into a downloadable `.cbz` archive
+// `POST /api/import/archive-path` - O(1) RAM 64-bit disk-backed `.cbz`/`.zip` extractor
+std::vector<ExtractedArchivePage> extract_archive_pages_from_file(
+    const std::filesystem::path& archive_path,
+    const std::filesystem::path& output_dir,
+    size_t max_pages = kMaxArchivePages);
+
+// `POST /api/export/cbz` - package ordered pages into a downloadable `.cbz` archive
 std::vector<uint8_t> build_cbz_bytes(
     const std::vector<ExportPageInput>& pages,
     ExportImageFormat image_format = ExportImageFormat::Original,
@@ -90,7 +103,7 @@ void build_cbz_to_file(
     ExportImageFormat image_format = ExportImageFormat::Original,
     int jpeg_quality = 95);
 
-// `POST /api/export/pdf` — native C++ PDF 1.4 multi-page writer (JPEG DCTDecode + lossless FlateDecode)
+// `POST /api/export/pdf` - native C++ PDF 1.4 multi-page writer (JPEG DCTDecode + lossless FlateDecode)
 std::vector<uint8_t> build_pdf_bytes(const std::vector<ExportPageInput>& pages);
 
 // Disk-backed O(1)-RAM PDF 1.4 writer for large multi-thousand-page batches

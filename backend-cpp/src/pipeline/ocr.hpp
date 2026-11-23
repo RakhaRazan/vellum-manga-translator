@@ -1,6 +1,6 @@
 #pragma once
 
-// Vellum — Native C++17 Multi-Language OCR Router (Phase 10.2)
+// Vellum - Native C++17 Multi-Language OCR Router (Phase 10.2)
 //
 // Routes speech bubble OCR per `source_lang` using ONNX Runtime C++ API (`Ort::Session`)
 // and `stb_image.h` (zero OpenCV / Python dependency):
@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -98,6 +99,9 @@ public:
     void unload();
     bool is_loaded() const noexcept {
         return manga_enc_session_.has_value() || manga_dec_session_.has_value() ||
+               baberu_vis_session_.has_value() || baberu_pre_session_.has_value() ||
+               baberu_stp_session_.has_value() || hayai_enc_session_.has_value() ||
+               hayai_dec_session_.has_value() ||
                rapid_det_session_.has_value() || rapid_cls_session_.has_value() ||
                rapid_rec_session_.has_value();
     }
@@ -115,6 +119,14 @@ private:
     std::string run_manga_ocr_single(const RgbImage& crop);
     std::string decode_manga_ocr_tokens(const std::vector<int64_t>& token_ids) const;
     static std::string postprocess_manga_ocr_text(const std::string& raw_utf8);
+
+    // Baberu OCR ONNX (DINOv2 vision + INT8 KV-cache prefill/step decoder on CPU AVX2)
+    void ensure_baberu_ocr_loaded();
+    std::string recognize_baberu_crop(const RgbImage& raw_crop);
+
+    // Hayai OCR v2.1 ONNX (SigLIP2 vision encoder + 2D-mRoPE causal transformer decoder)
+    void ensure_hayai_ocr_loaded(bool force_cpu);
+    std::string recognize_hayai_crop(const RgbImage& raw_crop);
 
     // Korean / Chinese / CJK PP-OCRv4 ONNX (det + cls + rec)
     void ensure_rapid_ocr_loaded(const std::string& lang, bool force_cpu);
@@ -155,6 +167,22 @@ private:
     std::optional<OrtSessionHandle> manga_dec_session_;
     std::vector<std::string> manga_vocab_;
     bool manga_force_cpu_ = false;
+
+    // Lazy Baberu OCR state (CPU AVX2)
+    std::optional<OrtSessionHandle> baberu_vis_session_;
+    std::optional<OrtSessionHandle> baberu_pre_session_;
+    std::optional<OrtSessionHandle> baberu_stp_session_;
+    std::vector<std::string> baberu_id2ch_;
+    std::unordered_set<int64_t> baberu_symbol_ids_;
+
+    // Lazy Hayai OCR state (GPU/CPU)
+    std::optional<OrtSessionHandle> hayai_enc_session_;
+    std::optional<OrtSessionHandle> hayai_dec_session_;
+    std::vector<std::string> hayai_id2tok_;
+    int64_t hayai_bos_id_ = 1;
+    int64_t hayai_eos_id_ = 2;
+    int64_t hayai_pad_id_ = 0;
+    bool hayai_force_cpu_ = false;
 
     // Lazy RapidOCR PP-OCRv4 state (for active `ko` or `cjk` profile)
     std::string rapid_loaded_lang_;

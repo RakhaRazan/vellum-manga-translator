@@ -16,7 +16,7 @@ const PROVIDER_LABELS = {
 
 export function formatExecutionProvider(provider) {
   if (!provider) {
-    return { label: 'Detecting…', short: '—', isGpu: false };
+    return { label: 'Detecting…', short: '-', isGpu: false };
   }
   if (provider === 'CUDAExecutionProvider') {
     return { label: 'GPU · CUDA', short: 'CUDA', isGpu: true };
@@ -43,6 +43,16 @@ export function formatShortModelName(modelName) {
   return modelName.length > 28 ? `${modelName.slice(0, 26)}…` : modelName;
 }
 
+export function formatShortDetectorName(detModel) {
+  if (!detModel) return null;
+  const lower = String(detModel).toLowerCase();
+  if (lower.includes('yolo11') && lower.includes('int8')) return 'YOLO11m INT8';
+  if (lower.includes('yolo11')) return 'YOLO11m-Seg';
+  if (lower.includes('rfdetr')) return 'RF-DETR-2XL';
+  if (lower.includes('comic-text-detector') || lower.includes('ctd')) return 'CTD';
+  return detModel.length > 18 ? `${detModel.slice(0, 16)}…` : detModel;
+}
+
 /**
  * Compact 24px native desktop studio bottom status bar.
  * Displays live zoom %, cursor XY coordinates, active ONNX Runtime GPU/CPU provider,
@@ -58,6 +68,11 @@ export default function StatusBar({
     cursorX,
     cursorY,
     executionProvider,
+    executionMode,
+    detectorProvider,
+    ocrProvider,
+    inpainterProvider,
+    detectorModel,
     lmStudio,
     activeProviderSummary,
     pipelineProvider,
@@ -71,6 +86,13 @@ export default function StatusBar({
       cursorX: s.canvasView.cursorX,
       cursorY: s.canvasView.cursorY,
       executionProvider: s.runtimeStatus.executionProvider,
+      executionMode:
+        s.pipelineConfig.executionMode || s.runtimeStatus.executionMode || 'hybrid',
+      detectorProvider: s.runtimeStatus.detectorProvider,
+      ocrProvider: s.runtimeStatus.ocrProvider,
+      inpainterProvider: s.runtimeStatus.inpainterProvider,
+      detectorModel:
+        s.runtimeStatus.detectorModel || s.pipelineConfig.detectionModel,
       lmStudio: s.runtimeStatus.lmStudio,
       activeProviderSummary: s.runtimeStatus.activeProviderSummary,
       pipelineProvider: s.pipelineConfig.provider,
@@ -85,6 +107,21 @@ export default function StatusBar({
   const hasCursor =
     typeof cursorX === 'number' && typeof cursorY === 'number';
   const providerMeta = formatExecutionProvider(executionProvider);
+  const normExecMode =
+    executionMode === 'cpu' || executionMode === 'cpu_only'
+      ? 'cpu_only'
+      : executionMode === 'gpu' || executionMode === 'force_gpu'
+      ? 'force_gpu'
+      : 'hybrid';
+  const hybridStatusLabel =
+    normExecMode === 'cpu_only'
+      ? 'CPU Only'
+      : normExecMode === 'force_gpu'
+      ? providerMeta.isGpu
+        ? `All GPU · ${providerMeta.short}`
+        : 'Force GPU'
+      : 'Hybrid GPU+CPU';
+  const hybridIsGpu = normExecMode !== 'cpu_only' && (providerMeta.isGpu || normExecMode === 'hybrid');
 
   const activeProviderId =
     activeProviderSummary?.provider || pipelineProvider || 'lmstudio';
@@ -148,11 +185,11 @@ export default function StatusBar({
           <span className="inline-flex items-center gap-2">
             <span className="w-[54px] text-left">
               <span className="text-studio-text-muted mr-0.5">X:</span>
-              {hasCursor ? cursorX : '—'}
+              {hasCursor ? cursorX : '-'}
             </span>
             <span className="w-[54px] text-left">
               <span className="text-studio-text-muted mr-0.5">Y:</span>
-              {hasCursor ? cursorY : '—'}
+              {hasCursor ? cursorY : '-'}
             </span>
           </span>
         </div>
@@ -184,7 +221,7 @@ export default function StatusBar({
               >
                 <span className="h-1.5 w-1.5 rounded-full bg-studio-danger shrink-0" />
                 <span className="truncate">
-                  Error — {activePage.error || 'Processing failed'}
+                  Error - {activePage.error || 'Processing failed'}
                 </span>
               </div>
             ) : activePage.status === 'idle' || activePage.status === 'queued' ? (
@@ -194,7 +231,7 @@ export default function StatusBar({
                 title="Configure Scope, Stages, Languages, and Pipeline Models, then press Run to start processing"
               >
                 <span className="h-1.5 w-1.5 rounded-full bg-studio-accent shrink-0" />
-                <span className="truncate">Ready — Press Run to process</span>
+                <span className="truncate">Ready - Press Run to process</span>
               </div>
             ) : (
               <div className="hidden md:flex items-center gap-2 font-mono tabular-nums text-studio-text-muted truncate">
@@ -218,16 +255,16 @@ export default function StatusBar({
         )}
       </div>
 
-      {/* Right: ONNX GPU/CPU Provider + Active LLM Model */}
+      {/* Right: ONNX GPU/CPU Provider + Active Detector + Active LLM Model */}
       <div className="flex items-center gap-2.5 shrink-0">
-        {/* Hardware Execution Provider (CUDA / DirectML / CPU) */}
+        {/* Hardware Execution Provider (Smart Hybrid GPU+CPU / All GPU / CPU Only) */}
         <div
           className="inline-flex items-center gap-1.5 font-mono text-[11px]"
-          title={`ONNX Runtime Execution Provider: ${executionProvider || 'Detecting…'}`}
+          title={`Execution Mode: ${hybridStatusLabel}\nDetection: ${detectorProvider || executionProvider || 'GPU'}\nOCR: ${ocrProvider || 'CPUExecutionProvider'}\nInpainting: ${inpainterProvider || executionProvider || 'GPU'}\nActive Detector: ${detectorModel || 'Auto'}`}
         >
           <span
             className={`h-1.5 w-1.5 rounded-full shrink-0 ${
-              providerMeta.isGpu
+              hybridIsGpu
                 ? 'bg-studio-accent'
                 : executionProvider
                 ? 'bg-studio-text-muted'
@@ -237,13 +274,21 @@ export default function StatusBar({
           <Cpu className="h-3 w-3 text-studio-text-muted shrink-0" />
           <span
             className={
-              providerMeta.isGpu
+              hybridIsGpu
                 ? 'text-studio-text font-medium'
                 : 'text-studio-text-secondary'
             }
           >
-            {providerMeta.label}
+            {hybridStatusLabel}
           </span>
+          {formatShortDetectorName(detectorModel) && (
+            <>
+              <span className="text-studio-border-strong hidden sm:inline">·</span>
+              <span className="text-studio-text-secondary hidden sm:inline">
+                {formatShortDetectorName(detectorModel)}
+              </span>
+            </>
+          )}
         </div>
 
         <span className="h-3 w-px bg-studio-border shrink-0" aria-hidden="true" />

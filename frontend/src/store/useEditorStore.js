@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export const MAX_HISTORY_STEPS = 50;
+export const MAX_HISTORY_STEPS = 30;
 export const THEME_STORAGE_KEY = 'vellum.theme';
 export const ACCENT_STORAGE_KEY = 'vellum.accent';
 export const DENSITY_STORAGE_KEY = 'vellum.density';
@@ -547,16 +547,30 @@ export const DEFAULT_TARGET_LANGUAGES = [
 
 export const DEFAULT_DETECTION_MODELS = [
   {
+    id: 'vellum-det-yolo11m-seg-1024-fp16',
+    label: 'Vellum YOLO11m-Seg (9-Class Fast GPU)',
+    name: 'Vellum YOLO11m-Seg (9-Class Fast GPU)',
+    description:
+      'Primary 9-class 1024px layout & bubble segmentation (CUDA / DirectML FP16)',
+  },
+  {
+    id: 'vellum-det-yolo11m-seg-1024-int8',
+    label: 'Vellum YOLO11m-Seg (INT8 CPU)',
+    name: 'Vellum YOLO11m-Seg (INT8 CPU)',
+    description:
+      'Static QDQ INT8 9-class 1024px detector optimized for CPU-only desktops',
+  },
+  {
     id: 'koharu-layout-rfdetr-seg-2xl',
-    label: 'Koharu Layout RF-DETR Seg 2XL',
-    name: 'Koharu Layout RF-DETR Seg 2XL',
+    label: 'Koharu Layout RF-DETR Seg 2XL (High-Context • Heavy CPU/CUDA)',
+    name: 'Koharu Layout RF-DETR Seg 2XL (High-Context • Heavy CPU/CUDA)',
     description:
       'High-precision 1152px manga layout & text segmentation (text, SFX, bubble, panel)',
   },
   {
     id: 'comic-text-detector',
-    label: 'Comic Text Detector (ONNX)',
-    name: 'Comic Text Detector (ONNX)',
+    label: 'Comic Text Detector (Legacy)',
+    name: 'Comic Text Detector (Legacy)',
     description:
       'Fast 1024px manga/manhwa/manhua text box & segmentation mask detector',
   },
@@ -565,29 +579,49 @@ export const DEFAULT_DETECTION_MODELS = [
 export const DEFAULT_OCR_MODELS = [
   {
     id: 'auto',
-    label: 'Auto (Manga-OCR / RapidOCR)',
-    name: 'Auto (Manga-OCR / RapidOCR)',
+    label: 'Auto (Language Router)',
+    name: 'Auto (Language Router)',
+    hardwareTag: 'CPU • Auto Router',
     description:
-      'Automatically routes Japanese → Manga OCR and Korean/Chinese → RapidOCR PP-OCRv4',
+      'Automatically routes Japanese → Manga OCR and Korean/Chinese → RapidOCR / Hayai OCR',
+  },
+  {
+    id: 'paddleocr-vl-1.6',
+    label: 'PaddleOCR-VL 1.6 (VLM • Multi-Lang)',
+    name: 'PaddleOCR-VL 1.6 (VLM • Multi-Lang)',
+    hardwareTag: 'VLM • Multi-Lang',
+    description:
+      'Multilingual Vision-Language OCR via llama-server / LM Studio or llama-mtmd-cli worker',
   },
   {
     id: 'manga-ocr',
-    label: 'Manga OCR',
-    name: 'Manga OCR',
+    label: 'Manga OCR (CPU • Japanese)',
+    name: 'Manga OCR (CPU • Japanese)',
+    hardwareTag: 'CPU • Japanese',
     description:
       'ViT + BERT autoregressive Japanese manga OCR (vertical tategaki & furigana)',
   },
   {
-    id: 'paddleocr-vl-gguf',
-    label: 'PaddleOCR-VL 1.6 (GGUF / LM Studio)',
-    name: 'PaddleOCR-VL 1.6 (GGUF / LM Studio)',
+    id: 'baberu-ocr',
+    label: 'Baberu OCR (CPU • JA/ZH/EN Fast)',
+    name: 'Baberu OCR (CPU • JA/ZH/EN Fast)',
+    hardwareTag: 'CPU • JA/ZH/EN Fast',
     description:
-      'Multilingual Vision-Language OCR via LM Studio (http://localhost:1235/v1)',
+      'Compact DINOv2 + INT8 KV-cache autoregressive OCR for Japanese, Chinese & English',
+  },
+  {
+    id: 'hayai-ocr',
+    label: 'Hayai OCR (GPU/CPU • JA/ZH/KO/EN)',
+    name: 'Hayai OCR (GPU/CPU • JA/ZH/KO/EN)',
+    hardwareTag: 'GPU/CPU • JA/ZH/KO/EN',
+    description:
+      'High-throughput 150M SigLIP2 + 2D-mRoPE causal transformer OCR across JA, ZH, KO, EN',
   },
   {
     id: 'rapidocr-ppocrv4',
-    label: 'RapidOCR PP-OCRv4',
-    name: 'RapidOCR PP-OCRv4',
+    label: 'RapidOCR PP-OCRv4 (CPU • KO/ZH)',
+    name: 'RapidOCR PP-OCRv4 (CPU • KO/ZH)',
+    hardwareTag: 'CPU • KO/ZH',
     description:
       'Fast CJK/Latin PP-OCRv4 ONNX recognition (Korean, Chinese & horizontal Japanese)',
   },
@@ -596,15 +630,41 @@ export const DEFAULT_OCR_MODELS = [
 export const DEFAULT_INPAINTING_MODELS = [
   {
     id: 'lama-manga',
-    label: 'LaMa Manga (Screentone)',
-    name: 'LaMa Manga (Screentone)',
+    label: 'LaMa (GPU • Screentone)',
+    name: 'LaMa (GPU • Screentone)',
+    hardwareTag: 'GPU • Screentone',
     description:
       'Manga-tuned Big-LaMa ONNX inpainter optimized for screentones & line art',
   },
   {
+    id: 'aot-inpainting',
+    label: 'AOT Inpainting (GPU • Ultra-Fast)',
+    name: 'AOT Inpainting (GPU • Ultra-Fast)',
+    hardwareTag: 'GPU • Ultra-Fast',
+    description:
+      'Lightweight 10-block AOT-GAN manga text-stroke inpainter (4-ch mask+RGB → 3-ch RGB, 512×512)',
+  },
+  {
+    id: 'flux-2-klein',
+    label: 'FLUX.2 Klein (Generative • 8GB+ VRAM)',
+    name: 'FLUX.2 Klein (Generative • 8GB+ VRAM)',
+    hardwareTag: 'Generative • 8GB+ VRAM',
+    description:
+      'Generative diffusion text-stroke ROI inpainter via local ComfyUI/A1111/sd-server adapter',
+  },
+  {
+    id: 'rorem-mixed',
+    label: 'RORem Mixed (Generative • Manga GGUF)',
+    name: 'RORem Mixed (Generative • Manga GGUF)',
+    hardwareTag: 'Generative • Manga GGUF',
+    description:
+      'Manga object/text removal diffusion adapter via local diffusion worker',
+  },
+  {
     id: 'lama-fp32',
-    label: 'LaMa Standard (FP32)',
-    name: 'LaMa Standard (FP32)',
+    label: 'LaMa Standard (GPU • FP32)',
+    name: 'LaMa Standard (GPU • FP32)',
+    hardwareTag: 'GPU • FP32',
     description: 'General-purpose Big-LaMa FP32 ONNX inpainter (512×512 tiles)',
   },
 ];
@@ -651,13 +711,18 @@ export const DEFAULT_PIPELINE_CONFIG = {
   visionMaxSide: 1024,
   customInstructions: '',
   glossary: {},
-  detectionModel: 'koharu-layout-rfdetr-seg-2xl',
+  detectionModel: 'vellum-det-yolo11m-seg-1024-fp16',
   textThreshold: null,
   bubbleThreshold: null,
   panelThreshold: null,
+  whisperThreshold: null,
+  borderlessThreshold: null,
+  enableAdaptiveTiling: true,
+  sfxSuppressIou: 0.60,
   ocrModel: 'auto',
   inpaintingModel: 'lama-manga',
-  executionMode: 'auto', // 'auto' | 'cpu'
+  inpaintApiUrl: 'http://127.0.0.1:8188',
+  executionMode: 'hybrid', // 'hybrid' | 'force_gpu' | 'cpu_only'
   confThreshold: 0.35,
   nmsThreshold: 0.45,
   maskThreshold: 0.5,
@@ -985,11 +1050,43 @@ function clonePage(page) {
 }
 
 function createHistorySnapshot(pages, activePageId, selectedLayerIds) {
+  // Structural sharing: pages and blocks are updated immutably across store actions,
+  // so a shallow array copy preserves all untouched page references in O(1) heap per edit.
   return {
-    pages: (pages || []).map(clonePage),
+    pages: Array.isArray(pages) ? [...pages] : [],
     activePageId: activePageId ?? null,
     selectedLayerIds: [...(selectedLayerIds || [])],
   };
+}
+
+function revokeUnusedBlobUrls(prevPages = [], nextPages = [], history = null) {
+  if (typeof URL === 'undefined' || typeof URL.revokeObjectURL !== 'function') return;
+  const activeUrls = new Set();
+  const collect = (list) => {
+    for (const p of list || []) {
+      if (typeof p?.originalUrl === 'string' && p.originalUrl.startsWith('blob:')) {
+        activeUrls.add(p.originalUrl);
+      }
+    }
+  };
+  collect(nextPages);
+  if (history) {
+    for (const snap of history.past || []) collect(snap?.pages);
+    for (const snap of history.future || []) collect(snap?.pages);
+  }
+  for (const p of prevPages || []) {
+    if (
+      typeof p?.originalUrl === 'string' &&
+      p.originalUrl.startsWith('blob:') &&
+      !activeUrls.has(p.originalUrl)
+    ) {
+      try {
+        URL.revokeObjectURL(p.originalUrl);
+      } catch {
+        // ignore
+      }
+    }
+  }
 }
 
 function mergeBlockUpdates(block, updates) {
@@ -1305,6 +1402,11 @@ export const useEditorStore = create((set, get) => ({
   // ── Hardware & LLM Runtime Status (shared by Toolbar & StatusBar) ──────────
   runtimeStatus: {
     executionProvider: null,
+    executionMode: 'hybrid',
+    detectorProvider: null,
+    ocrProvider: null,
+    inpainterProvider: null,
+    detectorModel: null,
     availableProviders: [],
     modelsReady: false,
     modelsStatus: null,
@@ -1417,6 +1519,7 @@ export const useEditorStore = create((set, get) => ({
         nextSelectedLayerIds,
         { recordHistory: options.recordHistory ?? true }
       );
+      revokeUnusedBlobUrls(state.pages, nextPages, history);
 
       return {
         pages: nextPages,
@@ -1449,6 +1552,7 @@ export const useEditorStore = create((set, get) => ({
         nextSelectedLayerIds,
         { recordHistory: true }
       );
+      revokeUnusedBlobUrls(state.pages, nextPages, history);
 
       return {
         pages: nextPages,
@@ -1628,7 +1732,7 @@ export const useEditorStore = create((set, get) => ({
     });
   },
 
-  replaceProjectState: ({ pages = [], activePageId = null, pipelineConfig = null, viewLayers = null } = {}) => {
+  replaceProjectState: ({ pages = [], activePageId = null, pipelineConfig = null, viewLayers = null, typesetting = null } = {}) => {
     resetHistoryCoalescing();
     set((state) => {
       const normalizedPages = (pages || []).map((p, idx) => {
@@ -1670,6 +1774,7 @@ export const useEditorStore = create((set, get) => ({
         [],
         { recordHistory: true }
       );
+      revokeUnusedBlobUrls(state.pages, normalizedPages, history);
 
       const nextPipelineConfig = pipelineConfig
         ? (() => {
@@ -1694,6 +1799,9 @@ export const useEditorStore = create((set, get) => ({
         selectedBlockId: null,
         selectedLayerIds: [],
         pipelineConfig: nextPipelineConfig,
+        typesetting: typesetting
+          ? { ...state.typesetting, ...typesetting }
+          : state.typesetting,
         viewLayers: viewLayers
           ? { ...state.viewLayers, ...viewLayers }
           : state.viewLayers,
@@ -2099,7 +2207,7 @@ export const useEditorStore = create((set, get) => ({
         MAX_HISTORY_STEPS
       );
 
-      const restoredPages = previous.pages.map(clonePage);
+      const restoredPages = [...(previous.pages || [])];
       const restoredActivePageId = restoredPages.some(
         (p) => p.id === previous.activePageId
       )
@@ -2147,7 +2255,7 @@ export const useEditorStore = create((set, get) => ({
         );
       const nextPast = [...past, currentSnapshot].slice(-MAX_HISTORY_STEPS);
 
-      const restoredPages = next.pages.map(clonePage);
+      const restoredPages = [...(next.pages || [])];
       const restoredActivePageId = restoredPages.some(
         (p) => p.id === next.activePageId
       )
@@ -2643,10 +2751,28 @@ export const useEditorStore = create((set, get) => ({
           backendSettings.panel_threshold !== undefined
             ? normalizeOptionalThreshold(backendSettings.panel_threshold)
             : state.pipelineConfig.panelThreshold,
+        whisperThreshold:
+          backendSettings.whisper_threshold !== undefined
+            ? normalizeOptionalThreshold(backendSettings.whisper_threshold)
+            : state.pipelineConfig.whisperThreshold,
+        borderlessThreshold:
+          backendSettings.borderless_threshold !== undefined
+            ? normalizeOptionalThreshold(backendSettings.borderless_threshold)
+            : state.pipelineConfig.borderlessThreshold,
+        enableAdaptiveTiling:
+          backendSettings.enable_adaptive_tiling !== undefined
+            ? Boolean(backendSettings.enable_adaptive_tiling)
+            : state.pipelineConfig.enableAdaptiveTiling,
+        sfxSuppressIou:
+          backendSettings.sfx_suppress_iou !== undefined
+            ? Number(backendSettings.sfx_suppress_iou)
+            : state.pipelineConfig.sfxSuppressIou,
         ocrModel:
           backendSettings.ocr_model ?? state.pipelineConfig.ocrModel,
         inpaintingModel:
           backendSettings.inpainting_model ?? state.pipelineConfig.inpaintingModel,
+        inpaintApiUrl:
+          backendSettings.inpaint_api_url ?? state.pipelineConfig.inpaintApiUrl,
         executionMode:
           backendSettings.execution_mode ?? state.pipelineConfig.executionMode,
         confThreshold:
@@ -2732,13 +2858,18 @@ export const useEditorStore = create((set, get) => ({
       theme: s.theme,
       accent_color: s.accentColor,
       ui_density: s.uiDensity,
-      detection_model: p.detectionModel || 'koharu-layout-rfdetr-seg-2xl',
+      detection_model: p.detectionModel || 'vellum-det-yolo11m-seg-1024-fp16',
       text_threshold: normalizeOptionalThreshold(p.textThreshold),
       bubble_threshold: normalizeOptionalThreshold(p.bubbleThreshold),
       panel_threshold: normalizeOptionalThreshold(p.panelThreshold),
+      whisper_threshold: normalizeOptionalThreshold(p.whisperThreshold),
+      borderless_threshold: normalizeOptionalThreshold(p.borderlessThreshold),
+      enable_adaptive_tiling: Boolean(p.enableAdaptiveTiling ?? true),
+      sfx_suppress_iou: Number(p.sfxSuppressIou ?? 0.60),
       ocr_model: p.ocrModel || 'auto',
       inpainting_model: p.inpaintingModel || 'lama-manga',
-      execution_mode: p.executionMode || 'auto',
+      inpaint_api_url: p.inpaintApiUrl || 'http://127.0.0.1:8188',
+      execution_mode: p.executionMode || 'hybrid',
       conf_threshold: Number(p.confThreshold ?? 0.35),
       nms_threshold: Number(p.nmsThreshold ?? 0.45),
       mask_threshold: Number(p.maskThreshold ?? 0.5),
@@ -2817,6 +2948,16 @@ export const useEditorStore = create((set, get) => ({
         ...state.runtimeStatus,
         executionProvider:
           data.execution_provider ?? state.runtimeStatus.executionProvider,
+        executionMode:
+          data.execution_mode ?? state.runtimeStatus.executionMode,
+        detectorProvider:
+          data.detector_provider ?? state.runtimeStatus.detectorProvider,
+        ocrProvider:
+          data.ocr_provider ?? state.runtimeStatus.ocrProvider,
+        inpainterProvider:
+          data.inpainter_provider ?? state.runtimeStatus.inpainterProvider,
+        detectorModel:
+          data.detector_model ?? state.runtimeStatus.detectorModel,
         availableProviders:
           data.available_providers ?? state.runtimeStatus.availableProviders,
         modelsReady:
@@ -2864,6 +3005,16 @@ export const useEditorStore = create((set, get) => ({
         ...state.runtimeStatus,
         executionProvider:
           data.execution_provider ?? state.runtimeStatus.executionProvider,
+        executionMode:
+          data.execution_mode ?? state.runtimeStatus.executionMode,
+        detectorProvider:
+          data.detector_provider ?? state.runtimeStatus.detectorProvider,
+        ocrProvider:
+          data.ocr_provider ?? state.runtimeStatus.ocrProvider,
+        inpainterProvider:
+          data.inpainter_provider ?? state.runtimeStatus.inpainterProvider,
+        detectorModel:
+          data.detector_model ?? state.runtimeStatus.detectorModel,
         availableProviders:
           data.available_providers ?? state.runtimeStatus.availableProviders,
         modelsReady:

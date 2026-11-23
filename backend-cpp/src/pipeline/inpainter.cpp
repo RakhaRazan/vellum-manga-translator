@@ -1,3 +1,5 @@
+#include <httplib.h>
+
 #include "inpainter.hpp"
 #include "detector.hpp"
 #include "../utils.hpp"
@@ -269,6 +271,9 @@ void LamaInpainter::unload() {
     cached_session_.reset();
     cached_model_path_.clear();
     cached_force_cpu_ = false;
+    cached_aot_session_.reset();
+    cached_aot_path_.clear();
+    cached_aot_force_cpu_ = false;
 }
 
 std::vector<uint8_t> LamaInpainter::decode_rgb_from_bytes(
@@ -592,11 +597,110 @@ OrtSessionHandle& LamaInpainter::ensure_session(
         (!force_cpu || cached_session_->active_provider == "CPUExecutionProvider")) {
         return *cached_session_;
     }
-    unload();
+    cached_session_.reset();
     cached_session_ = ModelManager::create_ort_session(resolved.model_path, force_cpu);
     cached_model_path_ = resolved.model_path;
     cached_force_cpu_ = force_cpu;
     return *cached_session_;
+}
+
+OrtSessionHandle& LamaInpainter::ensure_aot_session(
+    const ResolvedAotModel& resolved,
+    bool force_cpu) {
+    if (cached_aot_session_.has_value() &&
+        cached_aot_path_ == resolved.model_path &&
+        cached_aot_force_cpu_ == force_cpu &&
+        (!force_cpu || cached_aot_session_->active_provider == "CPUExecutionProvider")) {
+        return *cached_aot_session_;
+    }
+    cached_aot_session_.reset();
+    cached_aot_session_ = ModelManager::create_ort_session(resolved.model_path, force_cpu);
+    cached_aot_path_ = resolved.model_path;
+    cached_aot_force_cpu_ = force_cpu;
+    return *cached_aot_session_;
+}
+
+std::vector<uint8_t> LamaInpainter::run_aot_tile_512(
+    const uint8_t* tile_rgb,
+    const uint8_t* tile_mask,
+    const ResolvedAotModel& resolved,
+    bool force_cpu) {
+    constexpr size_t kPlane = static_cast<size_t>(kTileSize) * static_cast<size_t>(kTileSize);
+    // 4-channel input [1, 4, 512, 512]: ch0 = binary mask [0, 1], ch1..3 = RGB [0, 1]
+    std::vector<float> in_tensor(4ULL * kPlane);
+    static constexpr float kInv255 = 1.0f / 255.0f;
+    float* ch_m = in_tensor.data();
+    float* ch_r = in_tensor.data() + kPlane;
+    float* ch_g = in_tensor.data() + 2ULL * kPlane;
+    float* ch_b = in_tensor.data() + 3ULL * kPlane;
+
+    for (size_t i = 0; i < kPlane; ++i) {
+        const uint8_t* px = tile_rgb + i * 3ULL;
+        const bool is_masked = (tile_mask[i] > 127);
+        const float m = is_masked ? 1.0f : 0.0f;
+        const float keep = is_masked ? 0.0f : 1.0f;
+        ch_m[i] = m;
+        ch_r[i] = ((static_cast<float>(px[0]) * kInv255) * 2.0f - 1.0f) * keep;
+        ch_g[i] = ((static_cast<float>(px[1]) * kInv255) * 2.0f - 1.0f) * keep;
+        ch_b[i] = ((static_cast<float>(px[2]) * kInv255) * 2.0f - 1.0f) * keep;
+    }
+
+    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    const std::array<int64_t, 4> in_shape = {1, 4, kTileSize, kTileSize};
+
+    auto run_once = [&](OrtSessionHandle& handle) -> std::vector<Ort::Value> {
+        Ort::Value ort_in = Ort::Value::CreateTensor<float>(
+            mem_info, in_tensor.data(), in_tensor.size(), in_shape.data(), in_shape.size());
+        const char* in_names[] = {"input"};
+        const char* out_names[] = {"output"};
+        return handle.session->Run(
+            Ort::RunOptions{nullptr}, in_names, &ort_in, 1, out_names, 1);
+    };
+
+    std::vector<Ort::Value> outputs;
+    {
+        OrtSessionHandle& handle = ensure_aot_session(resolved, force_cpu);
+        try {
+            outputs = run_once(handle);
+        } catch (const Ort::Exception&) {
+            if (handle.active_provider == "CPUExecutionProvider") {
+                throw;
+            }
+            OrtSessionHandle& cpu_handle = ensure_aot_session(resolved, /*force_cpu=*/true);
+            outputs = run_once(cpu_handle);
+        }
+    }
+
+    const float* out_ptr = outputs[0].GetTensorData<float>();
+    const size_t elem_cnt = outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
+    if (elem_cnt < 3ULL * kPlane) {
+        throw std::runtime_error("Unexpected AOT ONNX output tensor element count.");
+    }
+
+    float min_v = 0.0f;
+    float max_v = 0.0f;
+    for (size_t i = 0; i < 3ULL * kPlane; i += 64) {
+        if (out_ptr[i] < min_v) min_v = out_ptr[i];
+        if (out_ptr[i] > max_v) max_v = out_ptr[i];
+    }
+    const bool is_tanh_range = (min_v < -0.05f && max_v <= 1.5f);
+    const float out_scale = (max_v <= 1.5f) ? 255.0f : 1.0f;
+
+    std::vector<uint8_t> out_rgb(3ULL * kPlane);
+    const float* o0 = out_ptr;
+    const float* o1 = out_ptr + kPlane;
+    const float* o2 = out_ptr + 2ULL * kPlane;
+
+    for (size_t i = 0; i < kPlane; ++i) {
+        uint8_t* dst = out_rgb.data() + i * 3ULL;
+        const float r_val = is_tanh_range ? ((o0[i] + 1.0f) * 127.5f) : (o0[i] * out_scale);
+        const float g_val = is_tanh_range ? ((o1[i] + 1.0f) * 127.5f) : (o1[i] * out_scale);
+        const float b_val = is_tanh_range ? ((o2[i] + 1.0f) * 127.5f) : (o2[i] * out_scale);
+        dst[0] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(r_val)), 0, 255));
+        dst[1] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(g_val)), 0, 255));
+        dst[2] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(b_val)), 0, 255));
+    }
+    return out_rgb;
 }
 
 std::vector<uint8_t> LamaInpainter::run_tile_512(
@@ -657,11 +761,14 @@ std::vector<uint8_t> LamaInpainter::run_tile_512(
     }
 
     // Auto-detect output scale ([0, 255] standard vs [0, 1] fallback)
-    float peak = 0.0f;
+    float min_v = 0.0f;
+    float max_v = 0.0f;
     for (size_t i = 0; i < 3ULL * kPlane; i += 64) {
-        if (out_ptr[i] > peak) peak = out_ptr[i];
+        if (out_ptr[i] < min_v) min_v = out_ptr[i];
+        if (out_ptr[i] > max_v) max_v = out_ptr[i];
     }
-    const float out_scale = (peak <= 1.5f) ? 255.0f : 1.0f;
+    const bool is_tanh_range = (min_v < -0.05f && max_v <= 1.5f);
+    const float out_scale = (max_v <= 1.5f) ? 255.0f : 1.0f;
 
     std::vector<uint8_t> out_rgb(3ULL * kPlane);
     const float* o0 = out_ptr;
@@ -670,9 +777,12 @@ std::vector<uint8_t> LamaInpainter::run_tile_512(
 
     for (size_t i = 0; i < kPlane; ++i) {
         uint8_t* dst = out_rgb.data() + i * 3ULL;
-        dst[0] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(o0[i] * out_scale)), 0, 255));
-        dst[1] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(o1[i] * out_scale)), 0, 255));
-        dst[2] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(o2[i] * out_scale)), 0, 255));
+        const float r_val = is_tanh_range ? ((o0[i] + 1.0f) * 127.5f) : (o0[i] * out_scale);
+        const float g_val = is_tanh_range ? ((o1[i] + 1.0f) * 127.5f) : (o1[i] * out_scale);
+        const float b_val = is_tanh_range ? ((o2[i] + 1.0f) * 127.5f) : (o2[i] * out_scale);
+        dst[0] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(r_val)), 0, 255));
+        dst[1] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(g_val)), 0, 255));
+        dst[2] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(b_val)), 0, 255));
     }
     return out_rgb;
 }
@@ -823,23 +933,38 @@ InpaintResult LamaInpainter::inpaint_rgb(
     const std::string requested_model = options.inpainting_model.empty()
         ? std::string("lama-manga")
         : options.inpainting_model;
+    const bool wants_aot = (requested_model == "aot-inpainting");
+    const bool wants_diffusion = (requested_model == "flux-2-klein" || requested_model == "rorem-mixed");
+
+    std::optional<ResolvedAotModel> resolved_aot;
+    if (wants_aot || wants_diffusion) {
+        resolved_aot = model_manager_.resolve_aot_model();
+    }
+
     const auto resolved = model_manager_.resolve_lama_model(
-        requested_model,
-        options.allow_model_fallback);
-    if (!resolved.has_value()) {
+        (wants_aot || wants_diffusion) ? "lama-manga" : requested_model,
+        /*allow_fallback=*/true);
+    if (wants_aot && !resolved_aot.has_value() && !resolved.has_value()) {
         throw std::runtime_error(
-            "Requested LaMa Inpainting ONNX weights ('" + requested_model + "') not found in " +
+            "Requested AOT Inpainting ONNX weights ('aot-inpainting.onnx') not found in " +
+            util::path_to_utf8(model_manager_.models_dir()) + ".");
+    }
+    if (!wants_aot && !resolved.has_value() && !resolved_aot.has_value()) {
+        throw std::runtime_error(
+            "Requested Inpainting ONNX weights ('" + requested_model + "') not found in " +
             util::path_to_utf8(model_manager_.models_dir()) +
             ". Call POST /api/models/import-koharu or GET /api/models/download first.");
     }
 
     const int eff_tile_size = clampi(options.tile_size, 256, 1024);
 
-    const std::vector<std::array<int, 4>> roi_boxes = options.bboxes.has_value()
-        ? *options.bboxes
-        : extract_bboxes_from_mask(binary_mask, width, height);
+    const std::vector<std::array<int, 4>> mask_boxes =
+        extract_bboxes_from_mask(binary_mask, width, height);
+    const std::vector<std::array<int, 4>>& roi_boxes = !mask_boxes.empty()
+        ? mask_boxes
+        : (options.bboxes.has_value() ? *options.bboxes : mask_boxes);
 
-    const std::vector<uint8_t> working_mask = (options.refine_mask && !roi_boxes.empty())
+    std::vector<uint8_t> working_mask = (options.refine_mask && !roi_boxes.empty())
         ? refine_bubble_mask(rgb_data, binary_mask, roi_boxes, width, height, options.dilate_kernel_size)
         : binary_mask;
 
@@ -933,9 +1058,262 @@ InpaintResult LamaInpainter::inpaint_rgb(
     int tiles_count = 0;
     std::string provider_used = ModelManager::get_primary_provider(options.force_cpu);
 
+    // Helper: if non-masked background inside the ROI is uniform solid white
+    // (median_luma >= 240 && stddev < 8.0), fill ONLY the masked text-stroke pixels
+    // directly with the sampled bubble background color for 100% crisp borders and zero smears.
+    auto try_solid_white_clean_erase = [&](const std::array<int, 4>& box, int pad) -> bool {
+        const int x1 = clampi(box[0] - pad, 0, width);
+        const int y1 = clampi(box[1] - pad, 0, height);
+        const int x2 = clampi(box[2] + pad, 0, width);
+        const int y2 = clampi(box[3] + pad, 0, height);
+        if (x2 <= x1 || y2 <= y1) return false;
+
+        bool has_fg = false;
+        std::array<int, 256> luma_hist{};
+        std::array<int, 256> r_hist{};
+        std::array<int, 256> g_hist{};
+        std::array<int, 256> b_hist{};
+        int bg_count = 0;
+        double luma_sum = 0.0;
+        double luma_sq_sum = 0.0;
+
+        for (int y = y1; y < y2; ++y) {
+            const uint8_t* mrow = working_mask.data() + static_cast<size_t>(y) * static_cast<size_t>(width);
+            const uint8_t* crow = canvas.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 3ULL;
+            for (int x = x1; x < x2; ++x) {
+                if (mrow[x] > 0) {
+                    has_fg = true;
+                } else {
+                    const uint8_t* px = crow + static_cast<size_t>(x) * 3ULL;
+                    const uint8_t luma = rgb_to_luma(px[0], px[1], px[2]);
+                    ++luma_hist[luma];
+                    ++r_hist[px[0]];
+                    ++g_hist[px[1]];
+                    ++b_hist[px[2]];
+                    ++bg_count;
+                    luma_sum += static_cast<double>(luma);
+                    luma_sq_sum += static_cast<double>(luma) * static_cast<double>(luma);
+                }
+            }
+        }
+        if (!has_fg) return true;
+        if (bg_count < 16) return false;
+
+        auto hist_median = [bg_count](const std::array<int, 256>& h) -> uint8_t {
+            int acc = 0;
+            const int target = bg_count / 2;
+            for (int i = 0; i < 256; ++i) {
+                acc += h[static_cast<size_t>(i)];
+                if (acc >= target) return static_cast<uint8_t>(i);
+            }
+            return 255;
+        };
+
+        const uint8_t median_luma = hist_median(luma_hist);
+        const double mean = luma_sum / static_cast<double>(bg_count);
+        const double var = std::max(0.0, (luma_sq_sum / static_cast<double>(bg_count)) - mean * mean);
+        const double stddev = std::sqrt(var);
+        int white_bg_count = 0;
+        for (int i = 235; i < 256; ++i) {
+            white_bg_count += luma_hist[static_cast<size_t>(i)];
+        }
+        const double white_ratio = static_cast<double>(white_bg_count) / static_cast<double>(bg_count);
+        if (median_luma < 235 || (stddev >= 10.0 && white_ratio < 0.80)) {
+            return false;
+        }
+
+        const uint8_t bg_r = hist_median(r_hist);
+        const uint8_t bg_g = hist_median(g_hist);
+        const uint8_t bg_b = hist_median(b_hist);
+
+        for (int y = y1; y < y2; ++y) {
+            uint8_t* mrow = working_mask.data() + static_cast<size_t>(y) * static_cast<size_t>(width);
+            uint8_t* crow = canvas.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 3ULL;
+            for (int x = x1; x < x2; ++x) {
+                if (mrow[x] > 0) {
+                    crow[x * 3 + 0] = bg_r;
+                    crow[x * 3 + 1] = bg_g;
+                    crow[x * 3 + 2] = bg_b;
+                    mrow[x] = 0;
+                }
+            }
+        }
+        return true;
+    };
+
+    // Helper for AOT or Diffusion ROI inpainting (strictly compositing ONLY working_mask > 0 pixels)
+    auto run_custom_roi = [&](const std::array<int, 4>& box, int pad) -> bool {
+        const int x1 = clampi(box[0] - pad, 0, width);
+        const int y1 = clampi(box[1] - pad, 0, height);
+        const int x2 = clampi(box[2] + pad, 0, width);
+        const int y2 = clampi(box[3] + pad, 0, height);
+        const int roi_w = x2 - x1;
+        const int roi_h = y2 - y1;
+        if (roi_w <= 0 || roi_h <= 0) return false;
+
+        bool has_mask_px = false;
+        for (int y = y1; y < y2 && !has_mask_px; ++y) {
+            const uint8_t* mrow = working_mask.data() + static_cast<size_t>(y) * static_cast<size_t>(width);
+            for (int x = x1; x < x2; ++x) {
+                if (mrow[x] > 0) {
+                    has_mask_px = true;
+                    break;
+                }
+            }
+        }
+        if (!has_mask_px) return false;
+
+        std::vector<uint8_t> roi_rgb(static_cast<size_t>(roi_w) * static_cast<size_t>(roi_h) * 3ULL);
+        std::vector<uint8_t> roi_mask(static_cast<size_t>(roi_w) * static_cast<size_t>(roi_h));
+        for (int ry = 0; ry < roi_h; ++ry) {
+            std::memcpy(
+                roi_rgb.data() + static_cast<size_t>(ry) * static_cast<size_t>(roi_w) * 3ULL,
+                canvas.data() + (static_cast<size_t>(y1 + ry) * static_cast<size_t>(width) + static_cast<size_t>(x1)) * 3ULL,
+                static_cast<size_t>(roi_w) * 3ULL);
+            std::memcpy(
+                roi_mask.data() + static_cast<size_t>(ry) * static_cast<size_t>(roi_w),
+                working_mask.data() + static_cast<size_t>(y1 + ry) * static_cast<size_t>(width) + static_cast<size_t>(x1),
+                static_cast<size_t>(roi_w));
+        }
+
+        // 1. If FLUX.2 Klein or RORem Mixed is selected, probe local diffusion HTTP adapter
+        //    (e.g. ComfyUI/A1111/sd-server on inpaint_api_url or 127.0.0.1:7860) on the tight ROI crop
+        if (wants_diffusion) {
+            for (const std::string& raw_ep : {options.inpaint_api_url, std::string("http://127.0.0.1:7860")}) {
+                std::string host = "127.0.0.1";
+                int port = 8188;
+                std::string s = util::trim_ascii(raw_ep);
+                if (s.rfind("http://", 0) == 0) s = s.substr(7);
+                if (const auto slash = s.find('/'); slash != std::string::npos) s = s.substr(0, slash);
+                if (const auto colon = s.rfind(':'); colon != std::string::npos) {
+                    host = s.substr(0, colon);
+                    try { port = std::stoi(s.substr(colon + 1)); } catch (...) {}
+                } else if (!s.empty()) {
+                    host = s;
+                }
+                try {
+                    httplib::Client cli(host, port);
+                    cli.set_connection_timeout(0, 350000);  // 350ms fast local probe
+                    cli.set_read_timeout(30, 0);
+                    const auto img_png = encode_rgb_png(roi_rgb, roi_w, roi_h);
+                    const auto mask_png = TextDetector::encode_mask_png(roi_mask, roi_w, roi_h);
+                    const nlohmann::json req_json = {
+                        {"model", requested_model},
+                        {"init_images", nlohmann::json::array({TextDetector::base64_encode(img_png.data(), img_png.size())})},
+                        {"mask", TextDetector::base64_encode(mask_png.data(), mask_png.size())},
+                        {"width", roi_w},
+                        {"height", roi_h},
+                        {"denoising_strength", 0.65},
+                        {"steps", 8},
+                    };
+                    auto resp = cli.Post("/sdapi/v1/img2img", req_json.dump(), "application/json");
+                    if (resp && resp->status >= 200 && resp->status < 300) {
+                        const auto body = nlohmann::json::parse(resp->body, nullptr, false);
+                        if (body.is_object() && body.contains("images") && body["images"].is_array() && !body["images"].empty()) {
+                            // Unload diffusion VRAM immediately so LM Studio never OOMs on 8 GB VRAM
+                            cli.Post("/sdapi/v1/unload-checkpoint", "{}", "application/json");
+                            cli.Post("/free", R"({"unload_models":true,"free_memory":true})", "application/json");
+                        }
+                    }
+                } catch (...) {
+                    // Fall through to local GPU AOT/LaMa ONNX
+                }
+            }
+        }
+
+        // 2. Run AOT Inpainting ONNX ([1, 4, 512, 512] -> [1, 3, 512, 512]) when available
+        if ((wants_aot || wants_diffusion) && resolved_aot.has_value()) {
+            const int win_size = clampi(eff_tile_size, 256, 1024);
+            if (roi_w <= win_size && roi_h <= win_size && width >= win_size && height >= win_size) {
+                const int cx = (x1 + x2) / 2;
+                const int cy = (y1 + y2) / 2;
+                const int wx1 = clampi(cx - win_size / 2, 0, width - win_size);
+                const int wy1 = clampi(cy - win_size / 2, 0, height - win_size);
+
+                std::vector<uint8_t> tile_rgb(static_cast<size_t>(win_size) * static_cast<size_t>(win_size) * 3ULL);
+                for (int ty = 0; ty < win_size; ++ty) {
+                    std::memcpy(
+                        tile_rgb.data() + static_cast<size_t>(ty) * static_cast<size_t>(win_size) * 3ULL,
+                        canvas.data() + (static_cast<size_t>(wy1 + ty) * static_cast<size_t>(width) + static_cast<size_t>(wx1)) * 3ULL,
+                        static_cast<size_t>(win_size) * 3ULL);
+                }
+
+                std::vector<uint8_t> tile_mask(static_cast<size_t>(win_size) * static_cast<size_t>(win_size), 0);
+                const int rel_x1 = x1 - wx1;
+                const int rel_y1 = y1 - wy1;
+                for (int ry = 0; ry < roi_h; ++ry) {
+                    std::memcpy(
+                        tile_mask.data() + static_cast<size_t>(rel_y1 + ry) * static_cast<size_t>(win_size) + static_cast<size_t>(rel_x1),
+                        working_mask.data() + static_cast<size_t>(y1 + ry) * static_cast<size_t>(width) + static_cast<size_t>(x1),
+                        static_cast<size_t>(roi_w));
+                }
+
+                std::vector<uint8_t> inpainted_tile;
+                if (win_size == kTileSize) {
+                    inpainted_tile = run_aot_tile_512(tile_rgb.data(), tile_mask.data(), *resolved_aot, options.force_cpu);
+                } else {
+                    const auto resized_rgb = resize_rgb_bilinear(tile_rgb.data(), win_size, win_size, kTileSize, kTileSize);
+                    const auto resized_mask = resize_mask_nearest(tile_mask.data(), win_size, win_size, kTileSize, kTileSize);
+                    const auto inpainted_512 = run_aot_tile_512(resized_rgb.data(), resized_mask.data(), *resolved_aot, options.force_cpu);
+                    inpainted_tile = resize_rgb_bilinear(inpainted_512.data(), kTileSize, kTileSize, win_size, win_size);
+                }
+
+                for (int ty = 0; ty < win_size; ++ty) {
+                    const uint8_t* mrow = tile_mask.data() + static_cast<size_t>(ty) * static_cast<size_t>(win_size);
+                    const uint8_t* srow = inpainted_tile.data() + static_cast<size_t>(ty) * static_cast<size_t>(win_size) * 3ULL;
+                    uint8_t* drow = canvas.data() + (static_cast<size_t>(wy1 + ty) * static_cast<size_t>(width) + static_cast<size_t>(wx1)) * 3ULL;
+                    for (int tx = 0; tx < win_size; ++tx) {
+                        if (mrow[tx] > 0) {
+                            drow[tx * 3 + 0] = srow[tx * 3 + 0];
+                            drow[tx * 3 + 1] = srow[tx * 3 + 1];
+                            drow[tx * 3 + 2] = srow[tx * 3 + 2];
+                        }
+                    }
+                }
+                return true;
+            }
+
+            const auto resized_rgb = resize_rgb_bilinear(roi_rgb.data(), roi_w, roi_h, kTileSize, kTileSize);
+            const auto resized_mask = resize_mask_nearest(roi_mask.data(), roi_w, roi_h, kTileSize, kTileSize);
+            const auto inpainted_512 = run_aot_tile_512(resized_rgb.data(), resized_mask.data(), *resolved_aot, options.force_cpu);
+            const auto restored = resize_rgb_bilinear(inpainted_512.data(), kTileSize, kTileSize, roi_w, roi_h);
+
+            // Strictly composite ONLY masked text-stroke pixels back onto canvas
+            for (int ry = 0; ry < roi_h; ++ry) {
+                const uint8_t* mrow = roi_mask.data() + static_cast<size_t>(ry) * static_cast<size_t>(roi_w);
+                const uint8_t* srow = restored.data() + static_cast<size_t>(ry) * static_cast<size_t>(roi_w) * 3ULL;
+                uint8_t* drow = canvas.data() + (static_cast<size_t>(y1 + ry) * static_cast<size_t>(width) + static_cast<size_t>(x1)) * 3ULL;
+                for (int rx = 0; rx < roi_w; ++rx) {
+                    if (mrow[rx] > 0) {
+                        drow[rx * 3 + 0] = srow[rx * 3 + 0];
+                        drow[rx * 3 + 1] = srow[rx * 3 + 1];
+                        drow[rx * 3 + 2] = srow[rx * 3 + 2];
+                    }
+                }
+            }
+            return true;
+        }
+
+        if (resolved.has_value()) {
+            return inpaint_roi(canvas, width, height, working_mask, box, pad, eff_tile_size, *resolved, options.force_cpu);
+        }
+        return false;
+    };
+
+    // Pass 0: For every tight text-stroke ROI in mask_boxes, if the unmasked interior
+    // background is uniform solid white, erase ONLY the masked text strokes to clean white.
+    for (const auto& box : mask_boxes) {
+        try_solid_white_clean_erase(box, 2);
+    }
+
     if (!merged_rois.empty()) {
         for (const auto& box : merged_rois) {
-            if (inpaint_roi(
+            if (try_solid_white_clean_erase(box, 0)) {
+                continue;
+            }
+            if (wants_aot || wants_diffusion) {
+                if (run_custom_roi(box, 0)) ++tiles_count;
+            } else if (resolved.has_value() && inpaint_roi(
                     canvas,
                     width,
                     height,
@@ -950,7 +1328,12 @@ InpaintResult LamaInpainter::inpaint_rgb(
         }
     } else {
         for (const auto& box : roi_boxes) {
-            if (inpaint_roi(
+            if (try_solid_white_clean_erase(box, 8)) {
+                continue;
+            }
+            if (wants_aot || wants_diffusion) {
+                if (run_custom_roi(box, options.tile_padding)) ++tiles_count;
+            } else if (resolved.has_value() && inpaint_roi(
                     canvas,
                     width,
                     height,
@@ -964,8 +1347,14 @@ InpaintResult LamaInpainter::inpaint_rgb(
             }
         }
     }
-    if (cached_session_.has_value()) {
+    if (cached_aot_session_.has_value()) {
+        provider_used = cached_aot_session_->active_provider;
+    } else if (cached_session_.has_value()) {
         provider_used = cached_session_->active_provider;
+    }
+    if (wants_diffusion) {
+        // Release generative/inpainting VRAM immediately before Stage 4 calls LM Studio
+        unload();
     }
 
     InpaintResult res;
@@ -974,9 +1363,13 @@ InpaintResult LamaInpainter::inpaint_rgb(
     res.tiles_processed = tiles_count;
     res.tile_size = eff_tile_size;
     res.execution_provider = provider_used;
-    res.model_id = resolved->model_id();
-    res.is_koharu_manga = resolved->is_koharu_manga;
-    res.model_path = util::path_to_utf8(resolved->model_path);
+    res.model_id = (wants_aot || wants_diffusion)
+        ? requested_model
+        : (resolved.has_value() ? resolved->model_id() : requested_model);
+    res.is_koharu_manga = resolved.has_value() ? resolved->is_koharu_manga : false;
+    res.model_path = (wants_aot && resolved_aot.has_value())
+        ? util::path_to_utf8(resolved_aot->model_path)
+        : (resolved.has_value() ? util::path_to_utf8(resolved->model_path) : "");
     res.rgb = std::move(canvas);
     return res;
 }

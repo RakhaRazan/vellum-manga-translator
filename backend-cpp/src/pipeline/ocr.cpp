@@ -474,11 +474,20 @@ std::string OcrEngine::normalize_ocr_model(const std::string& raw) {
         cleaned == "koharu-manga-ocr" || cleaned == "koharu_manga_ocr") {
         return "manga-ocr";
     }
-    if (cleaned == "paddleocr-vl-gguf" || cleaned == "paddleocr_vl_gguf" ||
+    if (cleaned == "baberu-ocr" || cleaned == "baberu_ocr" || cleaned == "baberu" ||
+        cleaned == "baberuocr") {
+        return "baberu-ocr";
+    }
+    if (cleaned == "hayai-ocr" || cleaned == "hayai_ocr" || cleaned == "hayai" ||
+        cleaned == "hayaiocr" || cleaned == "hayai-ocr-v2" || cleaned == "hayai_ocr_v2") {
+        return "hayai-ocr";
+    }
+    if (cleaned == "paddleocr-vl-1.6" || cleaned == "paddleocr_vl_1.6" ||
+        cleaned == "paddleocr-vl-gguf" || cleaned == "paddleocr_vl_gguf" ||
         cleaned == "paddleocr-vl" || cleaned == "paddleocr_vl" ||
         cleaned == "paddle-vl" || cleaned == "paddle_vl" ||
         cleaned == "paddleocr-vl-1.6-gguf") {
-        return "paddleocr-vl-gguf";
+        return "paddleocr-vl-1.6";
     }
     if (cleaned == "rapidocr-ppocrv4" || cleaned == "rapidocr_ppocrv4" ||
         cleaned == "rapidocr" || cleaned == "rapid-ocr" || cleaned == "rapid_ocr" ||
@@ -487,7 +496,7 @@ std::string OcrEngine::normalize_ocr_model(const std::string& raw) {
     }
     throw std::invalid_argument(
         "Unsupported ocr_model '" + raw +
-        "'. Supported options: 'auto', 'manga-ocr', 'paddleocr-vl-gguf', 'rapidocr-ppocrv4'.");
+        "'. Supported options: 'auto', 'paddleocr-vl-1.6', 'manga-ocr', 'baberu-ocr', 'hayai-ocr', 'rapidocr-ppocrv4'.");
 }
 
 std::string OcrEngine::resolve_effective_ocr_model(
@@ -506,6 +515,15 @@ void OcrEngine::unload() {
     manga_dec_session_.reset();
     manga_vocab_.clear();
     manga_force_cpu_ = false;
+    baberu_vis_session_.reset();
+    baberu_pre_session_.reset();
+    baberu_stp_session_.reset();
+    baberu_id2ch_.clear();
+    baberu_symbol_ids_.clear();
+    hayai_enc_session_.reset();
+    hayai_dec_session_.reset();
+    hayai_id2tok_.clear();
+    hayai_force_cpu_ = false;
     rapid_det_session_.reset();
     rapid_cls_session_.reset();
     rapid_rec_session_.reset();
@@ -1101,6 +1119,341 @@ std::string OcrEngine::recognize_ja_crop(const RgbImage& raw_crop, const std::st
 }
 
 // -----------------------------------------------------------------------------
+// Baberu OCR (`genshiai-daichi/baberu-ocr` ONNX Vision + INT8 KV-Cache Decoder)
+// -----------------------------------------------------------------------------
+
+void OcrEngine::ensure_baberu_ocr_loaded() {
+    if (baberu_vis_session_.has_value() &&
+        baberu_pre_session_.has_value() &&
+        baberu_stp_session_.has_value() &&
+        !baberu_id2ch_.empty()) {
+        return;
+    }
+
+    baberu_vis_session_.reset();
+    baberu_pre_session_.reset();
+    baberu_stp_session_.reset();
+    baberu_id2ch_.clear();
+    baberu_symbol_ids_.clear();
+
+    const auto resolved = model_manager_.resolve_baberu_ocr_models();
+    if (!resolved.has_value()) {
+        throw std::runtime_error(
+            "Baberu OCR ONNX weights (baberu-ocr/vision_int4.onnx, decoder_prefill_int8.onnx, decoder_step_int8.onnx, vocab.json) "
+            "not found in " + util::path_to_utf8(model_manager_.models_dir()) + ".");
+    }
+
+    const auto vocab_bytes = util::read_file_bytes(resolved->vocab_json);
+    if (!vocab_bytes.has_value() || vocab_bytes->empty()) {
+        throw std::runtime_error("Failed to read Baberu OCR vocab.json.");
+    }
+    const json charset = json::parse(vocab_bytes->begin(), vocab_bytes->end(), nullptr, false);
+    if (charset.is_discarded() || !charset.is_array()) {
+        throw std::runtime_error("Invalid JSON array in Baberu OCR vocab.json.");
+    }
+
+    baberu_id2ch_.assign(charset.size() + 4, "");
+    for (size_t i = 0; i < charset.size(); ++i) {
+        if (charset[i].is_string()) {
+            const std::string ch = charset[i].get<std::string>();
+            baberu_id2ch_[i + 4] = ch;
+            if (ch == "ー" || ch == "ｰ" || ch == "〜" || ch == "~" || ch == "." || ch == "…") {
+                baberu_symbol_ids_.insert(static_cast<int64_t>(i + 4));
+            }
+        }
+    }
+
+    // Keep Baberu OCR strictly on fast AVX2 CPUExecutionProvider to conserve RTX VRAM
+    baberu_vis_session_ = ModelManager::create_ort_session(resolved->vision_onnx, /*force_cpu=*/true);
+    baberu_pre_session_ = ModelManager::create_ort_session(resolved->decoder_prefill_onnx, /*force_cpu=*/true);
+    baberu_stp_session_ = ModelManager::create_ort_session(resolved->decoder_step_onnx, /*force_cpu=*/true);
+}
+
+std::string OcrEngine::recognize_baberu_crop(const RgbImage& raw_crop) {
+    ensure_baberu_ocr_loaded();
+
+    constexpr int kImgSize = 224;
+    constexpr int64_t kBosId = 1;
+    constexpr int64_t kEosId = 2;
+    constexpr int64_t kPadId = 0;
+    constexpr int kMaxNewTokens = 128;
+    constexpr float kRepetitionPenalty = 1.2f;
+
+    const RgbImage padded = pad_rgb_white(raw_crop, 6, 6, 6, 6);
+    const std::vector<uint8_t> resized =
+        resize_rgb_bilinear(padded.data.data(), padded.width, padded.height, kImgSize, kImgSize);
+
+    // DINOv2 / ImageNet normalization: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+    constexpr size_t kPlane = static_cast<size_t>(kImgSize) * static_cast<size_t>(kImgSize);
+    std::vector<float> pixel_values(3ULL * kPlane);
+    for (size_t i = 0; i < kPlane; ++i) {
+        const float r = static_cast<float>(resized[i * 3ULL + 0]) / 255.0f;
+        const float g = static_cast<float>(resized[i * 3ULL + 1]) / 255.0f;
+        const float b = static_cast<float>(resized[i * 3ULL + 2]) / 255.0f;
+        pixel_values[i] = (r - 0.485f) / 0.229f;
+        pixel_values[kPlane + i] = (g - 0.456f) / 0.224f;
+        pixel_values[2ULL * kPlane + i] = (b - 0.406f) / 0.225f;
+    }
+
+    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    const std::array<int64_t, 4> vis_in_shape = {1, 3, kImgSize, kImgSize};
+    Ort::Value vis_in = Ort::Value::CreateTensor<float>(
+        mem_info, pixel_values.data(), pixel_values.size(), vis_in_shape.data(), vis_in_shape.size());
+
+    const char* vis_in_names[] = {"pixel_values"};
+    const char* vis_out_names[] = {"vision_embeds"};
+    auto vis_outputs = baberu_vis_session_->session->Run(
+        Ort::RunOptions{nullptr}, vis_in_names, &vis_in, 1, vis_out_names, 1);
+
+    const auto vis_shape = vis_outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+    const int64_t vis_seq_len = (vis_shape.size() >= 2) ? vis_shape[1] : 256;
+
+    // Prefill pass: vision_embeds + BOS token
+    int64_t bos_token = kBosId;
+    const std::array<int64_t, 2> id_shape = {1, 1};
+    std::array<Ort::Value, 2> pre_inputs = {
+        std::move(vis_outputs[0]),
+        Ort::Value::CreateTensor<int64_t>(mem_info, &bos_token, 1, id_shape.data(), id_shape.size()),
+    };
+    const char* pre_in_names[] = {"vision_embeds", "input_ids"};
+    const char* pre_out_names[] = {
+        "logits",
+        "present_k0", "present_k1", "present_k2", "present_k3", "present_k4", "present_k5",
+        "present_v0", "present_v1", "present_v2", "present_v3", "present_v4", "present_v5",
+    };
+    auto cur_outputs = baberu_pre_session_->session->Run(
+        Ort::RunOptions{nullptr}, pre_in_names, pre_inputs.data(), pre_inputs.size(), pre_out_names, 13);
+
+    std::vector<int64_t> generated;
+    generated.reserve(64);
+    std::unordered_set<int64_t> seen_tokens{kBosId};
+    int64_t pos = vis_seq_len + 1;
+
+    const char* stp_in_names[] = {
+        "input_ids", "position_ids",
+        "past_k0", "past_k1", "past_k2", "past_k3", "past_k4", "past_k5",
+        "past_v0", "past_v1", "past_v2", "past_v3", "past_v4", "past_v5",
+    };
+
+    for (int step = 0; step < kMaxNewTokens; ++step) {
+        const auto logits_shape = cur_outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+        if (logits_shape.size() != 3 || logits_shape[2] <= 0) break;
+        const size_t seq_len = static_cast<size_t>(logits_shape[1]);
+        const size_t vocab_sz = static_cast<size_t>(logits_shape[2]);
+        const float* raw_logits = cur_outputs[0].GetTensorData<float>() + (seq_len - 1ULL) * vocab_sz;
+        std::vector<float> logits(raw_logits, raw_logits + vocab_sz);
+
+        for (int64_t tid : seen_tokens) {
+            if (tid >= 0 && static_cast<size_t>(tid) < vocab_sz) {
+                float s = logits[static_cast<size_t>(tid)];
+                logits[static_cast<size_t>(tid)] = (s < 0.0f) ? (s * kRepetitionPenalty) : (s / kRepetitionPenalty);
+            }
+        }
+
+        if (!generated.empty()) {
+            const int64_t last = generated.back();
+            const int cap = baberu_symbol_ids_.count(last) ? 16 : 12;
+            int run = 0;
+            for (auto it = generated.rbegin(); it != generated.rend() && *it == last; ++it) {
+                ++run;
+            }
+            if (run >= cap && last >= 0 && static_cast<size_t>(last) < vocab_sz) {
+                logits[static_cast<size_t>(last)] = -std::numeric_limits<float>::infinity();
+            }
+        }
+
+        int64_t best_id = kEosId;
+        float best_val = -std::numeric_limits<float>::infinity();
+        for (size_t v = 0; v < vocab_sz; ++v) {
+            if (logits[v] > best_val) {
+                best_val = logits[v];
+                best_id = static_cast<int64_t>(v);
+            }
+        }
+        if (best_id == kEosId || best_id == kPadId) {
+            break;
+        }
+        generated.push_back(best_id);
+        seen_tokens.insert(best_id);
+        if (static_cast<int>(generated.size()) >= kMaxNewTokens) {
+            break;
+        }
+
+        int64_t next_tok = best_id;
+        int64_t cur_pos = pos++;
+        std::vector<Ort::Value> stp_inputs;
+        stp_inputs.reserve(14);
+        stp_inputs.push_back(Ort::Value::CreateTensor<int64_t>(mem_info, &next_tok, 1, id_shape.data(), id_shape.size()));
+        stp_inputs.push_back(Ort::Value::CreateTensor<int64_t>(mem_info, &cur_pos, 1, id_shape.data(), id_shape.size()));
+        for (size_t k = 1; k <= 12; ++k) {
+            stp_inputs.push_back(std::move(cur_outputs[k]));
+        }
+
+        cur_outputs = baberu_stp_session_->session->Run(
+            Ort::RunOptions{nullptr}, stp_in_names, stp_inputs.data(), stp_inputs.size(), pre_out_names, 13);
+    }
+
+    std::string out;
+    for (int64_t tid : generated) {
+        if (tid >= 4 && static_cast<size_t>(tid) < baberu_id2ch_.size()) {
+            out.append(baberu_id2ch_[static_cast<size_t>(tid)]);
+        }
+    }
+    return util::trim_ascii(out);
+}
+
+// -----------------------------------------------------------------------------
+// Hayai OCR v2.1 (`JustANormalTinkerer/hayai-ocr-v2` SigLIP2 + 2D-mRoPE Decoder)
+// -----------------------------------------------------------------------------
+
+void OcrEngine::ensure_hayai_ocr_loaded(bool force_cpu) {
+    if (hayai_enc_session_.has_value() &&
+        hayai_dec_session_.has_value() &&
+        !hayai_id2tok_.empty() &&
+        hayai_force_cpu_ == force_cpu) {
+        return;
+    }
+
+    hayai_enc_session_.reset();
+    hayai_dec_session_.reset();
+    hayai_id2tok_.clear();
+
+    const auto resolved = model_manager_.resolve_hayai_ocr_models();
+    if (!resolved.has_value()) {
+        throw std::runtime_error(
+            "Hayai OCR ONNX weights (hayai-ocr/encoder.onnx, decoder.onnx, vocab.json) "
+            "not found in " + util::path_to_utf8(model_manager_.models_dir()) + ".");
+    }
+
+    const auto vocab_bytes = util::read_file_bytes(resolved->vocab_json);
+    if (!vocab_bytes.has_value() || vocab_bytes->empty()) {
+        throw std::runtime_error("Failed to read Hayai OCR vocab.json.");
+    }
+    const json vj = json::parse(vocab_bytes->begin(), vocab_bytes->end(), nullptr, false);
+    if (vj.is_discarded()) {
+        throw std::runtime_error("Invalid JSON in Hayai OCR vocab.json.");
+    }
+
+    if (vj.is_object() && vj.contains("tokens") && vj["tokens"].is_array()) {
+        hayai_bos_id_ = vj.value("bos_id", 1);
+        hayai_eos_id_ = vj.value("eos_id", 2);
+        hayai_pad_id_ = vj.value("pad_id", 0);
+        const auto& arr = vj["tokens"];
+        hayai_id2tok_.resize(arr.size());
+        for (size_t i = 0; i < arr.size(); ++i) {
+            if (arr[i].is_string()) {
+                hayai_id2tok_[i] = arr[i].get<std::string>();
+            }
+        }
+    } else if (vj.is_array()) {
+        hayai_id2tok_.resize(vj.size());
+        for (size_t i = 0; i < vj.size(); ++i) {
+            if (vj[i].is_string()) {
+                hayai_id2tok_[i] = vj[i].get<std::string>();
+            }
+        }
+    }
+
+    hayai_enc_session_ = ModelManager::create_ort_session(resolved->encoder_onnx, force_cpu);
+    // Autoregressive decoder uses dynamic sequence length 1..N; run on CPU when DirectML is active
+    // to avoid per-step DirectML shader compilation stalls.
+    const bool dec_cpu = force_cpu || (hayai_enc_session_->active_provider == "DmlExecutionProvider");
+    hayai_dec_session_ = ModelManager::create_ort_session(resolved->decoder_onnx, dec_cpu);
+    hayai_force_cpu_ = force_cpu;
+}
+
+std::string OcrEngine::recognize_hayai_crop(const RgbImage& raw_crop) {
+    constexpr int kImgSize = 256;
+    constexpr size_t kMaxTokens = 96;
+
+    const RgbImage padded = pad_rgb_white(raw_crop, 6, 6, 6, 6);
+    const std::vector<uint8_t> resized =
+        resize_rgb_bilinear(padded.data.data(), padded.width, padded.height, kImgSize, kImgSize);
+
+    // SigLIP2 normalization: (px / 255.0 - 0.5) / 0.5
+    constexpr size_t kPlane = static_cast<size_t>(kImgSize) * static_cast<size_t>(kImgSize);
+    std::vector<float> pixel_values(3ULL * kPlane);
+    for (size_t i = 0; i < kPlane; ++i) {
+        pixel_values[i] = (static_cast<float>(resized[i * 3ULL + 0]) / 255.0f - 0.5f) / 0.5f;
+        pixel_values[kPlane + i] = (static_cast<float>(resized[i * 3ULL + 1]) / 255.0f - 0.5f) / 0.5f;
+        pixel_values[2ULL * kPlane + i] = (static_cast<float>(resized[i * 3ULL + 2]) / 255.0f - 0.5f) / 0.5f;
+    }
+
+    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    const std::array<int64_t, 4> enc_in_shape = {1, 3, kImgSize, kImgSize};
+    Ort::Value enc_in = Ort::Value::CreateTensor<float>(
+        mem_info, pixel_values.data(), pixel_values.size(), enc_in_shape.data(), enc_in_shape.size());
+
+    const char* enc_in_names[] = {"pixel_values"};
+    const char* enc_out_names[] = {"visual_features"};
+    std::vector<Ort::Value> enc_outputs;
+    try {
+        enc_outputs = hayai_enc_session_->session->Run(
+            Ort::RunOptions{nullptr}, enc_in_names, &enc_in, 1, enc_out_names, 1);
+    } catch (const Ort::Exception&) {
+        if (hayai_enc_session_->active_provider == "CPUExecutionProvider") {
+            throw;
+        }
+        const auto resolved = model_manager_.resolve_hayai_ocr_models();
+        hayai_enc_session_ = ModelManager::create_ort_session(resolved->encoder_onnx, /*force_cpu=*/true);
+        enc_outputs = hayai_enc_session_->session->Run(
+            Ort::RunOptions{nullptr}, enc_in_names, &enc_in, 1, enc_out_names, 1);
+    }
+
+    const auto vis_shape = enc_outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+    const size_t vis_elems = enc_outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
+    const float* vis_ptr = enc_outputs[0].GetTensorData<float>();
+    std::vector<float> vis_feat(vis_ptr, vis_ptr + vis_elems);
+
+    std::vector<int64_t> token_ids;
+    token_ids.reserve(kMaxTokens + 1);
+    token_ids.push_back(hayai_bos_id_);
+
+    const char* dec_in_names[] = {"visual_features", "text_token_ids"};
+    const char* dec_out_names[] = {"logits"};
+
+    for (size_t step = 0; step < kMaxTokens; ++step) {
+        const std::array<int64_t, 2> ids_shape = {1, static_cast<int64_t>(token_ids.size())};
+        std::array<Ort::Value, 2> dec_inputs = {
+            Ort::Value::CreateTensor<float>(mem_info, vis_feat.data(), vis_feat.size(), vis_shape.data(), vis_shape.size()),
+            Ort::Value::CreateTensor<int64_t>(mem_info, token_ids.data(), token_ids.size(), ids_shape.data(), ids_shape.size()),
+        };
+
+        auto dec_outputs = hayai_dec_session_->session->Run(
+            Ort::RunOptions{nullptr}, dec_in_names, dec_inputs.data(), dec_inputs.size(), dec_out_names, 1);
+
+        const auto l_shape = dec_outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+        if (l_shape.size() != 3 || l_shape[2] <= 0) break;
+        const size_t seq_len = static_cast<size_t>(l_shape[1]);
+        const size_t vocab_sz = static_cast<size_t>(l_shape[2]);
+        const float* last_logits = dec_outputs[0].GetTensorData<float>() + (seq_len - 1ULL) * vocab_sz;
+
+        int64_t best_id = hayai_eos_id_;
+        float best_val = -std::numeric_limits<float>::infinity();
+        for (size_t v = 0; v < vocab_sz; ++v) {
+            if (last_logits[v] > best_val) {
+                best_val = last_logits[v];
+                best_id = static_cast<int64_t>(v);
+            }
+        }
+        if (best_id == hayai_eos_id_ || best_id == hayai_pad_id_) {
+            break;
+        }
+        token_ids.push_back(best_id);
+    }
+
+    std::string out;
+    for (size_t i = 1; i < token_ids.size(); ++i) {
+        const int64_t tid = token_ids[i];
+        if (tid == hayai_eos_id_ || tid == hayai_pad_id_ || tid == hayai_bos_id_) continue;
+        if (tid >= 0 && static_cast<size_t>(tid) < hayai_id2tok_.size()) {
+            out.append(hayai_id2tok_[static_cast<size_t>(tid)]);
+        }
+    }
+    return util::trim_ascii(out);
+}
+
+// -----------------------------------------------------------------------------
 // Korean (`ko`) & Chinese (`zh`) PP-OCRv4 ONNX (det + cls + rec)
 // -----------------------------------------------------------------------------
 
@@ -1679,32 +2032,67 @@ OcrStageResult OcrEngine::recognize_rgb(
     }
 
     std::string paddle_vl_model_id;
+    bool paddle_vl_fallback_to_local = false;
     if (effective_model == "manga-ocr") {
         result.engine = "manga-ocr";
         ensure_manga_ocr_loaded(options.force_cpu);
         result.execution_provider = manga_enc_session_->active_provider;
+    } else if (effective_model == "baberu-ocr") {
+        result.engine = "baberu-ocr";
+        ensure_baberu_ocr_loaded();
+        result.execution_provider = "CPUExecutionProvider";
+    } else if (effective_model == "hayai-ocr") {
+        result.engine = "hayai-ocr";
+        // Hayai OCR v2.1 is allowed onto GPU/CPU
+        ensure_hayai_ocr_loaded(false);
+        result.execution_provider = hayai_enc_session_->active_provider;
     } else if (effective_model == "rapidocr-ppocrv4") {
         result.engine = "rapidocr";
         ensure_rapid_ocr_loaded(lang, options.force_cpu);
         result.execution_provider = rapid_rec_session_->active_provider;
     } else {
-        result.engine = "paddleocr-vl-gguf";
-        paddle_vl_model_id = resolve_paddleocr_vl_lmstudio_model(options);
-        result.execution_provider = "LMStudioVisionOCR";
+        result.engine = "paddleocr-vl-1.6";
+        try {
+            paddle_vl_model_id = resolve_paddleocr_vl_lmstudio_model(options);
+            result.execution_provider = "LMStudioVisionOCR";
+        } catch (...) {
+            // Graceful fallback when PaddleOCR-VL vision server is not loaded in LM Studio
+            paddle_vl_fallback_to_local = true;
+            if (model_manager_.resolve_baberu_ocr_models().has_value()) {
+                ensure_baberu_ocr_loaded();
+                result.execution_provider = "CPUExecutionProvider";
+            } else if (lang == "ja" && model_manager_.resolve_manga_ocr_models().has_value()) {
+                ensure_manga_ocr_loaded(options.force_cpu);
+                result.execution_provider = manga_enc_session_->active_provider;
+            } else {
+                ensure_rapid_ocr_loaded(lang, options.force_cpu);
+                result.execution_provider = rapid_rec_session_->active_provider;
+            }
+        }
     }
 
     for (const auto& b : bubbles) {
-        // MangaOCR & PaddleOCR-VL were trained on raw manga crops (with borders/screentones);
-        // running erase_border_touching_ink on tight crops can wipe out edge characters.
+        // MangaOCR, Baberu, Hayai & PaddleOCR-VL were trained on raw manga crops;
+        // running erase_border_touching_ink on tight crops is reserved for RapidOCR PP-OCRv4.
         const bool clean_border = (effective_model == "rapidocr-ppocrv4");
         const RgbImage clean_crop = crop_bbox_clean(rgb_data, width, height, b.bbox, clean_border);
         std::string text;
         if (effective_model == "manga-ocr") {
             text = recognize_ja_crop(clean_crop, b.text_direction);
+        } else if (effective_model == "baberu-ocr") {
+            text = recognize_baberu_crop(clean_crop);
+        } else if (effective_model == "hayai-ocr") {
+            text = recognize_hayai_crop(clean_crop);
         } else if (effective_model == "rapidocr-ppocrv4") {
             text = recognize_rapid_crop(clean_crop);
-        } else {
+        } else if (!paddle_vl_fallback_to_local) {
             text = recognize_paddleocr_vl_crop(clean_crop, paddle_vl_model_id, options);
+        } else if (baberu_vis_session_.has_value()) {
+            text = recognize_baberu_crop(clean_crop);
+        } else if (manga_enc_session_.has_value()) {
+            text = recognize_ja_crop(clean_crop, b.text_direction);
+        } else {
+            text = recognize_rapid_crop(clean_crop);
         }
 
         OcrBubbleOutput out;

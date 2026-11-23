@@ -1,6 +1,6 @@
 #pragma once
 
-// Vellum — Native C++17 Model Manager & ONNX Runtime Session Factory (Phase 10.1)
+// Vellum - Native C++17 Model Manager & ONNX Runtime Session Factory (Phase 10.1)
 //
 // Features:
 // - Persistent model storage at `<portable_root>\models` (or `MANGA_MODELS_DIR`).
@@ -75,6 +75,26 @@ struct ResolvedMangaOcrModel {
     std::filesystem::path decoder_onnx;
     std::filesystem::path vocab_txt;
     std::optional<std::filesystem::path> config_json;
+    std::string source;
+};
+
+struct ResolvedBaberuOcrModel {
+    std::filesystem::path vision_onnx;
+    std::filesystem::path decoder_prefill_onnx;
+    std::filesystem::path decoder_step_onnx;
+    std::filesystem::path vocab_json;
+    std::string source;
+};
+
+struct ResolvedHayaiOcrModel {
+    std::filesystem::path encoder_onnx;
+    std::filesystem::path decoder_onnx;
+    std::filesystem::path vocab_json;
+    std::string source;
+};
+
+struct ResolvedAotModel {
+    std::filesystem::path model_path;
     std::string source;
 };
 
@@ -177,7 +197,10 @@ public:
     std::optional<ResolvedLamaModel> resolve_lama_model(
         const std::string& preferred_model = "auto",
         bool allow_fallback = true) const;
+    std::optional<ResolvedAotModel> resolve_aot_model() const;
     std::optional<ResolvedMangaOcrModel> resolve_manga_ocr_models() const;
+    std::optional<ResolvedBaberuOcrModel> resolve_baberu_ocr_models() const;
+    std::optional<ResolvedHayaiOcrModel> resolve_hayai_ocr_models() const;
     std::optional<ResolvedPaddleOcrVlGguf> resolve_paddleocr_vl_gguf() const;
     std::optional<RapidOcrPaths> resolve_rapidocr_paths(const std::string& language = "zh") const;
 

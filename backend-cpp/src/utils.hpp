@@ -163,6 +163,17 @@ inline fs::path get_portable_root_dir() {
                fs::is_directory(dir / L"backend-cpp", ec);
     };
 
+    // When running inside `Vellum_Runtime\`, prefer the parent root folder first
+    const std::wstring leaf = to_lower_ascii(wide_to_utf8(exe_dir.filename().wstring())) == "vellum_runtime"
+        ? L"vellum_runtime"
+        : L"";
+    if (!leaf.empty()) {
+        const fs::path parent = exe_dir.parent_path();
+        if (!parent.empty() && parent != exe_dir && has_root_markers(parent)) {
+            return parent;
+        }
+    }
+
     if (has_root_markers(exe_dir)) {
         return exe_dir;
     }

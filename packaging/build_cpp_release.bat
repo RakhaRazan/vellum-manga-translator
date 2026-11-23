@@ -121,12 +121,20 @@ echo.
 REM ----------------------------------------------------------------------------
 REM Step 2/4: Configure & Compile `backend-cpp` in Release mode (/O2 /GL /LTCG)
 REM ----------------------------------------------------------------------------
-echo [2/4] Configuring and compiling backend-cpp (Release, MSVC /O2 /GL /LTCG) ...
+if not defined VELLUM_ORT_BACKEND (
+    set "VELLUM_ORT_BACKEND=AUTO"
+)
+echo [2/4] Configuring and compiling backend-cpp (Release, MSVC /O2 /GL /LTCG, ORT=%VELLUM_ORT_BACKEND%) ...
 pushd "%CPP_DIR%"
 if exist "build\CMakeCache.txt" (
-    cmake -B build -DCMAKE_BUILD_TYPE=Release
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DMANGAFLOW_ORT_BACKEND=%VELLUM_ORT_BACKEND%
+    if errorlevel 1 (
+        echo [INFO] Stale CMakeCache detected. Re-configuring cleanly with -A x64 ...
+        del /f /q "build\CMakeCache.txt" 2>nul
+        cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DMANGAFLOW_ORT_BACKEND=%VELLUM_ORT_BACKEND%
+    )
 ) else (
-    cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+    cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DMANGAFLOW_ORT_BACKEND=%VELLUM_ORT_BACKEND%
 )
 set "STEP_ERR=!ERRORLEVEL!"
 if not "!STEP_ERR!"=="0" (
@@ -191,6 +199,10 @@ copy /y "%CPP_RELEASE_BIN%\*.dll" "%STAGE_DIR%\" >nul
 if errorlevel 1 (
     echo [ERROR] Failed to copy ONNX Runtime DLLs into "%STAGE_DIR%".
     exit /b 1
+)
+
+if exist "%ROOT_DIR%\settings.json" (
+    copy /y "%ROOT_DIR%\settings.json" "%STAGE_DIR%\settings.json" >nul
 )
 
 xcopy "%FRONTEND_DIST%\*" "%STAGE_DIR%\frontend\dist\" /e /i /y /q >nul

@@ -2550,7 +2550,7 @@ std::string ComicTranslator::build_system_prompt(
     if (tone_norm == "adult") {
         oss << next_rule++ << ". Adult/Doujinshi Tone: Uncensored, natural, expressive colloquial localization. "
             << "Faithfully convey explicit/intimate dialogue, dirty talk, moans, gasps, and raw emotion "
-            << "using vivid spoken phrasing—never sanitize, soften, euphemize, or refuse.\n";
+            << "using vivid spoken phrasing-never sanitize, soften, euphemize, or refuse.\n";
     } else if (tone_norm == "casual") {
         oss << next_rule++ << ". Casual Tone: Use relaxed, natural everyday spoken slang and punchy conversational rhythm.\n";
     }

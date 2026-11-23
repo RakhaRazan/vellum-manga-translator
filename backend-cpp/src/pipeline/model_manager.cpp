@@ -23,9 +23,6 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const wchar_t* kDefaultKoharuCachePath =
-    L"C:\\FILE SOFTWARE\\Koharu\\store\\hugging-face\\models";
-
 constexpr const char* kKoharuRfDetrFolder = "mayocream--koharu-layout-rfdetr-seg-2xl-1152";
 constexpr const char* kKoharuLamaFolder = "mayocream--lama-manga";
 constexpr const char* kKoharuMangaOcrFolder = "mayocream--manga-ocr";
@@ -737,11 +734,37 @@ OrtSessionHandle ModelManager::create_ort_session(const fs::path& model_path, bo
     Ort::Env& env = shared_ort_env();
     const auto preferred = get_preferred_providers(force_cpu);
 
-    // Leave 1 CPU thread for OS/UI/LM Studio host while maximizing CPU inference throughput
-    const unsigned int hw_threads = std::thread::hardware_concurrency();
-    const int cpu_intra_threads = static_cast<int>(
-        std::max(1u, std::min(7u, hw_threads > 1 ? (hw_threads - 1u) : 1u)));
-    const int gpu_host_threads = static_cast<int>(std::max(1u, std::min(2u, hw_threads / 2u)));
+    // Cap CPU intra-op threads to physical CPU core count to avoid HT contention while keeping UI/LM Studio responsive
+    auto query_physical_cores = []() -> int {
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+        if (len > 0) {
+            std::vector<uint8_t> buf(len);
+            if (GetLogicalProcessorInformationEx(
+                    RelationProcessorCore,
+                    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()),
+                    &len)) {
+                int cores = 0;
+                DWORD offset = 0;
+                while (offset < len) {
+                    const auto* info =
+                        reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + offset);
+                    if (info->Relationship == RelationProcessorCore) {
+                        ++cores;
+                    }
+                    offset += info->Size;
+                }
+                if (cores > 0) {
+                    return cores;
+                }
+            }
+        }
+        const unsigned int hw = std::thread::hardware_concurrency();
+        return static_cast<int>(std::max(1u, hw > 1 ? (hw / 2u) : 1u));
+    };
+    static const int kPhysicalCores = query_physical_cores();
+    const int cpu_intra_threads = std::max(1, kPhysicalCores);
+    const int gpu_host_threads = std::max(1, std::min(2, kPhysicalCores / 2));
 
     auto apply_common_resource_opts = [](Ort::SessionOptions& opts, bool is_cpu_only) {
         opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
@@ -1123,7 +1146,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
 
         detection_models.push_back({
             {"id", "koharu-layout-rfdetr-seg-2xl"},
-            {"name", "Koharu Layout RF-DETR-Seg-2XL"},
+            {"name", "Koharu Layout RF-DETR Seg 2XL (High-Context • Heavy CPU/CUDA)"},
             {"description", "High-precision 1152px manga layout & text segmentation (text, SFX, bubble, panel)"},
             {"installed", installed},
             {"source", source},
@@ -1156,7 +1179,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
 
         detection_models.push_back({
             {"id", "comic-text-detector"},
-            {"name", "Comic Text Detector (ONNX)"},
+            {"name", "Comic Text Detector (Legacy)"},
             {"description", "Fast 1024px manga/manhwa/manhua text box & segmentation mask detector"},
             {"installed", installed},
             {"source", source},
@@ -1168,6 +1191,49 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
             {"files", std::move(files)},
             {"supports_thresholds", json::array({"text_threshold", "conf_threshold", "nms_threshold", "mask_threshold"})},
             {"default_thresholds", {{"text", 0.35}, {"bubble", nullptr}, {"panel", nullptr}}},
+        });
+    }
+
+    // 1c & 1d. Vellum Detector Engine v2 (YOLO11m-Seg FP16 / INT8)
+    for (const auto& [id, name, desc, filename] : {
+             std::tuple<const char*, const char*, const char*, const char*>{
+                 "vellum-det-yolo11m-seg-1024-fp16",
+                 "Vellum YOLO11m-Seg (9-Class Fast GPU)",
+                 "9-class 1024px layout, bubble, panel & SFX segmentation (GPU FP16)",
+                 "vellum-det-yolo11m-seg-1024-fp16.onnx"},
+             std::tuple<const char*, const char*, const char*, const char*>{
+                 "vellum-det-yolo11m-seg-1024-int8",
+                 "Vellum YOLO11m-Seg (INT8 CPU)",
+                 "9-class 1024px layout, bubble, panel & SFX segmentation (CPU INT8)",
+                 "vellum-det-yolo11m-seg-1024-int8.onnx"}}) {
+        bool installed = false;
+        std::string source = "missing";
+        std::uintmax_t bytes = 0;
+        json path_val = nullptr;
+        json files = json::array();
+
+        if (auto found = find_valid_file(filename, 1024ULL * 1024ULL)) {
+            installed = true;
+            source = "local";
+            is_valid_regular_file(*found, 1ULL, &bytes);
+            path_val = util::path_to_utf8(*found);
+            files.push_back(util::path_to_utf8(found->filename()));
+        }
+
+        detection_models.push_back({
+            {"id", id},
+            {"name", name},
+            {"description", desc},
+            {"installed", installed},
+            {"source", source},
+            {"ready_for_inference", installed},
+            {"needs_conversion", false},
+            {"koharu_cached", false},
+            {"size_mb", round_2(static_cast<double>(bytes) / (1024.0 * 1024.0))},
+            {"path", std::move(path_val)},
+            {"files", std::move(files)},
+            {"supports_thresholds", json::array({"conf_threshold", "nms_threshold"})},
+            {"default_thresholds", {{"text", 0.42}, {"bubble", 0.42}, {"panel", 0.45}}},
         });
     }
 
@@ -1310,16 +1376,46 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
         }
     }
 
-    // Push OCR entries in canonical option order: auto, manga-ocr, paddleocr-vl-gguf, rapidocr-ppocrv4
+    // 2d. baberu-ocr status (./models/baberu-ocr/)
+    bool baberu_installed = false;
+    std::string baberu_source = "missing";
+    std::uintmax_t baberu_bytes = 0;
+    json baberu_path = nullptr;
+    json baberu_files = json::array();
+    if (auto baberu = resolve_baberu_ocr_models(); baberu.has_value()) {
+        baberu_installed = true;
+        baberu_source = baberu->source;
+        std::uintmax_t sz = 0;
+        for (const auto& p : {baberu->vision_onnx, baberu->decoder_prefill_onnx, baberu->decoder_step_onnx, baberu->vocab_json}) {
+            if (is_valid_regular_file(p, 1ULL, &sz)) baberu_bytes += sz;
+            baberu_files.push_back(util::path_to_utf8(p.filename()));
+        }
+        baberu_path = util::path_to_utf8(baberu->vision_onnx.parent_path());
+    }
+
+    // 2e. hayai-ocr status (./models/hayai-ocr/)
+    bool hayai_installed = false;
+    std::string hayai_source = "missing";
+    std::uintmax_t hayai_bytes = 0;
+    json hayai_path = nullptr;
+    json hayai_files = json::array();
+    if (auto hayai = resolve_hayai_ocr_models(); hayai.has_value()) {
+        hayai_installed = true;
+        hayai_source = hayai->source;
+        std::uintmax_t sz = 0;
+        for (const auto& p : {hayai->encoder_onnx, hayai->decoder_onnx, hayai->vocab_json}) {
+            if (is_valid_regular_file(p, 1ULL, &sz)) hayai_bytes += sz;
+            hayai_files.push_back(util::path_to_utf8(p.filename()));
+        }
+        hayai_path = util::path_to_utf8(hayai->encoder_onnx.parent_path());
+    }
+
+    // Push OCR entries in canonical option order: auto, paddleocr-vl-1.6, manga-ocr, baberu-ocr, hayai-ocr, rapidocr-ppocrv4
     {
-        const bool auto_installed = manga_ocr_installed || rapidocr_installed;
+        const bool auto_installed = manga_ocr_installed || baberu_installed || hayai_installed || rapidocr_installed;
         std::string auto_source = "missing";
-        if (manga_ocr_installed && rapidocr_installed) {
-            auto_source = (manga_ocr_source == "local" && rapidocr_source == "local") ? "local" : "koharu-cache";
-        } else if (manga_ocr_installed) {
-            auto_source = manga_ocr_source;
-        } else if (rapidocr_installed) {
-            auto_source = rapidocr_source;
+        if (auto_installed) {
+            auto_source = "local";
         } else if (manga_ocr_source == "koharu-cache") {
             auto_source = "koharu-cache";
         }
@@ -1327,7 +1423,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
         ocr_models.push_back({
             {"id", "auto"},
             {"name", "Auto (Language Router)"},
-            {"description", "Automatically routes Japanese → manga-ocr and Korean/Chinese → RapidOCR PP-OCRv4"},
+            {"description", "Automatically routes Japanese → manga-ocr and Korean/Chinese → RapidOCR / Hayai OCR"},
             {"installed", auto_installed},
             {"source", auto_source},
             {"ready_for_inference", auto_installed},
@@ -1336,29 +1432,15 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
             {"size_mb", round_2(static_cast<double>(manga_ocr_bytes + rapidocr_bytes) / (1024.0 * 1024.0))},
             {"path", nullptr},
             {"files", json::array()},
+            {"hardware_target", "CPU (Fast AVX2)"},
             {"routing", {{"ja", "manga-ocr"}, {"ko", "rapidocr-ppocrv4"}, {"zh", "rapidocr-ppocrv4"}}},
         });
     }
 
     ocr_models.push_back({
-        {"id", "manga-ocr"},
-        {"name", "Manga-OCR (Japanese ONNX)"},
-        {"description", "ViT + BERT autoregressive Japanese manga OCR (vertical tategaki & furigana)"},
-        {"installed", manga_ocr_installed},
-        {"source", manga_ocr_source},
-        {"ready_for_inference", manga_ocr_installed},
-        {"needs_conversion", manga_ocr_needs_conv},
-        {"koharu_cached", manga_ocr_koharu_cached},
-        {"size_mb", round_2(static_cast<double>(manga_ocr_bytes) / (1024.0 * 1024.0))},
-        {"path", std::move(manga_ocr_path)},
-        {"files", std::move(manga_ocr_files)},
-        {"languages", json::array({"ja"})},
-    });
-
-    ocr_models.push_back({
-        {"id", "paddleocr-vl-gguf"},
-        {"name", "PaddleOCR-VL-1.6 (GGUF Vision-OCR)"},
-        {"description", "Multilingual Vision-Language OCR via LM Studio (http://localhost:1235/v1)"},
+        {"id", "paddleocr-vl-1.6"},
+        {"name", "PaddleOCR-VL 1.6 (VLM • Multi-Lang)"},
+        {"description", "Multilingual Vision-Language OCR via llama-server / LM Studio or llama-mtmd-cli worker"},
         {"installed", paddle_vl_installed},
         {"source", paddle_vl_source},
         {"ready_for_inference", paddle_vl_installed},
@@ -1368,13 +1450,62 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
         {"path", std::move(paddle_vl_path)},
         {"files", std::move(paddle_vl_files)},
         {"runtime", "lmstudio-vision"},
-        {"lm_studio_hint", "Load PaddleOCR-VL-1.6-GGUF in LM Studio (http://localhost:1235/v1) for Vision-OCR mode"},
+        {"hardware_target", "VLM • Multi-Lang"},
+        {"lm_studio_hint", "Load PaddleOCR-VL-1.6-GGUF in llama-server / LM Studio (http://localhost:1235/v1) for Vision-OCR mode"},
         {"languages", json::array({"ja", "ko", "zh", "en"})},
     });
 
     ocr_models.push_back({
+        {"id", "manga-ocr"},
+        {"name", "Manga OCR (CPU • Japanese)"},
+        {"description", "ViT + BERT autoregressive Japanese manga OCR (vertical tategaki & furigana)"},
+        {"installed", manga_ocr_installed},
+        {"source", manga_ocr_source},
+        {"ready_for_inference", manga_ocr_installed},
+        {"needs_conversion", manga_ocr_needs_conv},
+        {"koharu_cached", manga_ocr_koharu_cached},
+        {"size_mb", round_2(static_cast<double>(manga_ocr_bytes) / (1024.0 * 1024.0))},
+        {"path", std::move(manga_ocr_path)},
+        {"files", std::move(manga_ocr_files)},
+        {"hardware_target", "CPU • Japanese"},
+        {"languages", json::array({"ja"})},
+    });
+
+    ocr_models.push_back({
+        {"id", "baberu-ocr"},
+        {"name", "Baberu OCR (CPU • JA/ZH/EN Fast)"},
+        {"description", "Compact DINOv2 + INT8 KV-cache autoregressive OCR for Japanese, Chinese & English"},
+        {"installed", baberu_installed},
+        {"source", baberu_source},
+        {"ready_for_inference", baberu_installed},
+        {"needs_conversion", false},
+        {"koharu_cached", false},
+        {"size_mb", round_2(static_cast<double>(baberu_bytes) / (1024.0 * 1024.0))},
+        {"path", std::move(baberu_path)},
+        {"files", std::move(baberu_files)},
+        {"hardware_target", "CPU • JA/ZH/EN Fast"},
+        {"languages", json::array({"ja", "zh", "en"})},
+    });
+
+    ocr_models.push_back({
+        {"id", "hayai-ocr"},
+        {"name", "Hayai OCR (GPU/CPU • JA/ZH/KO/EN)"},
+        {"description", "High-throughput 150M SigLIP2 + 2D-mRoPE causal transformer OCR across JA, ZH, KO, EN"},
+        {"installed", hayai_installed},
+        {"source", hayai_source},
+        {"ready_for_inference", hayai_installed},
+        {"needs_conversion", false},
+        {"koharu_cached", false},
+        {"size_mb", round_2(static_cast<double>(hayai_bytes) / (1024.0 * 1024.0))},
+        {"path", std::move(hayai_path)},
+        {"files", std::move(hayai_files)},
+        {"hardware_target", "GPU/CPU • JA/ZH/KO/EN"},
+        {"languages", json::array({"ja", "zh", "ko", "en"})},
+    });
+
+    ocr_models.push_back({
         {"id", "rapidocr-ppocrv4"},
-        {"name", "RapidOCR PP-OCRv4 (ONNX)"},
+        {"name", "RapidOCR PP-OCRv4 (CPU • KO/ZH)"},
         {"description", "Fast CJK/Latin PP-OCRv4 ONNX recognition (Korean, Chinese & horizontal Japanese)"},
         {"installed", rapidocr_installed},
         {"source", rapidocr_source},
@@ -1384,6 +1515,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
         {"size_mb", round_2(static_cast<double>(rapidocr_bytes) / (1024.0 * 1024.0))},
         {"path", std::move(rapidocr_path)},
         {"files", std::move(rapidocr_files)},
+        {"hardware_target", "CPU • KO/ZH"},
         {"languages", json::array({"ko", "zh", "ja"})},
     });
 
@@ -1433,7 +1565,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
 
         inpainting_models.push_back({
             {"id", "lama-manga"},
-            {"name", "LaMa-Manga (Koharu Screentone)"},
+            {"name", "LaMa (GPU • Screentone)"},
             {"description", "Manga-tuned Big-LaMa ONNX inpainter optimized for screentones & line art"},
             {"installed", installed},
             {"source", source},
@@ -1443,10 +1575,121 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
             {"size_mb", round_2(static_cast<double>(bytes) / (1024.0 * 1024.0))},
             {"path", std::move(path_val)},
             {"files", std::move(files)},
+            {"hardware_target", "GPU • Screentone"},
         });
     }
 
-    // 3b. lama-fp32
+    // 3b. aot-inpainting (./models/aot-inpainting.onnx)
+    {
+        bool installed = false;
+        std::string source = "missing";
+        std::uintmax_t bytes = 0;
+        json path_val = nullptr;
+        json files = json::array();
+
+        if (auto aot = resolve_aot_model(); aot.has_value()) {
+            installed = true;
+            source = aot->source;
+            is_valid_regular_file(aot->model_path, 1ULL, &bytes);
+            path_val = util::path_to_utf8(aot->model_path);
+            files.push_back(util::path_to_utf8(aot->model_path.filename()));
+        }
+
+        inpainting_models.push_back({
+            {"id", "aot-inpainting"},
+            {"name", "AOT Inpainting (GPU • Ultra-Fast)"},
+            {"description", "Lightweight 10-block AOT-GAN manga text-stroke inpainter (4-ch mask+RGB → 3-ch RGB, 512×512)"},
+            {"installed", installed},
+            {"source", source},
+            {"ready_for_inference", installed},
+            {"needs_conversion", false},
+            {"koharu_cached", false},
+            {"size_mb", round_2(static_cast<double>(bytes) / (1024.0 * 1024.0))},
+            {"path", std::move(path_val)},
+            {"files", std::move(files)},
+            {"hardware_target", "GPU • Ultra-Fast"},
+        });
+    }
+
+    // 3c. flux-2-klein (./models/flux-2-klein/ + local diffusion HTTP/CLI adapter)
+    {
+        bool installed = false;
+        std::string source = "diffusion-api";
+        std::uintmax_t bytes = 0;
+        json path_val = nullptr;
+        json files = json::array();
+        for (const auto& base_dir : {std::optional<fs::path>(models_dir_), fallback_models_dir_}) {
+            if (!base_dir.has_value()) continue;
+            const fs::path fdir = *base_dir / L"flux-2-klein";
+            if (auto f = find_first_with_ext(fdir, ".gguf", 1024ULL)) {
+                installed = true;
+                source = "local";
+                is_valid_regular_file(*f, 1ULL, &bytes);
+                path_val = util::path_to_utf8(*f);
+                files.push_back(util::path_to_utf8(f->filename()));
+                break;
+            }
+            if (auto f = find_first_with_ext(fdir, ".safetensors", 1024ULL)) {
+                installed = true;
+                source = "local";
+                is_valid_regular_file(*f, 1ULL, &bytes);
+                path_val = util::path_to_utf8(*f);
+                files.push_back(util::path_to_utf8(f->filename()));
+                break;
+            }
+        }
+        inpainting_models.push_back({
+            {"id", "flux-2-klein"},
+            {"name", "FLUX.2 Klein (Generative • 8GB+ VRAM)"},
+            {"description", "Generative diffusion text-stroke ROI inpainter via local ComfyUI/A1111/sd-server adapter (with LaMa fallback)"},
+            {"installed", installed},
+            {"source", source},
+            {"ready_for_inference", true},
+            {"needs_conversion", false},
+            {"koharu_cached", false},
+            {"size_mb", round_2(static_cast<double>(bytes) / (1024.0 * 1024.0))},
+            {"path", std::move(path_val)},
+            {"files", std::move(files)},
+            {"hardware_target", "Generative • 8GB+ VRAM"},
+        });
+    }
+
+    // 3d. rorem-mixed (./models/RORem-mixed-GGUF/ + local diffusion HTTP/CLI adapter)
+    {
+        bool installed = false;
+        std::string source = "diffusion-api";
+        std::uintmax_t bytes = 0;
+        json path_val = nullptr;
+        json files = json::array();
+        for (const auto& base_dir : {std::optional<fs::path>(models_dir_), fallback_models_dir_}) {
+            if (!base_dir.has_value()) continue;
+            const fs::path rdir = *base_dir / L"RORem-mixed-GGUF";
+            if (auto f = find_first_with_ext(rdir, ".gguf", 1024ULL)) {
+                installed = true;
+                source = "local";
+                is_valid_regular_file(*f, 1ULL, &bytes);
+                path_val = util::path_to_utf8(*f);
+                files.push_back(util::path_to_utf8(f->filename()));
+                break;
+            }
+        }
+        inpainting_models.push_back({
+            {"id", "rorem-mixed"},
+            {"name", "RORem Mixed (Generative • Manga GGUF)"},
+            {"description", "Manga object/text removal diffusion adapter via local diffusion worker (with LaMa/AOT fallback)"},
+            {"installed", installed},
+            {"source", source},
+            {"ready_for_inference", true},
+            {"needs_conversion", false},
+            {"koharu_cached", false},
+            {"size_mb", round_2(static_cast<double>(bytes) / (1024.0 * 1024.0))},
+            {"path", std::move(path_val)},
+            {"files", std::move(files)},
+            {"hardware_target", "Generative • Manga GGUF"},
+        });
+    }
+
+    // 3e. lama-fp32
     {
         bool installed = false;
         std::string source = "missing";
@@ -1464,7 +1707,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
 
         inpainting_models.push_back({
             {"id", "lama-fp32"},
-            {"name", "LaMa FP32 (Standard)"},
+            {"name", "LaMa Standard (GPU • FP32)"},
             {"description", "General-purpose Big-LaMa FP32 ONNX inpainter (512×512 tiles)"},
             {"installed", installed},
             {"source", source},
@@ -1474,13 +1717,15 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
             {"size_mb", round_2(static_cast<double>(bytes) / (1024.0 * 1024.0))},
             {"path", std::move(path_val)},
             {"files", std::move(files)},
+            {"hardware_target", "GPU • FP32"},
         });
     }
 
     const json active = {
-        {"detection_model", active_settings.value("detection_model", std::string("koharu-layout-rfdetr-seg-2xl"))},
+        {"detection_model", active_settings.value("detection_model", std::string("vellum-det-yolo11m-seg-1024-fp16"))},
         {"ocr_model", active_settings.value("ocr_model", std::string("auto"))},
         {"inpainting_model", active_settings.value("inpainting_model", std::string("lama-manga"))},
+        {"inpaint_api_url", active_settings.value("inpaint_api_url", std::string("http://127.0.0.1:8188"))},
         {"text_threshold", active_settings.contains("text_threshold") ? active_settings["text_threshold"] : json(nullptr)},
         {"bubble_threshold", active_settings.contains("bubble_threshold") ? active_settings["bubble_threshold"] : json(nullptr)},
         {"panel_threshold", active_settings.contains("panel_threshold") ? active_settings["panel_threshold"] : json(nullptr)},
@@ -2170,6 +2415,58 @@ std::optional<ResolvedLamaModel> ModelManager::resolve_lama_model(
     return std::nullopt;
 }
 
+std::optional<ResolvedAotModel> ModelManager::resolve_aot_model() const {
+    std::string src;
+    for (const char* fname : {"aot-inpainting.onnx", "aot_inpainting.onnx"}) {
+        if (auto found = find_valid_file(fname, 5'000'000ULL, &src)) {
+            return ResolvedAotModel{
+                *found,
+                (src == "persistent_models_dir") ? "local_models_dir" : src};
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<ResolvedBaberuOcrModel> ModelManager::resolve_baberu_ocr_models() const {
+    std::string src;
+    auto vis = find_valid_file("baberu-ocr/vision_int4.onnx", 10'000'000ULL, &src);
+    if (!vis.has_value()) {
+        vis = find_valid_file("baberu-ocr/vision_fp16.onnx", 10'000'000ULL, &src);
+    }
+    auto pre = find_valid_file("baberu-ocr/decoder_prefill_int8.onnx", 5'000'000ULL);
+    auto stp = find_valid_file("baberu-ocr/decoder_step_int8.onnx", 5'000'000ULL);
+    auto voc = find_valid_file("baberu-ocr/vocab.json", 1'000ULL);
+    if (vis.has_value() && pre.has_value() && stp.has_value() && voc.has_value()) {
+        ResolvedBaberuOcrModel res;
+        res.vision_onnx = *vis;
+        res.decoder_prefill_onnx = *pre;
+        res.decoder_step_onnx = *stp;
+        res.vocab_json = *voc;
+        res.source = (src == "persistent_models_dir") ? "local_models_dir" : src;
+        return res;
+    }
+    return std::nullopt;
+}
+
+std::optional<ResolvedHayaiOcrModel> ModelManager::resolve_hayai_ocr_models() const {
+    std::string src;
+    auto enc = find_valid_file("hayai-ocr/encoder.onnx", 10'000'000ULL, &src);
+    auto dec = find_valid_file("hayai-ocr/decoder.onnx", 10'000'000ULL);
+    auto voc = find_valid_file("hayai-ocr/vocab.json", 1'000ULL);
+    if (!voc.has_value()) {
+        voc = find_valid_file("hayai-ocr/tokenizer.json", 1'000ULL);
+    }
+    if (enc.has_value() && dec.has_value() && voc.has_value()) {
+        ResolvedHayaiOcrModel res;
+        res.encoder_onnx = *enc;
+        res.decoder_onnx = *dec;
+        res.vocab_json = *voc;
+        res.source = (src == "persistent_models_dir") ? "local_models_dir" : src;
+        return res;
+    }
+    return std::nullopt;
+}
+
 std::optional<ResolvedMangaOcrModel> ModelManager::resolve_manga_ocr_models() const {
     std::string src;
     auto enc = find_valid_file(kMangaOcrEncoderFile, kMinMangaOcrEncBytes, &src);
@@ -2267,6 +2564,28 @@ json ModelManager::get_status_json() const {
             {"active_filename", installed ? json(util::path_to_utf8(det->model_path.filename())) : json(nullptr)},
             {"active_path", installed ? json(util::path_to_utf8(det->model_path)) : json(nullptr)},
             {"source", installed ? json(det->source) : json(nullptr)},
+        };
+    }
+
+    // 1b. Vellum Detector v2 (YOLO11m-Seg FP16 / INT8 in ./models/)
+    for (const auto& [key, fname] : {
+             std::pair<const char*, const char*>{"vellum_det_yolo11m_fp16", "vellum-det-yolo11m-seg-1024-fp16.onnx"},
+             std::pair<const char*, const char*>{"vellum_det_yolo11m_int8", "vellum-det-yolo11m-seg-1024-int8.onnx"}}) {
+        std::uintmax_t sz = 0;
+        std::string src;
+        auto found = find_valid_file(fname, 1024ULL * 1024ULL, &src);
+        const bool ok = found.has_value();
+        if (ok) {
+            is_valid_regular_file(*found, 1ULL, &sz);
+        }
+        models[key] = {
+            {"installed", ok},
+            {"downloaded_mb", round_2(static_cast<double>(sz) / (1024.0 * 1024.0))},
+            {"files", json::array({fname})},
+            {"missing_files", ok ? json::array() : json::array({fname})},
+            {"active_filename", ok ? json(fname) : json(nullptr)},
+            {"active_path", ok ? json(util::path_to_utf8(*found)) : json(nullptr)},
+            {"source", ok ? json(src) : json(nullptr)},
         };
     }
 
@@ -2396,6 +2715,51 @@ json ModelManager::get_status_json() const {
             {"active_filename", installed ? json(util::path_to_utf8(lama->model_path.filename())) : json(nullptr)},
             {"active_path", installed ? json(util::path_to_utf8(lama->model_path)) : json(nullptr)},
             {"source", installed ? json(lama->source) : json(nullptr)},
+            {"hardware_target", "GPU (RTX/DirectML)"},
+        };
+    }
+
+    // 4b. Baberu OCR (`baberu_ocr`), Hayai OCR (`hayai_ocr`), AOT Inpainting (`aot_inpainting`)
+    {
+        const auto baberu = resolve_baberu_ocr_models();
+        std::uintmax_t b_sz = 0, tmp = 0;
+        if (baberu.has_value()) {
+            for (const auto& p : {baberu->vision_onnx, baberu->decoder_prefill_onnx, baberu->decoder_step_onnx, baberu->vocab_json}) {
+                if (is_valid_regular_file(p, 1ULL, &tmp)) b_sz += tmp;
+            }
+        }
+        models["baberu_ocr"] = {
+            {"installed", baberu.has_value()},
+            {"downloaded_mb", round_2(static_cast<double>(b_sz) / (1024.0 * 1024.0))},
+            {"hardware_target", "CPU (Fast AVX2)"},
+            {"source", baberu.has_value() ? json(baberu->source) : json(nullptr)},
+        };
+
+        const auto hayai = resolve_hayai_ocr_models();
+        std::uintmax_t h_sz = 0;
+        if (hayai.has_value()) {
+            for (const auto& p : {hayai->encoder_onnx, hayai->decoder_onnx, hayai->vocab_json}) {
+                if (is_valid_regular_file(p, 1ULL, &tmp)) h_sz += tmp;
+            }
+        }
+        models["hayai_ocr"] = {
+            {"installed", hayai.has_value()},
+            {"downloaded_mb", round_2(static_cast<double>(h_sz) / (1024.0 * 1024.0))},
+            {"hardware_target", "GPU / CPU"},
+            {"source", hayai.has_value() ? json(hayai->source) : json(nullptr)},
+        };
+
+        const auto aot = resolve_aot_model();
+        std::uintmax_t a_sz = 0;
+        if (aot.has_value()) {
+            is_valid_regular_file(aot->model_path, 1ULL, &a_sz);
+        }
+        models["aot_inpainting"] = {
+            {"installed", aot.has_value()},
+            {"downloaded_mb", round_2(static_cast<double>(a_sz) / (1024.0 * 1024.0))},
+            {"hardware_target", "GPU (RTX/DirectML)"},
+            {"active_filename", aot.has_value() ? json(util::path_to_utf8(aot->model_path.filename())) : json(nullptr)},
+            {"source", aot.has_value() ? json(aot->source) : json(nullptr)},
         };
     }
 

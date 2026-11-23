@@ -32,9 +32,11 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr size_t kMaxArchivePages = 10000;
-constexpr size_t kMaxArchiveUncompressedBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;  // 8 GiB
 constexpr size_t kMaxSingleImageBytes = 64ULL * 1024ULL * 1024ULL;                   // 64 MiB
+
+inline mz_bool mz_zip_writer_init_cfile_v2(mz_zip_archive* pZip, FILE* pFile, mz_uint flags) {
+    return mz_zip_writer_init_cfile(pZip, pFile, flags);
+}
 
 struct StbiDeleter {
     void operator()(unsigned char* ptr) const noexcept {
@@ -429,6 +431,41 @@ fs::path get_export_sessions_dir() {
     return ec ? dir : canon;
 }
 
+fs::path get_projects_cache_dir() {
+    fs::path dir = util::get_comic_translator_app_dir() / L"projects_cache";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    fs::path canon = fs::weakly_canonical(dir, ec);
+    return ec ? dir : canon;
+}
+
+fs::path resolve_pinned_project_image_path(
+    const std::string& project_id,
+    const std::string& filename) {
+    if (!is_safe_image_id(project_id) || filename.empty() || filename.size() > 160) {
+        throw ComicExportError("Invalid pinned project image reference.");
+    }
+    const fs::path leaf(util::utf8_to_wide(filename));
+    const std::string stem = util::path_to_utf8(leaf.stem());
+    std::string ext = util::to_lower_ascii(util::path_to_utf8(leaf.extension()));
+    if (!ext.empty() && ext.front() == '.') {
+        ext.erase(ext.begin());
+    }
+    if (!is_safe_image_id(stem) || !is_cacheable_ext(ext) ||
+        filename.find('/') != std::string::npos || filename.find('\\') != std::string::npos) {
+        throw ComicExportError("Invalid pinned project image filename.");
+    }
+
+    const fs::path proj_dir = get_projects_cache_dir() / util::utf8_to_wide(project_id);
+    std::error_code ec;
+    const fs::path cand = fs::weakly_canonical(proj_dir / leaf, ec);
+    if (ec || !fs::is_regular_file(cand, ec) ||
+        !util::is_path_within_root(proj_dir, cand)) {
+        throw std::runtime_error("Pinned project image not found.");
+    }
+    return cand;
+}
+
 void prune_image_cache(const fs::path& cache_dir, size_t max_files) {
     // Throttle directory scans during high-volume multi-thousand-page batches
     static std::atomic<uint64_t> s_prune_calls{0};
@@ -659,29 +696,15 @@ std::vector<uint8_t> decode_export_image_reference(const std::string& ref, int p
 }
 
 // -----------------------------------------------------------------------------
-// Archive Import (`POST /api/import/archive`) via miniz + stb_image
+// Archive Import (`POST /api/import/archive` & `/api/import/archive-path`) via miniz + stb_image
 // -----------------------------------------------------------------------------
 
-std::vector<ExtractedArchivePage> extract_archive_pages(
-    const std::vector<uint8_t>& archive_bytes,
+namespace {
+
+std::vector<ExtractedArchivePage> extract_archive_pages_from_zip_handle(
+    mz_zip_archive& zip,
     const fs::path& output_dir,
     size_t max_pages) {
-    if (archive_bytes.empty()) {
-        throw ArchiveImportError("Uploaded archive file is empty.");
-    }
-
-    std::error_code dir_ec;
-    fs::create_directories(output_dir, dir_ec);
-
-    mz_zip_archive zip{};
-    if (!mz_zip_reader_init_mem(&zip, archive_bytes.data(), archive_bytes.size(), 0)) {
-        throw ArchiveImportError("Uploaded file is not a valid .cbz or .zip archive.");
-    }
-    struct ZipReaderGuard {
-        mz_zip_archive* z;
-        ~ZipReaderGuard() { mz_zip_reader_end(z); }
-    } guard{&zip};
-
     struct CandidateEntry {
         mz_uint index = 0;
         std::string member_name;
@@ -724,13 +747,13 @@ std::vector<ExtractedArchivePage> extract_archive_pages(
     for (const auto& c : candidates) {
         declared_total += c.uncompressed_size;
         if (declared_total > kMaxArchiveUncompressedBytes) {
-            throw ArchiveImportError("Archive uncompressed size exceeds the 8 GiB safety limit.");
+            throw ArchiveImportError("Archive uncompressed size exceeds the 32 GiB safety limit.");
         }
     }
 
     std::vector<ExtractedArchivePage> extracted;
     extracted.reserve(candidates.size());
-    size_t cumulative_bytes = 0;
+    uint64_t cumulative_bytes = 0;
 
     for (size_t idx = 0; idx < candidates.size(); ++idx) {
         const auto& cand = candidates[idx];
@@ -750,9 +773,9 @@ std::vector<ExtractedArchivePage> extract_archive_pages(
         if (raw_bytes.size() > kMaxSingleImageBytes) {
             throw ArchiveImportError("Archive entry '" + cand.member_name + "' exceeds 64 MiB limit.");
         }
-        cumulative_bytes += raw_bytes.size();
+        cumulative_bytes += static_cast<uint64_t>(raw_bytes.size());
         if (cumulative_bytes > kMaxArchiveUncompressedBytes) {
-            throw ArchiveImportError("Archive extracted payload exceeds the 8 GiB safety limit.");
+            throw ArchiveImportError("Archive extracted payload exceeds the 32 GiB safety limit.");
         }
 
         const DetectedImageFormat fmt = detect_image_magic(raw_bytes);
@@ -767,6 +790,15 @@ std::vector<ExtractedArchivePage> extract_archive_pages(
             }
             out_ext = "webp";
             out_bytes = std::move(raw_bytes);
+        } else if (fmt == DetectedImageFormat::Jpeg || fmt == DetectedImageFormat::Png) {
+            int channels = 0;
+            if (!stbi_info_from_memory(
+                    raw_bytes.data(), static_cast<int>(raw_bytes.size()), &width, &height, &channels) ||
+                width <= 0 || height <= 0) {
+                throw ArchiveImportError("Archive entry '" + cand.member_name + "' is not a valid image.");
+            }
+            out_ext = (fmt == DetectedImageFormat::Jpeg) ? "jpg" : "png";
+            out_bytes = std::move(raw_bytes);
         } else {
             int channels = 0;
             StbiBuffer decoded(stbi_load_from_memory(
@@ -774,17 +806,9 @@ std::vector<ExtractedArchivePage> extract_archive_pages(
             if (!decoded || width <= 0 || height <= 0) {
                 throw ArchiveImportError("Archive entry '" + cand.member_name + "' is not a valid image.");
             }
-            if (fmt == DetectedImageFormat::Jpeg) {
-                out_ext = "jpg";
-                out_bytes = std::move(raw_bytes);
-            } else if (fmt == DetectedImageFormat::Png) {
-                out_ext = "png";
-                out_bytes = std::move(raw_bytes);
-            } else {
-                const auto rgb = flatten_pixels_to_rgb(decoded.get(), width, height, channels);
-                out_ext = "png";
-                out_bytes = encode_rgb_png(rgb.data(), width, height);
-            }
+            const auto rgb = flatten_pixels_to_rgb(decoded.get(), width, height, channels);
+            out_ext = "png";
+            out_bytes = encode_rgb_png(rgb.data(), width, height);
         }
 
         const std::string image_id = "imp_" + util::generate_uuid_hex();
@@ -814,6 +838,73 @@ std::vector<ExtractedArchivePage> extract_archive_pages(
 
     prune_image_cache(output_dir);
     return extracted;
+}
+
+}  // namespace
+
+std::vector<ExtractedArchivePage> extract_archive_pages_from_file(
+    const fs::path& archive_path,
+    const fs::path& output_dir,
+    size_t max_pages) {
+    std::error_code ec;
+    if (!fs::is_regular_file(archive_path, ec) || ec) {
+        throw ArchiveImportError("Archive file was not found on disk.");
+    }
+    const uint64_t file_size = static_cast<uint64_t>(fs::file_size(archive_path, ec));
+    if (ec || file_size == 0) {
+        throw ArchiveImportError("Archive file on disk is empty.");
+    }
+
+    fs::create_directories(output_dir, ec);
+
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, archive_path.c_str(), L"rb") != 0 || !fp) {
+        throw ArchiveImportError("Failed to open archive file for reading.");
+    }
+    struct FileGuard {
+        FILE* f = nullptr;
+        ~FileGuard() {
+            if (f) std::fclose(f);
+        }
+    } file_guard{fp};
+
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_cfile(&zip, fp, file_size, 0)) {
+        throw ArchiveImportError("File is not a valid .cbz or .zip archive.");
+    }
+    struct ZipReaderGuard {
+        mz_zip_archive* z;
+        ~ZipReaderGuard() { mz_zip_reader_end(z); }
+    } guard{&zip};
+
+    return extract_archive_pages_from_zip_handle(zip, output_dir, max_pages);
+}
+
+std::vector<ExtractedArchivePage> extract_archive_pages(
+    const std::vector<uint8_t>& archive_bytes,
+    const fs::path& output_dir,
+    size_t max_pages) {
+    if (archive_bytes.empty()) {
+        throw ArchiveImportError("Uploaded archive file is empty.");
+    }
+
+    std::error_code dir_ec;
+    fs::create_directories(output_dir, dir_ec);
+
+    const fs::path tmp_archive = output_dir / util::utf8_to_wide("tmp_import_" + util::generate_uuid_hex() + ".cbz");
+    std::string write_err;
+    if (!util::atomic_write_bytes(tmp_archive, archive_bytes.data(), archive_bytes.size(), &write_err)) {
+        throw ArchiveImportError("Failed to stage temporary archive file on disk: " + write_err);
+    }
+    struct TempFileGuard {
+        fs::path p;
+        ~TempFileGuard() {
+            std::error_code ec;
+            fs::remove(p, ec);
+        }
+    } tmp_guard{tmp_archive};
+
+    return extract_archive_pages_from_file(tmp_archive, output_dir, max_pages);
 }
 
 // -----------------------------------------------------------------------------
@@ -1207,7 +1298,7 @@ void build_cbz_to_file(
     } file_guard{fp};
 
     mz_zip_archive zip{};
-    if (!mz_zip_writer_init_cfile(&zip, fp, 0)) {
+    if (!mz_zip_writer_init_cfile_v2(&zip, fp, MZ_ZIP_FLAG_WRITE_ZIP64)) {
         throw ComicExportError("Failed to initialize disk-backed CBZ writer.");
     }
     bool finalized = false;
@@ -1487,7 +1578,11 @@ void build_pdf_to_file(
         }
     }
 
-    // Cross-reference table
+    // Cross-reference table (PDF 1.4 10-digit xref offset guard = 10 GB)
+    if (bytes_written >= 10000000000ULL) {
+        throw ComicExportError(
+            "PDF export exceeds the 10 GB PDF 1.4 cross-reference offset limit. Please export as .cbz (ZIP64) or split the volume.");
+    }
     const uint64_t xref_offset = bytes_written;
     write_str("xref\n0 " + std::to_string(total_objects + 1) + "\n");
     write_str("0000000000 65535 f \n");

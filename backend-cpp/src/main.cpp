@@ -1,4 +1,4 @@
-// Vellum — Native Modern C++17 Backend & WebView2 Desktop Host (Phase 10.3)
+// Vellum - Native Modern C++17 Backend & WebView2 Desktop Host (Phase 10.3)
 //
 // Runs an embedded cpp-httplib HTTP server on a background std::thread
 // (127.0.0.1:8000, or an OS-assigned free loopback port if busy), serves the
@@ -27,6 +27,10 @@
 #pragma warning(pop)
 #endif
 
+#include "detector/adaptive_tiler.hpp"
+#include "detector/detector_engine.hpp"
+#include "detector/export_artifacts.hpp"
+#include "detector/geometry_postproc.hpp"
 #include "exporter.hpp"
 #include "font_manager.hpp"
 #include "pipeline/detector.hpp"
@@ -36,6 +40,8 @@
 #include "pipeline/translator.hpp"
 #include "settings_manager.hpp"
 #include "utils.hpp"
+
+#include <stb_image.h>
 
 #include <algorithm>
 #include <atomic>
@@ -653,6 +659,15 @@ struct ExportSessionState {
     std::map<int, DiskExportPageEntry> pages;
 };
 
+struct CompletedExportState {
+    fs::path file_path;
+    fs::path session_dir;
+    std::string download_name;
+    std::string mime_type;
+    uint64_t file_size = 0;
+    size_t page_count = 0;
+};
+
 struct AppContext {
     fs::path exe_dir;
     fs::path frontend_dist_dir;
@@ -660,6 +675,8 @@ struct AppContext {
     std::vector<std::string> available_providers;
     std::unique_ptr<pipeline::ModelManager> model_manager;
     std::unique_ptr<pipeline::TextDetector> detector;
+    std::unique_ptr<vellum::detector::IDetectorEngine> detector_v2;
+    vellum::detector::BackendType detector_v2_backend = vellum::detector::BackendType::Auto;
     std::unique_ptr<pipeline::OcrEngine> ocr_engine;
     std::unique_ptr<pipeline::LamaInpainter> inpainter;
     SettingsManager settings_manager;
@@ -668,6 +685,7 @@ struct AppContext {
     std::mutex import_mutex;
     std::mutex export_sessions_mutex;
     std::unordered_map<std::string, ExportSessionState> export_sessions;
+    std::unordered_map<std::string, CompletedExportState> completed_exports;
 
     // Live per-stage progress reporting for UI polling (`GET /api/pipeline/status`)
     std::mutex progress_mutex;
@@ -706,6 +724,7 @@ struct AppContext {
     void unload_all_sessions() {
         std::lock_guard<std::mutex> lock(inference_mutex);
         if (detector) detector->unload();
+        if (detector_v2) detector_v2->unload();
         if (ocr_engine) ocr_engine->unload();
         if (inpainter) inpainter->unload();
         pipeline::ModelManager::trim_process_heap();
@@ -872,7 +891,8 @@ void populate_detection_options_from_settings(
     opts.box_padding = settings.value("bbox_padding", 6);
     opts.reading_order = settings.value("reading_order", std::string("auto"));
     opts.auto_unload = settings.value("auto_unload_vram", true);
-    opts.force_cpu = (settings.value("execution_mode", std::string("auto")) == "cpu");
+    const std::string det_exec_mode = settings.value("execution_mode", std::string("hybrid"));
+    opts.force_cpu = (det_exec_mode == "cpu_only" || det_exec_mode == "cpu");
 }
 
 void populate_ocr_options_from_settings(
@@ -881,7 +901,12 @@ void populate_ocr_options_from_settings(
     opts.ocr_model = SettingsManager::normalize_ocr_model(
         settings.value("ocr_model", std::string("auto")));
     opts.auto_unload = settings.value("auto_unload_vram", true);
-    opts.force_cpu = (settings.value("execution_mode", std::string("auto")) == "cpu");
+    // Smart Hybrid Routing:
+    // - "hybrid" (default): keep autoregressive manga-ocr & lightweight RapidOCR on CPU (saves ~650 MB VRAM, avoids DML stalls).
+    // - "force_gpu": allow OCR encoder/models onto GPU.
+    // - "cpu_only": force all models onto CPU.
+    const std::string ocr_exec_mode = settings.value("execution_mode", std::string("hybrid"));
+    opts.force_cpu = (ocr_exec_mode != "force_gpu" && ocr_exec_mode != "gpu");
 
     std::string lm_url = pipeline::kDefaultLmStudioBaseUrl;
     std::string lm_key = pipeline::kDefaultLmStudioApiKey;
@@ -913,11 +938,13 @@ void populate_inpaint_options_from_settings(
     const json& settings) {
     opts.inpainting_model = SettingsManager::normalize_inpainting_model(
         settings.value("inpainting_model", std::string("lama-manga")));
-    opts.allow_model_fallback = (opts.inpainting_model == "lama-manga");
+    opts.inpaint_api_url = settings.value("inpaint_api_url", std::string("http://127.0.0.1:8188"));
+    opts.allow_model_fallback = true;
     opts.tile_size = settings.value("lama_tile_size", 512);
     opts.refine_mask = settings.value("refine_mask", true);
     opts.auto_unload = settings.value("auto_unload_vram", true);
-    opts.force_cpu = (settings.value("execution_mode", std::string("auto")) == "cpu");
+    const std::string inp_exec_mode = settings.value("execution_mode", std::string("hybrid"));
+    opts.force_cpu = (inp_exec_mode == "cpu_only" || inp_exec_mode == "cpu");
 }
 
 json extract_multipart_translation_overrides(const httplib::Request& req) {
@@ -1077,7 +1104,23 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
     });
 
     server.Get("/api/models/status", [&ctx](const httplib::Request&, httplib::Response& res) {
+        const json current_settings = ctx.settings_manager.load();
+        const std::string exec_mode = current_settings.value("execution_mode", std::string("hybrid"));
+        const bool cpu_only = (exec_mode == "cpu_only" || exec_mode == "cpu");
+        const bool ocr_cpu = (exec_mode != "force_gpu" && exec_mode != "gpu");
+
+        std::string detector_provider = pipeline::ModelManager::get_primary_provider(cpu_only);
+        if (ctx.detector_v2 && !ctx.detector_v2->executionProvider().empty()) {
+            detector_provider = ctx.detector_v2->executionProvider();
+        }
+        const std::string ocr_provider = pipeline::ModelManager::get_primary_provider(ocr_cpu);
+        const std::string inpainter_provider = pipeline::ModelManager::get_primary_provider(cpu_only);
+
         json payload = ctx.model_manager->get_status_json();
+        payload["execution_mode"] = exec_mode;
+        payload["detector_provider"] = detector_provider;
+        payload["ocr_provider"] = ocr_provider;
+        payload["inpainter_provider"] = inpainter_provider;
         payload["lm_studio"] = probe_lm_studio(ctx.settings_manager);
         send_json(res, payload);
     });
@@ -1296,16 +1339,66 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             return;
         }
 
+        std::string export_dir;
+        if (req.form.has_field("export_dir")) {
+            export_dir = util::trim_ascii(req.form.get_field("export_dir"));
+        }
+
+        // Auto-resolve Detector Engine v2:
+        //   1. ./models/vellum-det-yolo11m-seg-1024-fp16.onnx (or -int8.onnx on CPU-only)
+        //   2. koharu-layout-rfdetr-seg-2xl-1152.onnx
+        //   3. comictextdetector.pt.onnx
         const std::string det_selector = !opts.detection_model.empty() ? opts.detection_model : opts.detector_backend;
-        if (!ctx.model_manager->resolve_detector_model(det_selector, opts.allow_model_fallback).has_value()) {
-            send_json(
-                res,
-                {{"detail",
-                  "Requested detector ONNX weights ('" + det_selector +
-                      "') are missing. Call POST /api/models/import-koharu (for local Koharu cache) "
-                      "or GET /api/models/download first."}},
-                503);
-            return;
+        const std::string sel_lower = util::to_lower_ascii(det_selector);
+
+        auto find_yolo_model = [&](bool prefer_int8) -> std::optional<fs::path> {
+            const std::array<const char*, 2> order = prefer_int8
+                ? std::array<const char*, 2>{"vellum-det-yolo11m-seg-1024-int8.onnx", "vellum-det-yolo11m-seg-1024-fp16.onnx"}
+                : std::array<const char*, 2>{"vellum-det-yolo11m-seg-1024-fp16.onnx", "vellum-det-yolo11m-seg-1024-int8.onnx"};
+            std::vector<fs::path> roots{ctx.model_manager->models_dir()};
+            if (ctx.model_manager->fallback_models_dir().has_value()) {
+                roots.push_back(*ctx.model_manager->fallback_models_dir());
+            }
+            std::error_code ec;
+            for (const char* fname : order) {
+                for (const auto& root : roots) {
+                    const fs::path candidate = root / util::utf8_to_wide(fname);
+                    if (fs::is_regular_file(candidate, ec) && !ec && fs::file_size(candidate, ec) > 1024ULL * 1024ULL) {
+                        return candidate;
+                    }
+                }
+            }
+            return std::nullopt;
+        };
+
+        const bool is_cpu_only = opts.force_cpu ||
+            (pipeline::ModelManager::get_primary_provider(opts.force_cpu) == "CPUExecutionProvider");
+        std::optional<fs::path> yolo_path;
+        if (sel_lower.empty() || sel_lower == "auto" || sel_lower.find("yolo") != std::string::npos) {
+            yolo_path = find_yolo_model(is_cpu_only || sel_lower.find("int8") != std::string::npos);
+        }
+
+        vellum::detector::BackendType target_backend = vellum::detector::BackendType::Yolo11Seg;
+        std::string resolved_model_path;
+        if (yolo_path.has_value()) {
+            target_backend = vellum::detector::BackendType::Yolo11Seg;
+            resolved_model_path = util::path_to_utf8(*yolo_path);
+        } else {
+            const auto legacy_det = ctx.model_manager->resolve_detector_model(det_selector, opts.allow_model_fallback);
+            if (!legacy_det.has_value()) {
+                send_json(
+                    res,
+                    {{"detail",
+                      "Requested detector ONNX weights ('" + det_selector +
+                          "') are missing. Call POST /api/models/import-koharu (for local Koharu cache) "
+                          "or GET /api/models/download first."}},
+                    503);
+                return;
+            }
+            target_backend = (legacy_det->backend == pipeline::DetectorBackend::KoharuRfDetr)
+                ? vellum::detector::BackendType::RfDetrSeg
+                : vellum::detector::BackendType::LegacyCtd;
+            resolved_model_path = util::path_to_utf8(legacy_det->model_path);
         }
 
         const BatchKeepAliveHint keep_hint = parse_batch_keep_alive(req);
@@ -1315,14 +1408,77 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
         }
 
         try {
+            int img_w = 0;
+            int img_h = 0;
+            int img_c = 0;
+            std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> rgb(
+                stbi_load_from_memory(
+                    reinterpret_cast<const stbi_uc*>(upload.content.data()),
+                    static_cast<int>(upload.content.size()),
+                    &img_w, &img_h, &img_c, 3),
+                &stbi_image_free);
+            if (!rgb || img_w <= 0 || img_h <= 0) {
+                send_json(res, {{"detail", "Failed to decode uploaded image bytes."}}, 400);
+                return;
+            }
+
+            vellum::detector::DetectorConfig v2_cfg;
+            v2_cfg.model_path = resolved_model_path;
+            v2_cfg.backend = target_backend;
+            v2_cfg.force_cpu = opts.force_cpu;
+            v2_cfg.keep_session_alive = !opts.auto_unload;
+            v2_cfg.export_dir = export_dir;
+            v2_cfg.enable_adaptive_tiling = current_settings.value("enable_adaptive_tiling", true);
+            v2_cfg.sfx_suppress_iou = static_cast<float>(current_settings.value("sfx_suppress_iou", 0.60));
+            if (current_settings.contains("whisper_threshold") && current_settings["whisper_threshold"].is_number()) {
+                v2_cfg.class_thresholds[static_cast<size_t>(vellum::detector::ClassId::WhisperBubble)] =
+                    current_settings["whisper_threshold"].get<float>();
+            }
+            if (current_settings.contains("borderless_threshold") && current_settings["borderless_threshold"].is_number()) {
+                v2_cfg.class_thresholds[static_cast<size_t>(vellum::detector::ClassId::BorderlessDialogue)] =
+                    current_settings["borderless_threshold"].get<float>();
+            }
+            if (opts.reading_order == "ltr") {
+                v2_cfg.reading_direction = vellum::detector::ReadingDirection::LTR;
+            } else if (opts.reading_order == "rtl") {
+                v2_cfg.reading_direction = vellum::detector::ReadingDirection::RTL;
+            } else {
+                v2_cfg.reading_direction = (opts.source_language == "ja")
+                    ? vellum::detector::ReadingDirection::RTL
+                    : vellum::detector::ReadingDirection::LTR;
+            }
+            if (opts.nms_threshold.has_value()) {
+                v2_cfg.nms_iou_threshold = *opts.nms_threshold;
+            }
+            if (opts.conf_threshold.has_value()) {
+                v2_cfg.class_thresholds[0] = *opts.conf_threshold;
+            } else if (opts.text_threshold.has_value()) {
+                v2_cfg.class_thresholds[0] = *opts.text_threshold;
+            }
+            if (opts.bubble_threshold.has_value()) {
+                v2_cfg.class_thresholds[0] = *opts.bubble_threshold;
+            }
+            if (opts.panel_threshold.has_value()) {
+                v2_cfg.class_thresholds[static_cast<size_t>(vellum::detector::ClassId::Panel)] = *opts.panel_threshold;
+            }
+
             ctx.cancel_pending_unload();
-            pipeline::DetectionResult det_result;
+            vellum::detector::PageDetectionResult v2_res;
             {
                 std::lock_guard<std::mutex> lock(ctx.inference_mutex);
-                det_result = ctx.detector->detect_from_bytes(
-                    reinterpret_cast<const uint8_t*>(upload.content.data()),
-                    upload.content.size(),
-                    opts);
+                if (!ctx.detector_v2 || ctx.detector_v2_backend != target_backend) {
+                    if (ctx.detector_v2) {
+                        ctx.detector_v2->unload();
+                    }
+                    ctx.detector_v2 = vellum::detector::DetectorFactory::create(target_backend);
+                    ctx.detector_v2_backend = target_backend;
+                }
+                ctx.detector_v2->load(v2_cfg);
+                v2_res = vellum::detector::AdaptiveTiler::detectPage(
+                    *ctx.detector_v2, rgb.get(), img_w, img_h, upload.filename, v2_cfg);
+            }
+            if (!v2_cfg.export_dir.empty()) {
+                vellum::detector::exportPageArtifacts(v2_res, rgb.get(), img_w, img_h, v2_cfg);
             }
             if (want_auto_unload) {
                 if (keep_hint.unload_after) {
@@ -1332,8 +1488,13 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 }
             }
 
-            const auto mask_png = pipeline::TextDetector::encode_mask_png(
-                det_result.mask, det_result.width, det_result.height);
+            // Build tight text-stroke inpainting mask strictly inside each dialogue safe_bbox
+            // (never pass full YOLO/RF-DETR bubble segmentation masks into LaMa inpainting).
+            const std::vector<uint8_t> page_mask =
+                vellum::detector::buildTextStrokeInpaintMask(
+                    rgb.get(), img_w, img_h, v2_res.detections);
+
+            const auto mask_png = pipeline::TextDetector::encode_mask_png(page_mask, img_w, img_h);
             const auto [mask_id, mask_url] = save_mask_png_to_cache(mask_png);
 
             std::optional<std::string> mask_b64;
@@ -1344,19 +1505,74 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
 
             json bubbles_json = json::array();
             json ordered_ids = json::array();
-            for (const auto& b : det_result.bubbles) {
-                bubbles_json.push_back(b.to_json());
-                ordered_ids.push_back(b.id);
-            }
-
             json layout_bubbles_json = json::array();
-            for (const auto& lb : det_result.speech_bubbles) {
-                layout_bubbles_json.push_back(lb.to_json());
+            for (const auto& d : v2_res.detections) {
+                const std::string id_str = "b_" + std::to_string(d.id);
+                const int x1 = static_cast<int>(std::lround(d.bbox.x1));
+                const int y1 = static_cast<int>(std::lround(d.bbox.y1));
+                const int x2 = static_cast<int>(std::lround(d.bbox.x2));
+                const int y2 = static_cast<int>(std::lround(d.bbox.y2));
+                const int sx1 = static_cast<int>(std::lround(d.safe_bbox.x1));
+                const int sy1 = static_cast<int>(std::lround(d.safe_bbox.y1));
+                const int sx2 = static_cast<int>(std::lround(d.safe_bbox.x2));
+                const int sy2 = static_cast<int>(std::lround(d.safe_bbox.y2));
+
+                json poly_json = json::array();
+                for (const auto& pt : d.mask.polygon) {
+                    poly_json.push_back({static_cast<int>(std::lround(pt.x)), static_cast<int>(std::lround(pt.y))});
+                }
+
+                const std::string legacy_cat =
+                    (d.class_id == vellum::detector::ClassId::SfxIgnore) ? "onomatopoeia" : "text";
+                const std::string text_dir =
+                    (v2_res.reading_direction == vellum::detector::ReadingDirection::RTL && (y2 - y1) >= (x2 - x1))
+                        ? "vertical"
+                        : "horizontal";
+
+                bubbles_json.push_back({
+                    {"id", id_str},
+                    {"order", d.reading_order},
+                    {"reading_order", d.reading_order},
+                    {"bbox", {x1, y1, x2, y2}},
+                    {"bubble_bbox", {x1, y1, x2, y2}},
+                    {"safe_bbox", {sx1, sy1, sx2, sy2}},
+                    {"polygon", std::move(poly_json)},
+                    {"confidence", d.confidence},
+                    {"text_direction", text_dir},
+                    {"category", legacy_cat},
+                    {"class_id", static_cast<int>(d.class_id)},
+                    {"class_name", d.class_name},
+                    {"panel_id", d.panel_id},
+                    {"is_cross_panel", d.is_cross_panel},
+                });
+                ordered_ids.push_back(id_str);
+
+                if (vellum::detector::is_dialogue_class(d.class_id)) {
+                    layout_bubbles_json.push_back({
+                        {"id", "lb_" + std::to_string(d.id)},
+                        {"order", d.reading_order},
+                        {"bbox", {x1, y1, x2, y2}},
+                        {"confidence", d.confidence},
+                        {"category", "bubble"},
+                    });
+                }
             }
 
             json panels_json = json::array();
-            for (const auto& p : det_result.panels) {
-                panels_json.push_back(p.to_json());
+            for (const auto& p : v2_res.panels) {
+                panels_json.push_back({
+                    {"id", "p_" + std::to_string(p.id)},
+                    {"panel_id", p.id},
+                    {"order", p.reading_order},
+                    {"reading_order", p.reading_order},
+                    {"bbox", {static_cast<int>(std::lround(p.bbox.x1)),
+                              static_cast<int>(std::lround(p.bbox.y1)),
+                              static_cast<int>(std::lround(p.bbox.x2)),
+                              static_cast<int>(std::lround(p.bbox.y2))}},
+                    {"bbox_norm", {p.bbox_norm.x1, p.bbox_norm.y1, p.bbox_norm.x2, p.bbox_norm.y2}},
+                    {"confidence", p.confidence},
+                    {"category", "panel"},
+                });
             }
 
             std::string page_id = "page_001";
@@ -1372,17 +1588,19 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 }
             }
 
+            const nlohmann::json v2_schema = vellum::detector::toSchemaV2Json(v2_res);
             json payload = {
+                {"schema_version", "2.0"},
                 {"page_id", page_id},
-                {"dimensions", {{"width", det_result.width}, {"height", det_result.height}}},
+                {"dimensions", {{"width", img_w}, {"height", img_h}}},
                 {"source_lang", opts.source_language},
                 {"source_language", opts.source_language},
-                {"reading_order", det_result.reading_order},
-                {"execution_provider", det_result.execution_provider},
-                {"detector_backend", pipeline::detector_backend_name(det_result.backend)},
-                {"detector_model", det_result.model_id},
-                {"model_path", det_result.model_path},
-                {"applied_thresholds", det_result.applied_thresholds.to_json()},
+                {"reading_order", v2_res.reading_direction == vellum::detector::ReadingDirection::RTL ? "rtl" : "ltr"},
+                {"execution_provider", v2_res.runtime_meta.execution_provider},
+                {"detector_backend", v2_schema["runtime_meta"]["backend"]},
+                {"detector_model", v2_res.runtime_meta.model_name},
+                {"model_path", resolved_model_path},
+                {"runtime_meta", v2_schema["runtime_meta"]},
                 {"mask_id", mask_id},
                 {"mask_url", mask_url},
                 {"mask", mask_b64.has_value() ? *mask_b64 : mask_url},
@@ -1391,6 +1609,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 {"blocks", std::move(bubbles_json)},
                 {"layout_bubbles", std::move(layout_bubbles_json)},
                 {"panels", std::move(panels_json)},
+                {"detections", v2_schema["detections"]},
             };
             if (mask_b64.has_value()) {
                 payload["mask_base64"] = *mask_b64;
@@ -1479,6 +1698,16 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                       "Japanese manga-ocr ONNX weights are missing. Call POST /api/models/import-koharu "
                       "or GET /api/models/download first."}},
                     503);
+                return;
+            }
+        } else if (effective_ocr_model == "baberu-ocr") {
+            if (!ctx.model_manager->resolve_baberu_ocr_models().has_value()) {
+                send_json(res, {{"detail", "Baberu OCR ONNX weights are missing in ./models/baberu-ocr/."}}, 503);
+                return;
+            }
+        } else if (effective_ocr_model == "hayai-ocr") {
+            if (!ctx.model_manager->resolve_hayai_ocr_models().has_value()) {
+                send_json(res, {{"detail", "Hayai OCR ONNX weights are missing in ./models/hayai-ocr/."}}, 503);
                 return;
             }
         } else if (effective_ocr_model == "rapidocr-ppocrv4") {
@@ -1598,11 +1827,17 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             return;
         }
 
-        if (!ctx.model_manager->resolve_lama_model(opts.inpainting_model, opts.allow_model_fallback).has_value()) {
+        const bool has_inpaint_weights =
+            (opts.inpainting_model == "aot-inpainting")
+                ? (ctx.model_manager->resolve_aot_model().has_value() || ctx.model_manager->resolve_lama_model().has_value())
+                : (opts.inpainting_model == "flux-2-klein" || opts.inpainting_model == "rorem-mixed")
+                ? (ctx.model_manager->resolve_aot_model().has_value() || ctx.model_manager->resolve_lama_model().has_value())
+                : ctx.model_manager->resolve_lama_model(opts.inpainting_model, opts.allow_model_fallback).has_value();
+        if (!has_inpaint_weights) {
             send_json(
                 res,
                 {{"detail",
-                  "Requested LaMa Inpainting ONNX weights ('" + opts.inpainting_model +
+                  "Requested Inpainting ONNX weights ('" + opts.inpainting_model +
                       "') are missing. Call POST /api/models/import-koharu or GET /api/models/download first."}},
                 503);
             return;
@@ -1725,7 +1960,9 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
         if (req.form.has_field("include_base64")) {
             include_base64 = parse_bool_param(req.form.get_field("include_base64"), false);
         }
-        opts.refine_mask = (refine_mask && has_explicit_mask);
+        // Only run refine_bubble_mask when a synthetic bounding-box mask was built (!has_explicit_mask);
+        // when an explicit text-stroke mask is uploaded/cached, preserve it without re-thresholding the full bbox.
+        opts.refine_mask = (!has_explicit_mask) || (req.form.has_field("refine_mask") && refine_mask);
 
         const BatchKeepAliveHint keep_hint = parse_batch_keep_alive(req);
         const bool want_auto_unload = opts.auto_unload;
@@ -2276,13 +2513,74 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
         // Verify local CV/OCR/Inpainting models before decoding/inferencing
         const std::string det_selector =
             !det_opts.detection_model.empty() ? det_opts.detection_model : det_opts.detector_backend;
-        if (!ctx.model_manager->resolve_detector_model(det_selector, det_opts.allow_model_fallback).has_value()) {
-            send_json(res, {{"detail", "Requested detector ONNX weights ('" + det_selector + "') are missing. Call POST /api/models/import-koharu or GET /api/models/download first."}}, 503);
-            return;
+        const std::string det_sel_lower = util::to_lower_ascii(det_selector);
+        const bool is_cpu_det = det_opts.force_cpu ||
+            (pipeline::ModelManager::get_primary_provider(det_opts.force_cpu) == "CPUExecutionProvider");
+
+        auto find_yolo_model = [&](bool prefer_int8) -> std::optional<fs::path> {
+            const std::array<const char*, 2> order = prefer_int8
+                ? std::array<const char*, 2>{"vellum-det-yolo11m-seg-1024-int8.onnx", "vellum-det-yolo11m-seg-1024-fp16.onnx"}
+                : std::array<const char*, 2>{"vellum-det-yolo11m-seg-1024-fp16.onnx", "vellum-det-yolo11m-seg-1024-int8.onnx"};
+            std::vector<fs::path> roots{ctx.model_manager->models_dir()};
+            if (ctx.model_manager->fallback_models_dir().has_value()) {
+                roots.push_back(*ctx.model_manager->fallback_models_dir());
+            }
+            std::error_code ec;
+            for (const char* fname : order) {
+                for (const auto& root : roots) {
+                    const fs::path candidate = root / util::utf8_to_wide(fname);
+                    if (fs::is_regular_file(candidate, ec) && !ec && fs::file_size(candidate, ec) > 1024ULL * 1024ULL) {
+                        return candidate;
+                    }
+                }
+            }
+            return std::nullopt;
+        };
+
+        std::optional<fs::path> yolo_path;
+        if (det_sel_lower.empty() || det_sel_lower == "auto" || det_sel_lower.find("yolo") != std::string::npos) {
+            yolo_path = find_yolo_model(is_cpu_det || det_sel_lower.find("int8") != std::string::npos);
+        }
+
+        vellum::detector::BackendType target_det_backend = vellum::detector::BackendType::Yolo11Seg;
+        std::string resolved_det_model_path;
+        if (yolo_path.has_value()) {
+            target_det_backend = vellum::detector::BackendType::Yolo11Seg;
+            resolved_det_model_path = util::path_to_utf8(*yolo_path);
+        } else {
+            const auto legacy_det = ctx.model_manager->resolve_detector_model(det_selector, det_opts.allow_model_fallback);
+            if (!legacy_det.has_value()) {
+                send_json(res, {{"detail", "Requested detector ONNX weights ('" + det_selector + "') are missing. Call POST /api/models/import-koharu or GET /api/models/download first."}}, 503);
+                return;
+            }
+            target_det_backend = (legacy_det->backend == pipeline::DetectorBackend::KoharuRfDetr)
+                ? vellum::detector::BackendType::RfDetrSeg
+                : vellum::detector::BackendType::LegacyCtd;
+            resolved_det_model_path = util::path_to_utf8(legacy_det->model_path);
         }
         if (effective_ocr_model == "manga-ocr") {
             if (!ctx.model_manager->resolve_manga_ocr_models().has_value()) {
                 send_json(res, {{"detail", "Japanese manga-ocr ONNX weights are missing. Call POST /api/models/import-koharu or GET /api/models/download first."}}, 503);
+                return;
+            }
+        } else if (effective_ocr_model == "baberu-ocr") {
+            if (!ctx.model_manager->resolve_baberu_ocr_models().has_value()) {
+                send_json(res, {{"detail", "Baberu OCR ONNX weights are missing in ./models/baberu-ocr/."}}, 503);
+                return;
+            }
+        } else if (effective_ocr_model == "hayai-ocr") {
+            if (!ctx.model_manager->resolve_hayai_ocr_models().has_value()) {
+                send_json(res, {{"detail", "Hayai OCR ONNX weights are missing in ./models/hayai-ocr/."}}, 503);
+                return;
+            }
+        } else if (effective_ocr_model == "baberu-ocr") {
+            if (!ctx.model_manager->resolve_baberu_ocr_models().has_value()) {
+                send_json(res, {{"detail", "Baberu OCR ONNX weights are missing in ./models/baberu-ocr/."}}, 503);
+                return;
+            }
+        } else if (effective_ocr_model == "hayai-ocr") {
+            if (!ctx.model_manager->resolve_hayai_ocr_models().has_value()) {
+                send_json(res, {{"detail", "Hayai OCR ONNX weights are missing in ./models/hayai-ocr/."}}, 503);
                 return;
             }
         } else if (effective_ocr_model == "rapidocr-ppocrv4") {
@@ -2291,8 +2589,14 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 return;
             }
         }
-        if (!ctx.model_manager->resolve_lama_model(inpaint_opts.inpainting_model, inpaint_opts.allow_model_fallback).has_value()) {
-            send_json(res, {{"detail", "Requested LaMa Inpainting ONNX weights ('" + inpaint_opts.inpainting_model + "') are missing. Call POST /api/models/import-koharu or GET /api/models/download first."}}, 503);
+        const bool has_page_inpaint_weights =
+            (inpaint_opts.inpainting_model == "aot-inpainting" ||
+             inpaint_opts.inpainting_model == "flux-2-klein" ||
+             inpaint_opts.inpainting_model == "rorem-mixed")
+                ? (ctx.model_manager->resolve_aot_model().has_value() || ctx.model_manager->resolve_lama_model().has_value())
+                : ctx.model_manager->resolve_lama_model(inpaint_opts.inpainting_model, inpaint_opts.allow_model_fallback).has_value();
+        if (!has_page_inpaint_weights) {
+            send_json(res, {{"detail", "Requested Inpainting ONNX weights ('" + inpaint_opts.inpainting_model + "') are missing. Call POST /api/models/import-koharu or GET /api/models/download first."}}, 503);
             return;
         }
 
@@ -2320,7 +2624,10 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             return;
         }
 
-        pipeline::DetectionResult det_result;
+        vellum::detector::PageDetectionResult v2_det_result;
+        std::vector<uint8_t> page_mask;
+        std::unordered_map<std::string, std::array<int, 4>> bubble_box_by_id;
+        std::unordered_map<std::string, std::array<int, 4>> safe_box_by_id;
         pipeline::OcrStageResult ocr_result;
         pipeline::InpaintResult inpaint_result;
         std::string mask_id;
@@ -2360,31 +2667,110 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             {
                 std::lock_guard<std::mutex> lock(ctx.inference_mutex);
 
-                // Stage 1: Comic Text Detection + Reading-Order Sort + Binary Text Mask
+                // Stage 1: Detector Engine v2 + Adaptive Tiler (YOLO11m-Seg / RF-DETR-Seg / Legacy CTD)
                 ctx.set_live_stage("detect", det_selector, 1, 4);
-                det_result = ctx.detector->detect_rgb(rgb_image.data(), orig_w, orig_h, det_opts);
+                vellum::detector::DetectorConfig v2_cfg;
+                v2_cfg.model_path = resolved_det_model_path;
+                v2_cfg.backend = target_det_backend;
+                v2_cfg.force_cpu = det_opts.force_cpu;
+                v2_cfg.keep_session_alive = !det_opts.auto_unload;
+                v2_cfg.enable_adaptive_tiling = current_settings.value("enable_adaptive_tiling", true);
+                v2_cfg.sfx_suppress_iou = static_cast<float>(current_settings.value("sfx_suppress_iou", 0.60));
+                if (current_settings.contains("whisper_threshold") && current_settings["whisper_threshold"].is_number()) {
+                    v2_cfg.class_thresholds[static_cast<size_t>(vellum::detector::ClassId::WhisperBubble)] =
+                        current_settings["whisper_threshold"].get<float>();
+                }
+                if (current_settings.contains("borderless_threshold") && current_settings["borderless_threshold"].is_number()) {
+                    v2_cfg.class_thresholds[static_cast<size_t>(vellum::detector::ClassId::BorderlessDialogue)] =
+                        current_settings["borderless_threshold"].get<float>();
+                }
+                if (det_opts.reading_order == "ltr") {
+                    v2_cfg.reading_direction = vellum::detector::ReadingDirection::LTR;
+                } else if (det_opts.reading_order == "rtl") {
+                    v2_cfg.reading_direction = vellum::detector::ReadingDirection::RTL;
+                } else {
+                    v2_cfg.reading_direction = (src_lang == "ja")
+                        ? vellum::detector::ReadingDirection::RTL
+                        : vellum::detector::ReadingDirection::LTR;
+                }
+                if (det_opts.nms_threshold.has_value()) {
+                    v2_cfg.nms_iou_threshold = *det_opts.nms_threshold;
+                }
+                if (det_opts.conf_threshold.has_value()) {
+                    v2_cfg.class_thresholds[0] = *det_opts.conf_threshold;
+                } else if (det_opts.text_threshold.has_value()) {
+                    v2_cfg.class_thresholds[0] = *det_opts.text_threshold;
+                }
+                if (det_opts.bubble_threshold.has_value()) {
+                    v2_cfg.class_thresholds[0] = *det_opts.bubble_threshold;
+                }
+                if (det_opts.panel_threshold.has_value()) {
+                    v2_cfg.class_thresholds[static_cast<size_t>(vellum::detector::ClassId::Panel)] = *det_opts.panel_threshold;
+                }
+
+                if (!ctx.detector_v2 || ctx.detector_v2_backend != target_det_backend) {
+                    if (ctx.detector_v2) {
+                        ctx.detector_v2->unload();
+                    }
+                    ctx.detector_v2 = vellum::detector::DetectorFactory::create(target_det_backend);
+                    ctx.detector_v2_backend = target_det_backend;
+                }
+                ctx.detector_v2->load(v2_cfg);
+                v2_det_result = vellum::detector::AdaptiveTiler::detectPage(
+                    *ctx.detector_v2, rgb_image.data(), orig_w, orig_h, upload.filename, v2_cfg);
+
+                // Build tight text-stroke inpainting mask strictly inside each dialogue safe_bbox
+                // (never pass full YOLO/RF-DETR bubble segmentation masks into LaMa inpainting).
+                page_mask = vellum::detector::buildTextStrokeInpaintMask(
+                    rgb_image.data(), orig_w, orig_h, v2_det_result.detections);
 
                 const auto mask_png = pipeline::TextDetector::encode_mask_png(
-                    det_result.mask, det_result.width, det_result.height);
+                    page_mask, orig_w, orig_h);
                 std::tie(mask_id, mask_url) = save_mask_png_to_cache(mask_png);
 
                 // Stage 2: Multi-Language OCR Router (`manga-ocr` / `rapidocr-ppocrv4` / `paddleocr-vl-gguf`)
                 ctx.set_live_stage("ocr", ocr_opts.ocr_model.empty() ? "manga-ocr" : ocr_opts.ocr_model, 2, 4);
                 std::vector<pipeline::OcrBubbleInput> ocr_inputs;
-                ocr_inputs.reserve(det_result.bubbles.size());
+                ocr_inputs.reserve(v2_det_result.detections.size());
                 std::vector<std::array<int, 4>> detected_bboxes;
-                detected_bboxes.reserve(det_result.bubbles.size());
+                detected_bboxes.reserve(v2_det_result.detections.size());
 
-                for (const auto& b : det_result.bubbles) {
+                for (const auto& d : v2_det_result.detections) {
+                    if (d.class_id == vellum::detector::ClassId::SfxIgnore) {
+                        continue;
+                    }
+                    const std::string bid = "b_" + std::to_string(d.id);
+                    const int x1 = static_cast<int>(std::lround(d.bbox.x1));
+                    const int y1 = static_cast<int>(std::lround(d.bbox.y1));
+                    const int x2 = static_cast<int>(std::lround(d.bbox.x2));
+                    const int y2 = static_cast<int>(std::lround(d.bbox.y2));
+                    const int sx1 = static_cast<int>(std::lround(d.safe_bbox.x1));
+                    const int sy1 = static_cast<int>(std::lround(d.safe_bbox.y1));
+                    const int sx2 = static_cast<int>(std::lround(d.safe_bbox.x2));
+                    const int sy2 = static_cast<int>(std::lround(d.safe_bbox.y2));
+
                     pipeline::OcrBubbleInput item;
-                    item.id = b.id;
-                    item.order = b.order;
-                    item.bbox = b.bbox;
-                    item.polygon.assign(b.polygon.begin(), b.polygon.end());
-                    item.confidence = b.confidence;
-                    item.text_direction = b.text_direction;
+                    item.id = bid;
+                    item.order = d.reading_order;
+                    item.bbox = {x1, y1, x2, y2};
+                    for (const auto& pt : d.mask.polygon) {
+                        item.polygon.push_back({static_cast<int>(std::lround(pt.x)), static_cast<int>(std::lround(pt.y))});
+                    }
+                    if (item.polygon.empty()) {
+                        item.polygon = {
+                            {x1, y1}, {x2, y1}, {x2, y2}, {x1, y2}
+                        };
+                    }
+                    item.confidence = d.confidence;
+                    item.text_direction =
+                        (v2_det_result.reading_direction == vellum::detector::ReadingDirection::RTL &&
+                         (y2 - y1) >= (x2 - x1))
+                            ? "vertical"
+                            : "horizontal";
+                    bubble_box_by_id[bid] = item.bbox;
+                    safe_box_by_id[bid] = {sx1, sy1, sx2, sy2};
+                    detected_bboxes.push_back(item.bbox);
                     ocr_inputs.push_back(std::move(item));
-                    detected_bboxes.push_back(b.bbox);
                 }
 
                 ocr_result = ctx.ocr_engine->recognize_rgb(
@@ -2426,10 +2812,11 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                     });
                 trans_started = true;
 
-                // Stage 3: Tile-Based LaMa Inpainting (`lama-manga` / `lama-fp32`)
+                // Stage 3: Tile-Based LaMa Inpainting + Solid-Bubble Clean Erase
                 inpaint_opts.bboxes = detected_bboxes;
+                inpaint_opts.refine_mask = false;
                 inpaint_result = ctx.inpainter->inpaint_rgb(
-                    rgb_image.data(), orig_w, orig_h, det_result.mask, inpaint_opts);
+                    rgb_image.data(), orig_w, orig_h, page_mask, inpaint_opts);
                 ctx.set_live_stage("translate", active_llm_name, 4, 4);
 
                 // Unload VRAM immediately once after the final page of a batch (or under memory pressure)
@@ -2438,6 +2825,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                      keep_hint.unload_after ||
                      (keep_hint.keep_alive.has_value() && !*keep_hint.keep_alive))) {
                     if (ctx.detector) ctx.detector->unload();
+                    if (ctx.detector_v2) ctx.detector_v2->unload();
                     if (ctx.ocr_engine) ctx.ocr_engine->unload();
                     if (ctx.inpainter) ctx.inpainter->unload();
                     pipeline::ModelManager::trim_process_heap();
@@ -2464,8 +2852,8 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 : cleaned_image_url;
 
             // Free large per-page uncompressed image/mask buffers before waiting on Stage 4 LLM HTTP
-            det_result.mask.clear();
-            det_result.mask.shrink_to_fit();
+            page_mask.clear();
+            page_mask.shrink_to_fit();
             inpaint_result.rgb.clear();
             inpaint_result.rgb.shrink_to_fit();
             rgb_image.clear();
@@ -2498,12 +2886,6 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             return;
         }
 
-        std::unordered_map<std::string, const pipeline::DetectedBubble*> det_by_id;
-        det_by_id.reserve(det_result.bubbles.size());
-        for (const auto& db : det_result.bubbles) {
-            det_by_id[db.id] = &db;
-        }
-
         json processed_blocks = json::array();
         for (const auto& b : ocr_result.blocks) {
             const auto it = translation_res.translations.find(b.id);
@@ -2513,9 +2895,11 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
 
             std::array<int, 4> bubble_bb = b.bbox;
             std::array<int, 4> safe_bb = b.bbox;
-            if (const auto dit = det_by_id.find(b.id); dit != det_by_id.end() && dit->second != nullptr) {
-                bubble_bb = dit->second->bubble_bbox;
-                safe_bb = dit->second->safe_bbox;
+            if (const auto bit = bubble_box_by_id.find(b.id); bit != bubble_box_by_id.end()) {
+                bubble_bb = bit->second;
+            }
+            if (const auto sit = safe_box_by_id.find(b.id); sit != safe_box_by_id.end()) {
+                safe_bb = sit->second;
             }
             const int fsize = estimate_font_size(safe_bb, sizing_text);
 
@@ -2546,32 +2930,72 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             });
         }
 
+        const nlohmann::json v2_schema = vellum::detector::toSchemaV2Json(v2_det_result);
         json layout_bubbles_json = json::array();
-        for (const auto& lb : det_result.speech_bubbles) {
-            layout_bubbles_json.push_back(lb.to_json());
+        for (const auto& d : v2_det_result.detections) {
+            if (vellum::detector::is_dialogue_class(d.class_id)) {
+                layout_bubbles_json.push_back({
+                    {"id", "lb_" + std::to_string(d.id)},
+                    {"order", d.reading_order},
+                    {"bbox", {static_cast<int>(std::lround(d.bbox.x1)),
+                              static_cast<int>(std::lround(d.bbox.y1)),
+                              static_cast<int>(std::lround(d.bbox.x2)),
+                              static_cast<int>(std::lround(d.bbox.y2))}},
+                    {"confidence", d.confidence},
+                    {"category", "bubble"},
+                });
+            }
         }
         json panels_json = json::array();
-        for (const auto& p : det_result.panels) {
-            panels_json.push_back(p.to_json());
+        for (const auto& p : v2_det_result.panels) {
+            panels_json.push_back({
+                {"id", "p_" + std::to_string(p.id)},
+                {"panel_id", p.id},
+                {"order", p.reading_order},
+                {"reading_order", p.reading_order},
+                {"bbox", {static_cast<int>(std::lround(p.bbox.x1)),
+                          static_cast<int>(std::lround(p.bbox.y1)),
+                          static_cast<int>(std::lround(p.bbox.x2)),
+                          static_cast<int>(std::lround(p.bbox.y2))}},
+                {"bbox_norm", {p.bbox_norm.x1, p.bbox_norm.y1, p.bbox_norm.x2, p.bbox_norm.y2}},
+                {"confidence", p.confidence},
+                {"category", "panel"},
+            });
         }
 
         const std::string page_id = extract_page_id_from_filename(upload.filename);
+        const std::string active_exec_mode = current_settings.value("execution_mode", std::string("hybrid"));
+        json combined_runtime_meta = v2_schema["runtime_meta"];
+        combined_runtime_meta["execution_mode"] = active_exec_mode;
+        combined_runtime_meta["detector_provider"] = v2_det_result.runtime_meta.execution_provider;
+        combined_runtime_meta["ocr_provider"] = ocr_result.execution_provider;
+        combined_runtime_meta["inpainter_provider"] = inpaint_result.execution_provider;
+        combined_runtime_meta["detector_model"] = v2_det_result.runtime_meta.model_name;
+        combined_runtime_meta["ocr_model"] = ocr_result.ocr_model;
+        combined_runtime_meta["inpainting_model"] = inpaint_result.model_id;
+
         send_json(res, {
+            {"schema_version", "2.0"},
             {"page_id", page_id},
             {"dimensions", {{"width", orig_w}, {"height", orig_h}}},
             {"source_lang", src_lang},
             {"target_lang", tgt_lang},
             {"source_language", src_lang},
             {"target_language", tgt_lang},
-            {"reading_order", det_result.reading_order},
+            {"reading_order", v2_det_result.reading_direction == vellum::detector::ReadingDirection::RTL ? "rtl" : "ltr"},
+            {"execution_mode", active_exec_mode},
+            {"execution_provider", v2_det_result.runtime_meta.execution_provider},
+            {"detector_provider", v2_det_result.runtime_meta.execution_provider},
+            {"ocr_provider", ocr_result.execution_provider},
+            {"inpainter_provider", inpaint_result.execution_provider},
+            {"runtime_meta", std::move(combined_runtime_meta)},
+            {"detector_backend", v2_schema["runtime_meta"]["backend"]},
+            {"detector_model", v2_det_result.runtime_meta.model_name},
+            {"tiles_detected", v2_det_result.runtime_meta.tiles_processed},
             {"provider", translation_res.provider},
             {"model", translation_res.model},
             {"vision_used", translation_res.vision_used},
             {"reasoning_effort", translation_res.reasoning_effort},
-            {"execution_provider", det_result.execution_provider},
-            {"detector_backend", pipeline::detector_backend_name(det_result.backend)},
-            {"detector_model", det_result.model_id},
-            {"applied_thresholds", det_result.applied_thresholds.to_json()},
             {"ocr_engine", ocr_result.engine},
             {"ocr_model", ocr_result.ocr_model},
             {"inpainting_model", inpaint_result.model_id},
@@ -2933,6 +3357,231 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             serve_cached_image_ref(req.matches[1].str(), res);
         });
 
+    // Pin project images into `./projects_cache/<project_id>/` (exempt from 50,000-file LRU pruning)
+    auto handle_pin_project_cache = [](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            send_json(res, {{"detail", "Invalid JSON object for /api/projects_cache/pin."}}, 400);
+            return;
+        }
+        const std::string raw_pid = util::trim_ascii(body.value("project_id", std::string("")));
+        if (raw_pid.empty() || raw_pid.size() > 64) {
+            send_json(res, {{"detail", "Valid 'project_id' (1-64 chars) is required."}}, 400);
+            return;
+        }
+        for (unsigned char c : raw_pid) {
+            if (!std::isalnum(c) && c != '_' && c != '-') {
+                send_json(res, {{"detail", "Invalid characters in 'project_id'."}}, 400);
+                return;
+            }
+        }
+        if (!body.contains("image_urls") || !body["image_urls"].is_array()) {
+            send_json(res, {{"detail", "Provide 'image_urls' array."}}, 400);
+            return;
+        }
+
+        const fs::path proj_dir = get_projects_cache_dir() / util::utf8_to_wide(raw_pid);
+        std::error_code ec;
+        fs::create_directories(proj_dir, ec);
+        if (ec) {
+            send_json(res, {{"detail", "Failed to create project cache directory."}}, 500);
+            return;
+        }
+
+        json pinned_urls = json::object();
+        size_t pinned_count = 0;
+        for (const auto& item : body["image_urls"]) {
+            if (!item.is_string()) continue;
+            const std::string ref = util::trim_ascii(item.get<std::string>());
+            if (ref.empty()) continue;
+            if (ref.find("/api/projects_cache/") != std::string::npos) {
+                pinned_urls[ref] = ref;
+                ++pinned_count;
+                continue;
+            }
+            try {
+                const fs::path src = resolve_cached_image_path(ref);
+                const std::string fname = util::path_to_utf8(src.filename());
+                const fs::path dst = proj_dir / src.filename();
+                if (!fs::exists(dst, ec)) {
+                    if (!CreateHardLinkW(dst.c_str(), src.c_str(), nullptr)) {
+                        CopyFileW(src.c_str(), dst.c_str(), FALSE);
+                    }
+                }
+                if (fs::is_regular_file(dst, ec)) {
+                    pinned_urls[ref] = "/api/projects_cache/" + raw_pid + "/" + fname;
+                    ++pinned_count;
+                }
+            } catch (...) {
+                // Skip unresolvable references without failing the batch
+            }
+        }
+
+        send_json(res, {
+            {"status", "ok"},
+            {"project_id", raw_pid},
+            {"pinned_count", pinned_count},
+            {"pinned_urls", std::move(pinned_urls)},
+        });
+    };
+    server.Post("/api/cache/pin", handle_pin_project_cache);
+    server.Post("/api/projects_cache/pin", handle_pin_project_cache);
+
+    // Wipe unpinned `./cache/images/` files on user demand
+    server.Post("/api/cache/clear", [](const httplib::Request&, httplib::Response& res) {
+        const fs::path cache_dir = get_image_cache_dir();
+        std::error_code ec;
+        size_t deleted_files = 0;
+        std::uintmax_t freed_bytes = 0;
+        if (fs::is_directory(cache_dir, ec)) {
+            for (const auto& entry : fs::directory_iterator(cache_dir, ec)) {
+                if (ec) break;
+                std::error_code f_ec;
+                if (!entry.is_regular_file(f_ec) || f_ec) continue;
+                const std::string fname = util::path_to_utf8(entry.path().filename());
+                if (fname == ".gitkeep") continue;
+                const auto fsize = entry.file_size(f_ec);
+                if (!f_ec) {
+                    freed_bytes += fsize;
+                }
+                if (fs::remove(entry.path(), f_ec) && !f_ec) {
+                    ++deleted_files;
+                }
+            }
+        }
+        send_json(res, {
+            {"status", "ok"},
+            {"deleted_files", deleted_files},
+            {"freed_bytes", freed_bytes},
+        });
+    });
+
+    // Disk-backed crash-recovery autosave (`./projects_cache/autosave.vellum.json`)
+    server.Post("/api/projects_cache/autosave", [](const httplib::Request& req, httplib::Response& res) {
+        if (util::trim_ascii(req.body).empty()) {
+            send_json(res, {{"detail", "Empty autosave request body."}}, 400);
+            return;
+        }
+        const json parsed = json::parse(req.body, nullptr, false);
+        if (parsed.is_discarded() || !parsed.is_object()) {
+            send_json(res, {{"detail", "Invalid JSON object for /api/projects_cache/autosave."}}, 400);
+            return;
+        }
+        const fs::path autosave_path = get_projects_cache_dir() / L"autosave.vellum.json";
+        std::string write_err;
+        if (!util::atomic_write_bytes(
+                autosave_path,
+                reinterpret_cast<const uint8_t*>(req.body.data()),
+                req.body.size(),
+                &write_err)) {
+            send_json(res, {{"detail", write_err.empty() ? "Failed to write autosave file." : write_err}}, 500);
+            return;
+        }
+        const size_t page_count = (parsed.contains("pages") && parsed["pages"].is_array())
+            ? parsed["pages"].size()
+            : 0;
+        send_json(res, {
+            {"status", "ok"},
+            {"saved_bytes", req.body.size()},
+            {"page_count", page_count},
+        });
+    });
+
+    server.Get("/api/projects_cache/autosave", [](const httplib::Request&, httplib::Response& res) {
+        const fs::path autosave_path = get_projects_cache_dir() / L"autosave.vellum.json";
+        std::error_code ec;
+        if (!fs::is_regular_file(autosave_path, ec)) {
+            send_json(res, {{"status", "empty"}, {"pages", json::array()}}, 200);
+            return;
+        }
+        const auto bytes = util::read_file_bytes(autosave_path);
+        if (!bytes.has_value() || bytes->empty()) {
+            send_json(res, {{"status", "empty"}, {"pages", json::array()}}, 200);
+            return;
+        }
+        apply_cors_headers(res);
+        res.status = 200;
+        res.set_content(
+            reinterpret_cast<const char*>(bytes->data()),
+            bytes->size(),
+            "application/json; charset=utf-8");
+    });
+
+    server.Delete("/api/projects_cache/autosave", [](const httplib::Request&, httplib::Response& res) {
+        const fs::path autosave_path = get_projects_cache_dir() / L"autosave.vellum.json";
+        std::error_code ec;
+        const bool removed = fs::remove(autosave_path, ec);
+        send_json(res, {{"status", "ok"}, {"removed", removed}});
+    });
+
+    server.Get(R"(/api/projects_cache/([A-Za-z0-9_-]{1,64})/([A-Za-z0-9_.-]{1,160}))",
+        [](const httplib::Request& req, httplib::Response& res) {
+            try {
+                const fs::path path = resolve_pinned_project_image_path(
+                    req.matches[1].str(), req.matches[2].str());
+                const auto bytes = util::read_file_bytes(path);
+                if (!bytes.has_value()) {
+                    send_json(res, {{"detail", "Failed to read pinned project image."}}, 500);
+                    return;
+                }
+                std::string ext = util::to_lower_ascii(util::path_to_utf8(path.extension()));
+                if (!ext.empty() && ext.front() == '.') {
+                    ext.erase(ext.begin());
+                }
+                apply_cors_headers(res);
+                res.set_header("Cache-Control", "public, max-age=86400");
+                res.set_header("Content-Disposition", "inline; filename=\"" + req.matches[2].str() + "\"");
+                res.set_content(
+                    reinterpret_cast<const char*>(bytes->data()),
+                    bytes->size(),
+                    media_type_for_cache_ext(ext));
+            } catch (const ComicExportError& ex) {
+                send_json(res, {{"detail", ex.what()}}, 400);
+            } catch (const std::exception& ex) {
+                send_json(res, {{"detail", ex.what()}}, 404);
+            }
+        });
+
+    server.Post(
+        "/api/cache/upload",
+        [&](const httplib::Request& req, httplib::Response& res) {
+            if (!req.is_multipart_form_data()) {
+                send_json(res, {{"detail", "Expected multipart/form-data upload with field 'image' or 'file'."}}, 400);
+                return;
+            }
+            httplib::FormData upload;
+            if (req.form.has_file("image")) {
+                upload = req.form.get_file("image");
+            } else if (req.form.has_file("file")) {
+                upload = req.form.get_file("file");
+            } else {
+                send_json(res, {{"detail", "Missing uploaded image file. Provide multipart form field 'image' or 'file'."}}, 400);
+                return;
+            }
+            if (upload.content.empty()) {
+                send_json(res, {{"detail", "Uploaded image file is empty."}}, 400);
+                return;
+            }
+
+            std::string ext = util::to_lower_ascii(fs::path(upload.filename).extension().string());
+            if (ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" && ext != ".bmp") {
+                ext = ".png";
+            }
+            const std::string image_id = "imp_" + util::generate_uuid_hex() + ext;
+            const fs::path cache_dir = get_image_cache_dir();
+            const fs::path dest_path = cache_dir / image_id;
+            std::string write_err;
+            if (!util::atomic_write_bytes(dest_path, upload.content.data(), upload.content.size(), &write_err)) {
+                send_json(res, {{"detail", write_err.empty() ? "Failed to cache uploaded image." : write_err}}, 500);
+                return;
+            }
+            prune_image_cache(cache_dir);
+            send_json(res, {
+                {"image_id", image_id},
+                {"image_url", "/api/cache/images/" + image_id},
+            });
+        });
+
     // -------------------------------------------------------------------------
     // Archive Import & Multi-Page Export (`/api/import/archive`, `/api/export/cbz`, `/api/export/pdf`)
     // -------------------------------------------------------------------------
@@ -2972,9 +3621,28 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
         }
 
         try {
-            std::vector<uint8_t> raw_bytes(upload.content.begin(), upload.content.end());
             const fs::path cache_dir = get_image_cache_dir();
-            const auto extracted = extract_archive_pages(raw_bytes, cache_dir);
+            std::error_code dir_ec;
+            fs::create_directories(cache_dir, dir_ec);
+            const fs::path tmp_archive = cache_dir / util::utf8_to_wide("tmp_upload_" + util::generate_uuid_hex() + ".cbz");
+            std::string write_err;
+            if (!util::atomic_write_bytes(
+                    tmp_archive,
+                    reinterpret_cast<const uint8_t*>(upload.content.data()),
+                    upload.content.size(),
+                    &write_err)) {
+                send_json(res, {{"detail", "Failed to stage uploaded archive on disk: " + write_err}}, 500);
+                return;
+            }
+            struct TempUploadGuard {
+                fs::path p;
+                ~TempUploadGuard() {
+                    std::error_code ec;
+                    fs::remove(p, ec);
+                }
+            } tmp_guard{tmp_archive};
+
+            const auto extracted = extract_archive_pages_from_file(tmp_archive, cache_dir);
 
             json pages_json = json::array();
             for (const auto& p : extracted) {
@@ -2991,6 +3659,51 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
 
             send_json(res, {
                 {"archive_name", archive_name},
+                {"total_pages", extracted.size()},
+                {"pages", std::move(pages_json)},
+            });
+        } catch (const ArchiveImportError& ex) {
+            send_json(res, {{"detail", ex.what()}}, 400);
+        } catch (const std::exception& ex) {
+            send_json(res, {{"detail", std::string("Archive import failed: ") + ex.what()}}, 500);
+        }
+    });
+
+    server.Post("/api/import/archive-path", [](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            send_json(res, {{"detail", "Invalid JSON object for /api/import/archive-path."}}, 400);
+            return;
+        }
+        const std::string raw_path = util::trim_ascii(body.value("path", std::string("")));
+        if (raw_path.empty()) {
+            send_json(res, {{"detail", "Provide non-empty 'path' to a local .cbz or .zip file."}}, 400);
+            return;
+        }
+        const fs::path archive_path(util::utf8_to_wide(raw_path));
+        const std::string suffix = util::to_lower_ascii(util::path_to_utf8(archive_path.extension()));
+        if (suffix != ".cbz" && suffix != ".zip") {
+            send_json(res, {{"detail", "Unsupported archive format '" + suffix + "'. Expected .cbz or .zip."}}, 400);
+            return;
+        }
+
+        try {
+            const fs::path cache_dir = get_image_cache_dir();
+            const auto extracted = extract_archive_pages_from_file(archive_path, cache_dir);
+            json pages_json = json::array();
+            for (const auto& p : extracted) {
+                pages_json.push_back({
+                    {"index", p.index},
+                    {"filename", p.filename},
+                    {"archive_path", p.archive_path},
+                    {"image_id", p.image_id},
+                    {"image_url", "/api/cache/images/" + p.image_id + "." + p.extension},
+                    {"dimensions", {{"width", p.dimensions.width}, {"height", p.dimensions.height}}},
+                    {"size_bytes", p.size_bytes},
+                });
+            }
+            send_json(res, {
+                {"archive_name", util::path_to_utf8(archive_path.filename())},
                 {"total_pages", extracted.size()},
                 {"pages", std::move(pages_json)},
             });
@@ -3239,6 +3952,38 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                     return;
                 }
 
+                bool return_url = req.has_param("return_url") &&
+                    parse_bool_param(req.get_param_value("return_url"), false);
+                if (!return_url && !util::trim_ascii(req.body).empty()) {
+                    const json body = json::parse(req.body, nullptr, false);
+                    if (body.is_object() && body.contains("return_url") && body["return_url"].is_boolean()) {
+                        return_url = body["return_url"].get<bool>();
+                    }
+                }
+
+                if (return_url) {
+                    CompletedExportState done;
+                    done.file_path = out_file;
+                    done.session_dir = st.session_dir;
+                    done.download_name = download_name;
+                    done.mime_type = mime;
+                    done.file_size = file_size;
+                    done.page_count = ordered_pages.size();
+                    {
+                        std::lock_guard<std::mutex> lock(ctx.export_sessions_mutex);
+                        ctx.completed_exports[sid] = std::move(done);
+                    }
+                    send_json(res, {
+                        {"status", "ok"},
+                        {"session_id", sid},
+                        {"download_url", "/api/export/session/" + sid + "/download"},
+                        {"filename", download_name},
+                        {"size_bytes", file_size},
+                        {"page_count", ordered_pages.size()},
+                    });
+                    return;
+                }
+
                 auto stream_file = std::make_shared<std::ifstream>(out_file, std::ios::binary);
                 if (!stream_file->is_open()) {
                     cleanup_dir();
@@ -3286,6 +4031,68 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 cleanup_dir();
                 send_json(res, {{"detail", std::string("Streamed export failed: ") + ex.what()}}, 500);
             }
+        });
+
+    server.Get(R"(/api/export/session/([A-Za-z0-9_-]{1,64})/download)",
+        [&ctx](const httplib::Request& req, httplib::Response& res) {
+            const std::string sid = req.matches[1].str();
+            CompletedExportState done;
+            {
+                std::lock_guard<std::mutex> lock(ctx.export_sessions_mutex);
+                auto it = ctx.completed_exports.find(sid);
+                if (it == ctx.completed_exports.end()) {
+                    send_json(res, {{"detail", "Completed export not found or already downloaded."}}, 404);
+                    return;
+                }
+                done = std::move(it->second);
+                ctx.completed_exports.erase(it);
+            }
+
+            auto cleanup_dir = [dir = done.session_dir]() {
+                std::error_code ec;
+                fs::remove_all(dir, ec);
+            };
+
+            auto stream_file = std::make_shared<std::ifstream>(done.file_path, std::ios::binary);
+            if (!stream_file->is_open()) {
+                cleanup_dir();
+                send_json(res, {{"detail", "Failed to open finalized export file for download."}}, 500);
+                return;
+            }
+
+            apply_cors_headers(res);
+            res.set_header("Content-Disposition", "attachment; filename=\"" + done.download_name + "\"");
+            res.set_header("X-Page-Count", std::to_string(done.page_count));
+
+            const fs::path dir_to_clean = done.session_dir;
+            res.set_content_provider(
+                static_cast<size_t>(done.file_size),
+                done.mime_type,
+                [stream_file](size_t offset, size_t length, httplib::DataSink& sink) -> bool {
+                    constexpr size_t kChunk = 1024ULL * 1024ULL;  // 1 MiB stream chunks
+                    std::vector<char> buf(std::min(length, kChunk));
+                    stream_file->clear();
+                    stream_file->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+                    size_t remaining = length;
+                    while (remaining > 0) {
+                        const size_t to_read = std::min(remaining, buf.size());
+                        stream_file->read(buf.data(), static_cast<std::streamsize>(to_read));
+                        const std::streamsize got = stream_file->gcount();
+                        if (got <= 0) {
+                            return false;
+                        }
+                        if (!sink.write(buf.data(), static_cast<size_t>(got))) {
+                            return false;
+                        }
+                        remaining -= static_cast<size_t>(got);
+                    }
+                    return true;
+                },
+                [stream_file, dir_to_clean](bool /*success*/) {
+                    stream_file->close();
+                    std::error_code ec;
+                    fs::remove_all(dir_to_clean, ec);
+                });
         });
 
     server.Post(R"(/api/export/session/([A-Za-z0-9_-]{1,64})/cancel)",
@@ -3506,7 +4313,7 @@ void show_error_dialog(const std::wstring& message) {
     MessageBoxW(
         nullptr,
         message.c_str(),
-        L"Vellum — Startup Error",
+        L"Vellum - Startup Error",
         MB_OK | MB_ICONERROR);
 }
 
@@ -3515,9 +4322,15 @@ void show_error_dialog(const std::wstring& message) {
 void register_cuda_dll_paths(const fs::path& exe_dir) {
     std::vector<fs::path> roots;
     roots.push_back(exe_dir / "cuda");
-    roots.push_back(fs::path(L"C:\\FILE SOFTWARE\\Koharu\\store\\cuda"));
-    if (const wchar_t* local_app = _wgetenv(L"LOCALAPPDATA")) {
-        roots.push_back(fs::path(local_app) / L"Koharu" / L"store" / L"cuda");
+    if (auto cuda_env = mangaflow::util::get_env_wide(L"CUDA_PATH"); cuda_env.has_value() && !cuda_env->empty()) {
+        roots.emplace_back(*cuda_env);
+    }
+    roots.emplace_back(L"C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA");
+    if (auto local_app = mangaflow::util::get_env_wide(L"LOCALAPPDATA"); local_app.has_value() && !local_app->empty()) {
+        roots.emplace_back(fs::path(*local_app) / L"LM-Studio");
+    }
+    if (auto user_prof = mangaflow::util::get_env_wide(L"USERPROFILE"); user_prof.has_value() && !user_prof->empty()) {
+        roots.emplace_back(fs::path(*user_prof) / L".lmstudio");
     }
 
     std::wstring extra_paths;
@@ -3529,7 +4342,7 @@ void register_cuda_dll_paths(const fs::path& exe_dir) {
             if (ec) break;
             if (!entry.is_directory(ec) || ec) continue;
             const std::wstring name = entry.path().filename().wstring();
-            if (name == L"bin" || name == L"x86_64") {
+            if (name == L"bin" || name == L"x86_64" || name == L"cuda12") {
                 extra_paths += entry.path().wstring();
                 extra_paths += L";";
             }
@@ -3590,7 +4403,8 @@ int WINAPI WinMain(
 
     // Pre-load persistent settings so execution_mode (`MANGA_FORCE_CPU`) is synced at startup
     const json initial_settings = ctx.settings_manager.load();
-    if (initial_settings.value("execution_mode", std::string("auto")) == "cpu") {
+    const std::string init_exec_mode = initial_settings.value("execution_mode", std::string("hybrid"));
+    if (init_exec_mode == "cpu_only" || init_exec_mode == "cpu") {
         util::set_env_utf8(L"MANGA_FORCE_CPU", "1");
     }
 
@@ -3598,7 +4412,7 @@ int WINAPI WinMain(
     server.set_read_timeout(300, 0);
     server.set_write_timeout(600, 0);
     server.set_keep_alive_max_count(10000);
-    server.set_payload_max_length(2ULL * 1024ULL * 1024ULL * 1024ULL);  // 2 GiB for large archives & exports
+    server.set_payload_max_length(16ULL * 1024ULL * 1024ULL * 1024ULL);  // 16 GiB for multi-GB 10,000-page archives & exports
     register_routes(server, ctx);
 
     int preferred_port = kDefaultPort;

@@ -1,9 +1,11 @@
 # Models, fonts, cache, local settings & large weight files
+Vellum.exe
+Vellum_Runtime/
 models/
 fonts/
 cache/
+projects_cache/
 settings.json
-Vellum_Runtime/
 *.onnx
 *.gguf
 *.bin
@@ -38,12 +40,15 @@ release/
 *.cbz
 *.pdf
 
-# Optional standalone Python CLI helper caches (packaging/convert_koharu_to_onnx.py)
+# Optional standalone Python CLI helper caches & detector trainer artifacts
 venv/
 .venv/
 __pycache__/
 *.py[cod]
 packaging/_koharu_stage/
+tools/detector_trainer/datasets/
+tools/detector_trainer/runs/
+tools/detector_trainer/.venv/
 
 # Local environment files & logs
 .env

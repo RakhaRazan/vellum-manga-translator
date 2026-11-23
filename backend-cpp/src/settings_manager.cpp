@@ -479,7 +479,7 @@ fs::path SettingsManager::default_settings_path() {
     if (auto env_path = util::get_env_wide(L"MANGA_SETTINGS_PATH")) {
         return fs::path(*env_path);
     }
-    return util::get_comic_translator_app_dir() / L"settings.json";
+    return util::get_portable_root_dir() / L"settings.json";
 }
 
 SettingsManager::SettingsManager(std::optional<fs::path> custom_path)
@@ -534,6 +534,8 @@ json SettingsManager::list_reasoning_efforts() {
 
 json SettingsManager::list_detection_models() {
     return json::array({
+        "vellum-det-yolo11m-seg-1024-fp16",
+        "vellum-det-yolo11m-seg-1024-int8",
         "koharu-layout-rfdetr-seg-2xl",
         "comic-text-detector",
     });
@@ -542,8 +544,10 @@ json SettingsManager::list_detection_models() {
 json SettingsManager::list_ocr_models() {
     return json::array({
         "auto",
+        "paddleocr-vl-1.6",
         "manga-ocr",
-        "paddleocr-vl-gguf",
+        "baberu-ocr",
+        "hayai-ocr",
         "rapidocr-ppocrv4",
     });
 }
@@ -551,12 +555,28 @@ json SettingsManager::list_ocr_models() {
 json SettingsManager::list_inpainting_models() {
     return json::array({
         "lama-manga",
+        "aot-inpainting",
+        "flux-2-klein",
+        "rorem-mixed",
         "lama-fp32",
     });
 }
 
 std::string SettingsManager::normalize_detection_model(const std::string& raw) {
     const std::string cleaned = util::to_lower_ascii(util::trim_ascii(raw));
+    if (cleaned == "vellum-det-yolo11m-seg-1024-fp16" ||
+        cleaned == "vellum-det-yolo11m-seg-1024-fp16.onnx" ||
+        cleaned == "vellum_det_yolo11m_fp16" ||
+        cleaned == "yolo11m-seg-fp16" ||
+        cleaned == "yolo11-seg") {
+        return "vellum-det-yolo11m-seg-1024-fp16";
+    }
+    if (cleaned == "vellum-det-yolo11m-seg-1024-int8" ||
+        cleaned == "vellum-det-yolo11m-seg-1024-int8.onnx" ||
+        cleaned == "vellum_det_yolo11m_int8" ||
+        cleaned == "yolo11m-seg-int8") {
+        return "vellum-det-yolo11m-seg-1024-int8";
+    }
     if (cleaned.empty() || cleaned == "default" || cleaned == "auto" ||
         cleaned == "koharu-layout-rfdetr-seg-2xl" ||
         cleaned == "koharu-layout-rfdetr-seg-2xl-1152" ||
@@ -577,7 +597,7 @@ std::string SettingsManager::normalize_detection_model(const std::string& raw) {
     }
     throw std::invalid_argument(
         "Unsupported detection_model '" + raw +
-        "'. Supported options: 'koharu-layout-rfdetr-seg-2xl', 'comic-text-detector'.");
+        "'. Supported options: 'vellum-det-yolo11m-seg-1024-fp16', 'vellum-det-yolo11m-seg-1024-int8', 'koharu-layout-rfdetr-seg-2xl', 'comic-text-detector'.");
 }
 
 std::string SettingsManager::normalize_ocr_model(const std::string& raw) {
@@ -589,11 +609,20 @@ std::string SettingsManager::normalize_ocr_model(const std::string& raw) {
         cleaned == "koharu-manga-ocr" || cleaned == "koharu_manga_ocr") {
         return "manga-ocr";
     }
-    if (cleaned == "paddleocr-vl-gguf" || cleaned == "paddleocr_vl_gguf" ||
+    if (cleaned == "baberu-ocr" || cleaned == "baberu_ocr" || cleaned == "baberu" ||
+        cleaned == "baberuocr") {
+        return "baberu-ocr";
+    }
+    if (cleaned == "hayai-ocr" || cleaned == "hayai_ocr" || cleaned == "hayai" ||
+        cleaned == "hayaiocr" || cleaned == "hayai-ocr-v2" || cleaned == "hayai_ocr_v2") {
+        return "hayai-ocr";
+    }
+    if (cleaned == "paddleocr-vl-1.6" || cleaned == "paddleocr_vl_1.6" ||
+        cleaned == "paddleocr-vl-gguf" || cleaned == "paddleocr_vl_gguf" ||
         cleaned == "paddleocr-vl" || cleaned == "paddleocr_vl" ||
         cleaned == "paddle-vl" || cleaned == "paddle_vl" ||
         cleaned == "paddleocr-vl-1.6-gguf") {
-        return "paddleocr-vl-gguf";
+        return "paddleocr-vl-1.6";
     }
     if (cleaned == "rapidocr-ppocrv4" || cleaned == "rapidocr_ppocrv4" ||
         cleaned == "rapidocr" || cleaned == "rapid-ocr" || cleaned == "rapid_ocr" ||
@@ -602,7 +631,7 @@ std::string SettingsManager::normalize_ocr_model(const std::string& raw) {
     }
     throw std::invalid_argument(
         "Unsupported ocr_model '" + raw +
-        "'. Supported options: 'auto', 'manga-ocr', 'paddleocr-vl-gguf', 'rapidocr-ppocrv4'.");
+        "'. Supported options: 'auto', 'paddleocr-vl-1.6', 'manga-ocr', 'baberu-ocr', 'hayai-ocr', 'rapidocr-ppocrv4'.");
 }
 
 std::string SettingsManager::normalize_inpainting_model(const std::string& raw) {
@@ -612,13 +641,27 @@ std::string SettingsManager::normalize_inpainting_model(const std::string& raw) 
         cleaned == "koharu-lama-manga" || cleaned == "koharu_lama_manga") {
         return "lama-manga";
     }
+    if (cleaned == "aot-inpainting" || cleaned == "aot_inpainting" ||
+        cleaned == "aot" || cleaned == "aot-manga") {
+        return "aot-inpainting";
+    }
+    if (cleaned == "flux-2-klein" || cleaned == "flux_2_klein" ||
+        cleaned == "flux.2-klein" || cleaned == "flux2-klein" ||
+        cleaned == "flux-klein" || cleaned == "flux") {
+        return "flux-2-klein";
+    }
+    if (cleaned == "rorem-mixed" || cleaned == "rorem_mixed" ||
+        cleaned == "rorem" || cleaned == "rorem-mixed-gguf" ||
+        cleaned == "rorem_mixed_gguf") {
+        return "rorem-mixed";
+    }
     if (cleaned == "lama-fp32" || cleaned == "lama_fp32" ||
         cleaned == "lama" || cleaned == "fp32") {
         return "lama-fp32";
     }
     throw std::invalid_argument(
         "Unsupported inpainting_model '" + raw +
-        "'. Supported options: 'lama-manga', 'lama-fp32'.");
+        "'. Supported options: 'lama-manga', 'aot-inpainting', 'flux-2-klein', 'rorem-mixed', 'lama-fp32'.");
 }
 
 json SettingsManager::build_default_settings() {
@@ -648,14 +691,19 @@ json SettingsManager::build_default_settings() {
         {"theme", "dark"},
         {"accent_color", "amber"},
         {"ui_density", "compact"},
-        // Tab 2: Pipeline (Koharu-matching model selection + hardware/geometry/VRAM settings)
-        {"detection_model", "koharu-layout-rfdetr-seg-2xl"},
+        // Tab 2: Pipeline (Vellum YOLO11m-Seg default + Smart Hybrid GPU/CPU settings)
+        {"detection_model", "vellum-det-yolo11m-seg-1024-fp16"},
         {"text_threshold", nullptr},
         {"bubble_threshold", nullptr},
         {"panel_threshold", nullptr},
+        {"whisper_threshold", nullptr},
+        {"borderless_threshold", nullptr},
+        {"enable_adaptive_tiling", true},
+        {"sfx_suppress_iou", 0.60},
         {"ocr_model", "auto"},
         {"inpainting_model", "lama-manga"},
-        {"execution_mode", "auto"},
+        {"inpaint_api_url", "http://127.0.0.1:8188"},
+        {"execution_mode", "hybrid"},
         {"conf_threshold", 0.35},
         {"nms_threshold", 0.45},
         {"mask_threshold", 0.5},
@@ -886,6 +934,22 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         ? clamp_optional_double(raw["panel_threshold"], 0.05, 0.95, current.value("panel_threshold", json(nullptr)))
         : current.value("panel_threshold", json(nullptr));
 
+    const json whisper_threshold = raw.contains("whisper_threshold")
+        ? clamp_optional_double(raw["whisper_threshold"], 0.05, 0.95, current.value("whisper_threshold", json(nullptr)))
+        : current.value("whisper_threshold", json(nullptr));
+
+    const json borderless_threshold = raw.contains("borderless_threshold")
+        ? clamp_optional_double(raw["borderless_threshold"], 0.05, 0.95, current.value("borderless_threshold", json(nullptr)))
+        : current.value("borderless_threshold", json(nullptr));
+
+    const bool enable_adaptive_tiling = (raw.contains("enable_adaptive_tiling") && !raw["enable_adaptive_tiling"].is_null())
+        ? coerce_bool(raw["enable_adaptive_tiling"], current.value("enable_adaptive_tiling", true))
+        : current.value("enable_adaptive_tiling", true);
+
+    const double sfx_suppress_iou = (raw.contains("sfx_suppress_iou") && !raw["sfx_suppress_iou"].is_null())
+        ? clamp_double(raw["sfx_suppress_iou"], 0.05, 1.0, current.value("sfx_suppress_iou", 0.60))
+        : current.value("sfx_suppress_iou", 0.60);
+
     std::string ocr_model = current.value("ocr_model", std::string("auto"));
     if (raw.contains("ocr_model") && !raw["ocr_model"].is_null()) {
         ocr_model = normalize_ocr_model(json_to_string(raw["ocr_model"]));
@@ -896,12 +960,31 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         inpainting_model = normalize_inpainting_model(json_to_string(raw["inpainting_model"]));
     }
 
-    std::string execution_mode = current.value("execution_mode", std::string("auto"));
+    std::string inpaint_api_url = current.value("inpaint_api_url", std::string("http://127.0.0.1:8188"));
+    if (raw.contains("inpaint_api_url") && !raw["inpaint_api_url"].is_null()) {
+        const std::string u = util::trim_ascii(json_to_string(raw["inpaint_api_url"]));
+        if (!u.empty()) inpaint_api_url = u;
+    }
+
+    std::string execution_mode = current.value("execution_mode", std::string("hybrid"));
+    if (execution_mode == "auto" || execution_mode.empty()) {
+        execution_mode = "hybrid";
+    } else if (execution_mode == "cpu") {
+        execution_mode = "cpu_only";
+    } else if (execution_mode == "gpu") {
+        execution_mode = "force_gpu";
+    }
     if (raw.contains("execution_mode") && !raw["execution_mode"].is_null()) {
         const std::string em = util::to_lower_ascii(util::trim_ascii(json_to_string(raw["execution_mode"])));
-        execution_mode = (em == "cpu" || em == "cpu_only" || em == "cpu only") ? "cpu" : "auto";
+        if (em == "cpu" || em == "cpu_only" || em == "cpu only" || em == "cpu-only") {
+            execution_mode = "cpu_only";
+        } else if (em == "gpu" || em == "force_gpu" || em == "force gpu" || em == "force-gpu") {
+            execution_mode = "force_gpu";
+        } else {
+            execution_mode = "hybrid";
+        }
     }
-    util::set_env_utf8(L"MANGA_FORCE_CPU", execution_mode == "cpu" ? "1" : "0");
+    util::set_env_utf8(L"MANGA_FORCE_CPU", execution_mode == "cpu_only" ? "1" : "0");
 
     const double conf_threshold = (raw.contains("conf_threshold") && !raw["conf_threshold"].is_null())
         ? clamp_double(raw["conf_threshold"], 0.05, 0.95, current.value("conf_threshold", 0.35))
@@ -1056,8 +1139,13 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         {"text_threshold", text_threshold},
         {"bubble_threshold", bubble_threshold},
         {"panel_threshold", panel_threshold},
+        {"whisper_threshold", whisper_threshold},
+        {"borderless_threshold", borderless_threshold},
+        {"enable_adaptive_tiling", enable_adaptive_tiling},
+        {"sfx_suppress_iou", sfx_suppress_iou},
         {"ocr_model", ocr_model},
         {"inpainting_model", inpainting_model},
+        {"inpaint_api_url", inpaint_api_url},
         {"execution_mode", execution_mode},
         {"conf_threshold", conf_threshold},
         {"nms_threshold", nms_threshold},
