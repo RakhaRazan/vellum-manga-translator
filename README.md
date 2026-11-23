@@ -9,7 +9,7 @@ Built with a pure modern **C++17** backend (**ONNX Runtime C++ API** + **Microso
 Grab the latest `Vellum-Windows-x64.zip` from [Releases](https://github.com/HoldMyAss/vellum-manga-translator/releases), extract it anywhere, and double-click `Vellum.exe`.
 
 - **Requirements:** Windows 10/11 (x64) with Microsoft Edge WebView2 Runtime (pre-installed on Windows 11).
-- **100% Portable Relative Paths:** All runtime data resolves strictly relative to `Vellum.exe` (`./models/`, `./fonts/`, `./cache/`, `./projects_cache/`, and `./settings.json`)—zero `%LOCALAPPDATA%` or Registry clutter.
+- **100% Portable Relative Paths:** All runtime data resolves strictly relative to `Vellum.exe` (`./models/`, `./fonts/`, `./cache/`, `./projects_cache/`, and `./settings.json`) zero `%LOCALAPPDATA%` or Registry clutter.
 - On first launch, Vellum automatically checks `./models/` and lets you download missing ONNX models directly from **Settings -> Pipeline** (or import an existing local Koharu Hugging Face cache).
 
 ## Architecture & Scale Highlights (v2.0)
