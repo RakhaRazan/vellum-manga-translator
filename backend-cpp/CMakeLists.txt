@@ -87,16 +87,20 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(webview)
 
 # ------------------------------------------------------------------------------
-# 4. Official Prebuilt ONNX Runtime (win-x64: DirectML / CUDA / CPU)
+# 4. Official Prebuilt ONNX Runtime (win-x64: DML [default] / CUDA / CPU)
 # ------------------------------------------------------------------------------
-if(DEFINED VELLUM_ORT_BACKEND AND NOT DEFINED MANGAFLOW_ORT_BACKEND)
-    set(MANGAFLOW_ORT_BACKEND "${VELLUM_ORT_BACKEND}")
+if(DEFINED MANGAFLOW_ORT_BACKEND AND NOT DEFINED VELLUM_ORT_BACKEND)
+    set(VELLUM_ORT_BACKEND "${MANGAFLOW_ORT_BACKEND}" CACHE STRING "ONNX Runtime prebuilt backend: DML (universal default), CUDA, CPU, or AUTO")
+else()
+    set(VELLUM_ORT_BACKEND "DML" CACHE STRING "ONNX Runtime prebuilt backend: DML (universal default), CUDA, CPU, or AUTO")
 endif()
-set(MANGAFLOW_ORT_BACKEND "AUTO" CACHE STRING "ONNX Runtime prebuilt backend: AUTO, CUDA, DIRECTML, or CPU")
-set_property(CACHE MANGAFLOW_ORT_BACKEND PROPERTY STRINGS AUTO CUDA DIRECTML CPU)
+set_property(CACHE VELLUM_ORT_BACKEND PROPERTY STRINGS DML DIRECTML CUDA CPU AUTO)
 set(MANGAFLOW_ORT_URL "" CACHE STRING "Optional custom URL to an official onnxruntime-win-x64 zip/nupkg archive")
 
-set(_RESOLVED_ORT_BACKEND "${MANGAFLOW_ORT_BACKEND}")
+string(TOUPPER "${VELLUM_ORT_BACKEND}" _RESOLVED_ORT_BACKEND)
+if(_RESOLVED_ORT_BACKEND STREQUAL "DML")
+    set(_RESOLVED_ORT_BACKEND "DIRECTML")
+endif()
 if(_RESOLVED_ORT_BACKEND STREQUAL "AUTO")
     # Probe CUDA 12 + cuDNN 9 DLLs on PATH, CUDA_PATH, NVIDIA Toolkit, or LM Studio before falling back to DirectML
     set(_CUDA_SEARCH_DIRS "")
@@ -132,7 +136,7 @@ elseif(_RESOLVED_ORT_BACKEND STREQUAL "CPU")
     set(_ORT_DOWNLOAD_URL "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${_ORT_VERSION}/microsoft.ml.onnxruntime.${_ORT_VERSION}.nupkg")
     set(_ORT_DOWNLOAD_NAME "onnxruntime-win-x64-${_ORT_VERSION}.zip")
 else()
-    message(FATAL_ERROR "Invalid MANGAFLOW_ORT_BACKEND='${MANGAFLOW_ORT_BACKEND}'. Choose AUTO, CUDA, DIRECTML, or CPU.")
+    message(FATAL_ERROR "Invalid VELLUM_ORT_BACKEND='${VELLUM_ORT_BACKEND}'. Choose DML, DIRECTML, CUDA, CPU, or AUTO.")
 endif()
 
 FetchContent_Declare(
@@ -220,7 +224,7 @@ set_target_properties(stb::headers PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${stb_headers_SOURCE_DIR}"
 )
 
-message(STATUS "[Vellum] ONNX Runtime backend : ${MANGAFLOW_ORT_BACKEND} (resolved: ${_RESOLVED_ORT_BACKEND})")
+message(STATUS "[Vellum] ONNX Runtime backend : ${VELLUM_ORT_BACKEND} (resolved: ${_RESOLVED_ORT_BACKEND})")
 message(STATUS "[Vellum] ONNX Runtime include : ${ONNXRUNTIME_INCLUDE_DIR}")
 message(STATUS "[Vellum] ONNX Runtime lib dir : ${ONNXRUNTIME_LIB_DIR}")
 message(STATUS "[Vellum] DirectML header      : ${MANGAFLOW_HAS_DML}")
@@ -261,6 +265,7 @@ add_executable(MangaFlowAI WIN32
     src/detector/adaptive_tiler.cpp
     src/detector/export_artifacts.hpp
     src/detector/export_artifacts.cpp
+    src/pipeline/ort_provider.cpp
     src/pipeline/model_manager.cpp
     src/pipeline/detector.cpp
     src/pipeline/ocr.cpp
@@ -315,6 +320,7 @@ target_link_libraries(MangaFlowAI PRIVATE
     dwmapi
     dxgi
     winhttp
+    crypt32
 )
 
 # Copy ONNX Runtime DLLs next to Vellum.exe after every build
@@ -389,6 +395,7 @@ add_executable(vellum_det_bench
     src/detector/export_artifacts.hpp
     src/detector/export_artifacts.cpp
     src/pipeline/detector.cpp
+    src/pipeline/ort_provider.cpp
     src/pipeline/model_manager.cpp
 )
 

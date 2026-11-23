@@ -1,5 +1,6 @@
 #include "yolo_seg_backend.hpp"
 #include "geometry_postproc.hpp"
+#include "../pipeline/ort_provider.hpp"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -24,12 +25,6 @@ constexpr int kYoloInputSize = 1024;
 constexpr int kMaskChannels = 32;
 constexpr float kLetterboxPadVal = 114.0f / 255.0f;
 constexpr float kMaskThreshold = 0.50f;
-
-struct MinimalOrtDmlApi {
-    OrtStatus*(ORT_API_CALL* SessionOptionsAppendExecutionProvider_DML)(
-        OrtSessionOptions* options,
-        int device_id);
-};
 
 // IEEE-754 float32 <-> float16 conversion helpers for FP16 ONNX models.
 uint16_t floatToHalfBits(float value) noexcept {
@@ -293,16 +288,8 @@ bool Yolo11SegBackend::load(const DetectorConfig& config) {
     const int physical_cores = queryPhysicalCoreCount();
     const int gpu_host_threads = std::max(1, std::min(2, physical_cores / 2));
 
-    std::vector<std::string> providers;
-    if (!config.force_cpu) {
-        const auto available = Ort::GetAvailableProviders();
-        for (const char* preferred : {"CUDAExecutionProvider", "DmlExecutionProvider"}) {
-            if (std::find(available.begin(), available.end(), preferred) != available.end()) {
-                providers.emplace_back(preferred);
-            }
-        }
-    }
-    providers.emplace_back("CPUExecutionProvider");
+    const std::vector<std::string> providers =
+        mangaflow::pipeline::get_ordered_execution_providers(config.force_cpu);
 
     auto tryCreateSession = [&](const std::string& provider) -> std::unique_ptr<Ort::Session> {
         Ort::SessionOptions opts;
@@ -318,38 +305,10 @@ bool Yolo11SegBackend::load(const DetectorConfig& config) {
         opts.SetIntraOpNumThreads(gpu_host_threads);
         opts.AddConfigEntry("session.intra_op.allow_spinning", "0");
 
-        if (provider == "CUDAExecutionProvider") {
-            OrtCUDAProviderOptions cuda_opts{};
-            cuda_opts.device_id = 0;
-            cuda_opts.arena_extend_strategy = 1;
-            opts.AppendExecutionProvider_CUDA(cuda_opts);
-            return std::make_unique<Ort::Session>(sharedEnv(), model_fs_path.c_str(), opts);
+        if (!mangaflow::pipeline::append_gpu_execution_provider(opts, provider, /*device_id=*/0)) {
+            return nullptr;
         }
-
-        if (provider == "DmlExecutionProvider") {
-            opts.DisableMemPattern();
-            opts.DisableCpuMemArena();
-            opts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-
-            const void* raw_dml_api = nullptr;
-            OrtStatus* api_status = Ort::GetApi().GetExecutionProviderApi(
-                "DML", ORT_API_VERSION, &raw_dml_api);
-            if (api_status != nullptr || raw_dml_api == nullptr) {
-                if (api_status != nullptr) {
-                    Ort::GetApi().ReleaseStatus(api_status);
-                }
-                return nullptr;
-            }
-            const auto* dml_api = static_cast<const MinimalOrtDmlApi*>(raw_dml_api);
-            OrtStatus* append_status =
-                dml_api->SessionOptionsAppendExecutionProvider_DML(opts, 0);
-            if (append_status != nullptr) {
-                Ort::GetApi().ReleaseStatus(append_status);
-                return nullptr;
-            }
-            return std::make_unique<Ort::Session>(sharedEnv(), model_fs_path.c_str(), opts);
-        }
-        return nullptr;
+        return std::make_unique<Ort::Session>(sharedEnv(), model_fs_path.c_str(), opts);
     };
 
     for (const auto& provider : providers) {

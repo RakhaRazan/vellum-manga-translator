@@ -264,6 +264,13 @@ const std::vector<ProviderSpec>& all_provider_specs() {
             true, true, true, true, true,
             {},
         },
+        {
+            "none", "None (Manual / No-LLM)", "",
+            "", "",
+            false, false, true, "none",
+            false, false, false, false, false,
+            {},
+        },
     };
     return kSpecs;
 }
@@ -1677,9 +1684,15 @@ TranslatorConfig TranslatorConfig::from_settings_with_overrides(
 std::string ComicTranslator::normalize_provider_id(const std::string& raw) {
     const std::string cleaned = util::to_lower_ascii(util::trim_ascii(raw));
     if (cleaned.empty()) {
-        return "lmstudio";
+        return "none";
     }
     static const std::unordered_map<std::string, std::string> kAliases = {
+        {"none", "none"},
+        {"manual", "none"},
+        {"disabled", "none"},
+        {"off", "none"},
+        {"no-llm", "none"},
+        {"no_llm", "none"},
         {"lmstudio", "lmstudio"},
         {"lm-studio", "lmstudio"},
         {"lm_studio", "lmstudio"},

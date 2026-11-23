@@ -37,6 +37,7 @@
 #include "pipeline/inpainter.hpp"
 #include "pipeline/model_manager.hpp"
 #include "pipeline/ocr.hpp"
+#include "pipeline/ort_provider.hpp"
 #include "pipeline/translator.hpp"
 #include "settings_manager.hpp"
 #include "utils.hpp"
@@ -1100,6 +1101,17 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             {"active_provider", ctx.settings_manager.get_active_provider_summary()},
             {"lm_studio", lm_status},
         };
+        send_json(res, payload);
+    });
+
+    server.Get("/api/system/hardware", [&ctx](const httplib::Request&, httplib::Response& res) {
+        const json current_settings = ctx.settings_manager.load();
+        const std::string exec_mode = current_settings.value("execution_mode", std::string("hybrid"));
+        const bool cpu_only = (exec_mode == "cpu_only" || exec_mode == "cpu");
+        const auto caps = pipeline::detect_hardware_capabilities(cpu_only);
+        json payload = pipeline::hardware_capabilities_to_json(caps);
+        payload["execution_mode"] = exec_mode;
+        payload["onnxruntime_version"] = ctx.ort_version;
         send_json(res, payload);
     });
 
