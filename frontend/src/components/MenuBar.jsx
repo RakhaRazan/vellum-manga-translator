@@ -1112,11 +1112,12 @@ export default function MenuBar({
               </div>
 
               <p className="text-studio-text-secondary leading-relaxed">
-                100% native C++17 desktop application powered by ONNX Runtime C++
-                and Microsoft Edge WebView2. Translates Japanese Manga, Korean Manhwa,
-                and Chinese Manhua using Koharu RF-DETR / Comic Text Detector, manga-ocr /
-                RapidOCR, tile-based LaMa inpainting, and context-aware LLM translation
-                with zero Python runtime dependency.
+                100% portable native C++17 desktop studio powered by ONNX Runtime C++
+                and Microsoft Edge WebView2 with Smart Hybrid GPU+CPU routing.
+                Supports Vellum YOLO11m-Seg, Koharu RF-DETR-Seg 2XL &amp; ComicTextDetector
+                (SAHI+WBF), Manga OCR, Baberu OCR, Hayai OCR, RapidOCR &amp; PaddleOCR-VL 1.6,
+                text-stroke-only LaMa / AOT / FLUX.2 Klein / RORem Mixed inpainting,
+                multi-provider LLM translation, and 64-bit ZIP64 (&gt;4 GB) .cbz/.pdf export.
               </p>
 
               <div className="rounded-studio border border-studio-border bg-studio-surface p-2.5 space-y-1.5 font-mono text-[11px]">
