@@ -73,14 +73,14 @@ packaging\build_cpp_release.bat
 
 Vellum stands on the shoulders of the open-source manga translation, OCR, and computer vision community:
 
-- **[Koharu](https://github.com/mayocream/koharu)** (`mayocream`) — Inspiration for the modern local-first manga translation workflow, `koharu-layout-rfdetr-seg-2xl-1152`, and `lama-manga` weights.
-- **[ogkalu](https://huggingface.co/ogkalu)** — Comic and manga speech-bubble / layout detection datasets and YOLO segmentation research.
-- **[comic-text-detector](https://github.com/dmMaze/comic-text-detector)** (`dmMaze`) — Foundational manga text block and stroke mask detection architecture.
-- **[manga-ocr](https://github.com/kha-white/manga-ocr)** (`kha-white`) — Japanese vertical/horizontal manga OCR model.
-- **[baberu-ocr](https://huggingface.co/genshiai-daichi/baberu-ocr)** (`genshiai-daichi/baberu-ocr`) — Lightweight quantized `JA`/`ZH`/`EN` and SFX manga OCR weights.
-- **[hayai-ocr-v2](https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2)** (`JustANormalTinkerer/hayai-ocr-v2`) — Aspect-ratio-preserving multilingual manga and webtoon OCR architecture.
-- **[RapidOCR](https://github.com/RapidAI/RapidOCR)** & **[PaddleOCR / PaddleOCR-VL 1.6](https://github.com/PaddlePaddle/PaddleOCR)** (`PaddlePaddle`) — PP-OCRv4 Korean/Chinese recognition and PaddleOCR-VL-1.6 GGUF Vision-Language OCR models.
-- **[LaMa](https://github.com/advimman/lama)** (`advimman/lama`) — Resolution-robust Large Mask Inpainting architecture.
-- **[aot-inpainting](https://huggingface.co/mayocream/aot-inpainting)** (`mayocream/aot-inpainting`) — Fast AOT-GAN manga text-stroke inpainting model.
-- **[RORem-mixed-GGUF](https://huggingface.co/mayocream/RORem-mixed-GGUF)** (`mayocream/RORem-mixed-GGUF`) — Generative manga text and object removal diffusion weights.
-- **[FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)** (`black-forest-labs/FLUX.2-klein-4B`) — High-speed rectified-flow generative inpainting model.
+- **[Koharu](https://github.com/mayocream/koharu)** (`mayocream`) - Inspiration for the modern local-first manga translation workflow, `koharu-layout-rfdetr-seg-2xl-1152`, and `lama-manga` weights.
+- **[ogkalu](https://huggingface.co/ogkalu)** - Comic and manga speech-bubble / layout detection datasets and YOLO segmentation research.
+- **[comic-text-detector](https://github.com/dmMaze/comic-text-detector)** (`dmMaze`) - Foundational manga text block and stroke mask detection architecture.
+- **[manga-ocr](https://github.com/kha-white/manga-ocr)** (`kha-white`) - Japanese vertical/horizontal manga OCR model.
+- **[baberu-ocr](https://huggingface.co/genshiai-daichi/baberu-ocr)** (`genshiai-daichi/baberu-ocr`) - Lightweight quantized `JA`/`ZH`/`EN` and SFX manga OCR weights.
+- **[hayai-ocr-v2](https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2)** (`JustANormalTinkerer/hayai-ocr-v2`) - Aspect-ratio-preserving multilingual manga and webtoon OCR architecture.
+- **[RapidOCR](https://github.com/RapidAI/RapidOCR)** & **[PaddleOCR / PaddleOCR-VL 1.6](https://github.com/PaddlePaddle/PaddleOCR)** (`PaddlePaddle`) - PP-OCRv4 Korean/Chinese recognition and PaddleOCR-VL-1.6 GGUF Vision-Language OCR models.
+- **[LaMa](https://github.com/advimman/lama)** (`advimman/lama`) - Resolution-robust Large Mask Inpainting architecture.
+- **[aot-inpainting](https://huggingface.co/mayocream/aot-inpainting)** (`mayocream/aot-inpainting`) - Fast AOT-GAN manga text-stroke inpainting model.
+- **[RORem-mixed-GGUF](https://huggingface.co/mayocream/RORem-mixed-GGUF)** (`mayocream/RORem-mixed-GGUF`) - Generative manga text and object removal diffusion weights.
+- **[FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)** (`black-forest-labs/FLUX.2-klein-4B`) - High-speed rectified-flow generative inpainting model.
