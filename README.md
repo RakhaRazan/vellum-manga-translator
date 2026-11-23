@@ -25,7 +25,7 @@ Grab the latest `Vellum-Windows-x64.zip` from [Releases](https://github.com/Hold
 
 ## Setting Up a Translator (LM Studio)
 
-By default, Vellum connects to a local server from [LM Studio](https://lmstudio.ai/) on port `1235`:
+By default, Vellum connects to a local server from [LM Studio]:
 
 1. Load a model in LM Studio.
 2. Open the **Developer / Local Server** tab, set the port to `1235`, enable **CORS**, and click **Start Server**.
