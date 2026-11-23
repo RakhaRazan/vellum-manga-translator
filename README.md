@@ -28,7 +28,7 @@ Grab the latest `Vellum-Windows-x64.zip` from [Releases](https://github.com/Hold
 By default, Vellum connects to a local server from [LM Studio]:
 
 1. Load a model in LM Studio.
-2. Open the **Developer / Local Server** tab, set the port to `1235`, enable **CORS**, and click **Start Server**.
+2. Open the **Developer / Local Server** tab, set the port to your local LLM, enable **CORS**, and click **Start Server**.
 3. Vellum detects it automatically.
 
 For Ollama or cloud APIs (OpenAI, Gemini, Anthropic, DeepSeek, OpenRouter), configure your endpoint and key under **Settings -> Providers**.
