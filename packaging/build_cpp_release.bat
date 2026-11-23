@@ -205,6 +205,11 @@ if exist "%ROOT_DIR%\settings.json" (
     copy /y "%ROOT_DIR%\settings.json" "%STAGE_DIR%\settings.json" >nul
 )
 
+if exist "%ROOT_DIR%\fonts" (
+    mkdir "%STAGE_DIR%\fonts" >nul 2>&1
+    xcopy "%ROOT_DIR%\fonts\*" "%STAGE_DIR%\fonts\" /e /i /y /q >nul 2>&1
+)
+
 xcopy "%FRONTEND_DIST%\*" "%STAGE_DIR%\frontend\dist\" /e /i /y /q >nul
 if errorlevel 1 (
     echo [ERROR] Failed to copy frontend/dist into "%STAGE_DIR%\frontend\dist".

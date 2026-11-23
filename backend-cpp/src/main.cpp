@@ -235,7 +235,7 @@ json build_default_style_json(
     const std::string& color = "#000000",
     const std::string& align = "center") {
     return {
-        {"font_family", "Anime Ace"},
+        {"font_family", "CC Wild Words"},
         {"font_size", font_size},
         {"color", color},
         {"stroke_color", "#ffffff"},

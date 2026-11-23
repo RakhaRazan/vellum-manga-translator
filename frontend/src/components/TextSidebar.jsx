@@ -34,12 +34,17 @@ import useEditorStore, {
 
 export const COMIC_FONT_FAMILIES = [
   {
-    label: 'Comic Neue (Default Comic)',
-    value: '"Comic Neue", "Anime Ace", "Comic Sans MS", sans-serif',
+    label: 'CC Wild Words (Default Manga)',
+    value:
+      '"CC Wild Words", "Anime Ace", "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans", sans-serif',
+  },
+  {
+    label: 'Comic Neue (Classic Comic)',
+    value: '"Comic Neue", "CC Wild Words", "Anime Ace", "Comic Sans MS", sans-serif',
   },
   {
     label: 'Anime Ace / Classic Manga',
-    value: '"Anime Ace", "Comic Neue", "Comic Sans MS", cursive, sans-serif',
+    value: '"Anime Ace", "CC Wild Words", "Comic Neue", "Comic Sans MS", cursive, sans-serif',
   },
   {
     label: 'Inter Bold (Clean Webtoon)',

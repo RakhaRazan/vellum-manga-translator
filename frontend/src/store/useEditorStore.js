@@ -12,13 +12,14 @@ export const VALID_DENSITIES = ['compact', 'comfortable'];
 export const DEFAULT_FONT_FALLBACK_CHAIN = [
   'CC Wild Words',
   'Anime Ace',
-  'Comic Neue',
+  'Segoe UI Symbol',
+  'Noto Sans Symbols 2',
   'Noto Sans',
   'sans-serif',
 ];
 
 export const DEFAULT_FONT_FAMILY =
-  '"CC Wild Words", "Anime Ace", "Comic Neue", "Noto Sans", sans-serif';
+  '"CC Wild Words", "Anime Ace", "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans", sans-serif';
 
 export const DEFAULT_TYPESETTING_CONFIG = {
   fontFamily: DEFAULT_FONT_FAMILY,
@@ -445,6 +446,12 @@ export async function loadFontFamilyFromCatalog(
     variants.find((v) => !v.italic) ||
     variants[0];
   const boldVariant = variants.find((v) => !v.italic && v.weight >= 600) || null;
+  const italicVariant =
+    variants.find((v) => v.italic && (v.weight === 400 || v.weight === 500)) ||
+    variants.find((v) => v.italic && v.weight < 600) ||
+    null;
+  const boldItalicVariant =
+    variants.find((v) => v.italic && v.weight >= 600) || null;
 
   const jobs = [];
   if (boldVariant && regularVariant && boldVariant.url !== regularVariant.url) {
@@ -463,11 +470,57 @@ export async function loadFontFamilyFromCatalog(
       })
     );
   } else if (regularVariant?.url) {
+    // Register both 400 and 700 descriptors for single-weight Roman/Regular font files
+    // to prevent synthetic faux-bold clipping on Konva canvas & offscreen exports.
     jobs.push(
       ensureFontFaceLoaded(familyName, regularVariant.url, apiBaseUrl, {
+        italic: Boolean(regularVariant.italic),
         registerBoldAlias: true,
       })
     );
+  }
+
+  if (italicVariant?.url && italicVariant.url !== regularVariant?.url) {
+    jobs.push(
+      ensureFontFaceLoaded(familyName, italicVariant.url, apiBaseUrl, {
+        weight: '400',
+        italic: true,
+        registerBoldAlias: !boldItalicVariant,
+      })
+    );
+  }
+
+  if (
+    boldItalicVariant?.url &&
+    boldItalicVariant.url !== regularVariant?.url &&
+    boldItalicVariant.url !== italicVariant?.url
+  ) {
+    jobs.push(
+      ensureFontFaceLoaded(familyName, boldItalicVariant.url, apiBaseUrl, {
+        weight: '700',
+        italic: true,
+        registerBoldAlias: false,
+      })
+    );
+  }
+
+  // Also load any remaining distinct variant files in the family group
+  for (const v of variants) {
+    if (
+      v?.url &&
+      v.url !== regularVariant?.url &&
+      v.url !== boldVariant?.url &&
+      v.url !== italicVariant?.url &&
+      v.url !== boldItalicVariant?.url
+    ) {
+      jobs.push(
+        ensureFontFaceLoaded(familyName, v.url, apiBaseUrl, {
+          weight: String(v.weight || 400),
+          italic: Boolean(v.italic),
+          registerBoldAlias: false,
+        })
+      );
+    }
   }
 
   const results = await Promise.all(jobs);
@@ -2499,6 +2552,17 @@ export const useEditorStore = create((set, get) => ({
 
   setFontsCatalogCache: (catalogData) => {
     set({ fontsCatalogCache: catalogData });
+    if (catalogData && typeof window !== 'undefined' && typeof FontFace !== 'undefined') {
+      const chain =
+        useEditorStore.getState()?.typesetting?.fontFallbackChain ||
+        DEFAULT_FONT_FALLBACK_CHAIN;
+      const preloadNames = new Set(['CC Wild Words', ...chain]);
+      preloadNames.forEach((fam) => {
+        loadFontFamilyFromCatalog(fam, catalogData, DEFAULT_API_BASE_URL).catch(
+          () => false
+        );
+      });
+    }
   },
 
   bumpFontLoadVersion: () => {

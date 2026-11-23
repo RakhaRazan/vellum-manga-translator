@@ -817,6 +817,10 @@ std::optional<FontManager::IndexedFont> FontManager::build_indexed_font(
 
     std::string subfamily =
         (sfnt.subfamily.has_value() && !sfnt.subfamily->empty()) ? *sfnt.subfamily : "Regular";
+    const std::string fam_check = util::to_lower_ascii(family);
+    if (fam_check.rfind("cc wild words", 0) == 0 || fam_check.rfind("ccwildwords", 0) == 0) {
+        family = "CC Wild Words";
+    }
     std::string full_name;
     if (!has_override && sfnt.full_name.has_value() && !sfnt.full_name->empty()) {
         full_name = *sfnt.full_name;
@@ -893,6 +897,22 @@ std::vector<FontManager::IndexedFont> FontManager::scan_local_fonts() const {
 
     scan_dir(fonts_dir_, "custom", nullptr);
     scan_dir(custom_subdir_, "custom", nullptr);
+
+    // Also scan immediate subdirectories inside `./fonts/` (e.g. `./fonts/CC Wild Words/`)
+    std::error_code sub_ec;
+    if (fs::is_directory(fonts_dir_, sub_ec) && !sub_ec) {
+        const std::string dl_name = util::to_lower_ascii(util::path_to_utf8(downloaded_dir_.filename()));
+        const std::string cust_name = util::to_lower_ascii(util::path_to_utf8(custom_subdir_.filename()));
+        for (const auto& dirent : fs::directory_iterator(fonts_dir_, sub_ec)) {
+            if (sub_ec) break;
+            std::error_code d_ec;
+            if (!dirent.is_directory(d_ec) || d_ec) continue;
+            const std::string sub_name = util::to_lower_ascii(util::path_to_utf8(dirent.path().filename()));
+            if (sub_name == dl_name || sub_name == cust_name) continue;
+            scan_dir(dirent.path(), "custom", nullptr);
+        }
+    }
+
     const json manifest = load_downloaded_manifest();
     scan_dir(downloaded_dir_, "downloaded", &manifest);
     return entries;
@@ -1164,6 +1184,10 @@ ResolvedFontFile FontManager::resolve_font_file(const std::string& font_name) {
         if (!fs::is_regular_file(candidate, ec) || ec) return std::nullopt;
         fs::path resolved = fs::weakly_canonical(candidate, ec);
         if (ec) return std::nullopt;
+        const fs::path fonts_canon = fs::weakly_canonical(fonts_dir_, ec);
+        if (!ec && util::is_path_within_root(fonts_canon, resolved)) {
+            return resolved;
+        }
         const std::string parent_lower = util::to_lower_ascii(util::path_to_utf8(resolved.parent_path()));
         for (const auto& root : allowed_roots) {
             if (parent_lower == util::to_lower_ascii(util::path_to_utf8(root))) {

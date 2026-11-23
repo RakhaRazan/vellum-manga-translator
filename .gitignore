@@ -2,7 +2,13 @@
 Vellum.exe
 Vellum_Runtime/
 models/
-fonts/
+fonts/*
+!fonts/.gitkeep
+fonts/*.ttf
+fonts/*.otf
+fonts/*.ttc
+fonts/*.woff2
+fonts/*.woff
 cache/
 projects_cache/
 settings.json

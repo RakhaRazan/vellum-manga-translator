@@ -448,7 +448,7 @@ std::string format_font_family_stack(const std::vector<std::string>& chain) {
         }
     }
     if (formatted.empty()) {
-        return R"("CC Wild Words", "Anime Ace", "Comic Neue", "Noto Sans", sans-serif)";
+        return R"("CC Wild Words", "Anime Ace", "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans", sans-serif)";
     }
     if (!seen.count("sans-serif") && !seen.count("serif") && !seen.count("monospace")) {
         formatted.push_back("sans-serif");
@@ -713,8 +713,8 @@ json SettingsManager::build_default_settings() {
         {"auto_unload_vram", true},
         {"refine_mask", true},
         // Tab 5: Typesetting
-        {"font_family", R"("CC Wild Words", "Anime Ace", "Comic Neue", "Noto Sans", sans-serif)"},
-        {"font_fallback_chain", json::array({"CC Wild Words", "Anime Ace", "Comic Neue", "Noto Sans", "sans-serif"})},
+        {"font_family", R"("CC Wild Words", "Anime Ace", "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans", sans-serif)"},
+        {"font_fallback_chain", json::array({"CC Wild Words", "Anime Ace", "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans", "sans-serif"})},
         {"auto_fit_font_size", true},
         {"default_font_size", 18},
         {"default_stroke_width", 4.0},
@@ -1028,7 +1028,7 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         }
     }
     if (font_fallback_chain.empty()) {
-        font_fallback_chain = {"CC Wild Words", "Anime Ace", "Comic Neue", "Noto Sans", "sans-serif"};
+        font_fallback_chain = {"CC Wild Words", "Anime Ace", "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans", "sans-serif"};
     }
 
     bool chain_updated = false;
@@ -1051,7 +1051,7 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
 
     std::string font_family = current.value(
         "font_family",
-        std::string(R"("CC Wild Words", "Anime Ace", "Comic Neue", "Noto Sans", sans-serif)"));
+        std::string(R"("CC Wild Words", "Anime Ace", "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans", sans-serif)"));
     if (raw.contains("font_family") && !raw["font_family"].is_null()) {
         const std::string ff = util::trim_ascii(json_to_string(raw["font_family"]));
         if (!ff.empty()) {

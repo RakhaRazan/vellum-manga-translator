@@ -340,7 +340,7 @@ export default function App() {
   // Hydrate persistent backend settings, languages & health metadata (non-blocking)
   const hydrateBackendContext = useCallback(async () => {
     try {
-      const [settingsRes, healthRes, langsRes] = await Promise.allSettled([
+      const [settingsRes, healthRes, langsRes, fontsRes] = await Promise.allSettled([
         fetch(`${apiBaseUrl}/api/settings`, {
           headers: { Accept: 'application/json' },
         }),
@@ -348,6 +348,9 @@ export default function App() {
           headers: { Accept: 'application/json' },
         }),
         fetch(`${apiBaseUrl}/api/languages`, {
+          headers: { Accept: 'application/json' },
+        }),
+        fetch(`${apiBaseUrl}/api/fonts/list`, {
           headers: { Accept: 'application/json' },
         }),
       ]);
@@ -365,6 +368,10 @@ export default function App() {
         if (Array.isArray(langsData?.target_languages)) {
           setSupportedTargetLanguages(langsData.target_languages);
         }
+      }
+      if (fontsRes.status === 'fulfilled' && fontsRes.value.ok) {
+        const fontsData = await fontsRes.value.json();
+        useEditorStore.getState().setFontsCatalogCache(fontsData);
       }
     } catch {
       // Non-fatal; fallback defaults in store remain active
