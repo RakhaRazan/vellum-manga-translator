@@ -32,10 +32,9 @@
 
 namespace mangaflow::pipeline {
 
-constexpr const char* kDefaultLmStudioBaseUrl = "http://localhost:1235/v1";
-constexpr const char* kDefaultLmStudioApiKey = "lm-studio";
-constexpr const char* kDefaultLmStudioModel =
-    "Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P";
+constexpr const char* kDefaultLmStudioBaseUrl = "http://localhost:1234/v1";
+constexpr const char* kDefaultLmStudioApiKey = "";
+constexpr const char* kDefaultLmStudioModel = "";
 constexpr const char* kDefaultOllamaBaseUrl = "http://localhost:11434/v1";
 constexpr const char* kDefaultAnthropicVersion = "2023-06-01";
 

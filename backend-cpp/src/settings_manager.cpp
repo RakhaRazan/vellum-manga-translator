@@ -44,11 +44,11 @@ struct TargetLanguageSpec {
 
 const std::vector<ProviderPreset>& provider_presets() {
     static const std::vector<ProviderPreset> kPresets = {
-        {"lmstudio", "LM Studio (Local)", "http://localhost:1235/v1",
-         "Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P", "lm-studio",
+        {"lmstudio", "LM Studio (Local)", "http://localhost:1234/v1",
+         "", "",
          false, true, true, "openai", true, true, true, true, true},
         {"ollama", "Ollama (Local)", "http://localhost:11434/v1",
-         "qwen2.5:7b", "ollama",
+         "qwen2.5:7b", "",
          false, true, true, "openai", true, true, true, true, true},
         {"openai", "OpenAI", "https://api.openai.com/v1",
          "gpt-4o-mini", "",
@@ -665,12 +665,12 @@ std::string SettingsManager::normalize_inpainting_model(const std::string& raw) 
 }
 
 json SettingsManager::build_default_settings() {
-    const auto& lm = find_provider_preset("lmstudio");
+    const auto& custom = find_provider_preset("custom");
     return {
-        {"provider", "lmstudio"},
-        {"base_url", lm.default_base_url},
-        {"api_key", lm.default_api_key},
-        {"model", lm.default_model},
+        {"provider", "custom"},
+        {"base_url", custom.default_base_url},
+        {"api_key", custom.default_api_key},
+        {"model", custom.default_model},
         {"timeout", 90.0},
         {"source_lang", "ja"},
         {"target_lang", "id"},

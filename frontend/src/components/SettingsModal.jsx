@@ -459,7 +459,7 @@ function glossaryRowsToDict(rows) {
  * Tabs:
  * 1. Appearance  - Dark / Light / System theme, Accent presets, UI density
  * 2. Pipeline    - Auto GPU/CPU vs CPU Only, detection threshold, bbox padding, LaMa tile size, reading order, auto-unload VRAM
- * 3. Providers   - 8 Koharu-style providers (LM Studio :1235, Ollama, OpenAI, Gemini, Anthropic, DeepSeek, OpenRouter, Custom), Base URL, masked API key toggle, Test Connection, Fetch Models
+ * 3. Providers   - 8 Koharu-style providers (LM Studio :1234, Ollama, OpenAI, Gemini, Anthropic, DeepSeek, OpenRouter, Custom), Base URL, masked API key toggle, Test Connection, Fetch Models
  * 4. Translation - Provider & Model, Target Language++ (16 langs), Sampling sliders, Reasoning + strip <think>, Vision toggle, Instruction Bar, Glossary table
  * 5. Typesetting - Searchable Font Picker (/api/fonts/list + catalog downloader + Import .ttf/.otf), ordered Font Fallback Chain, auto-fit, default size, stroke, line height, ALL-CAPS
  */
@@ -2731,8 +2731,8 @@ export default function SettingsModal({
                           }
                           placeholder={
                             selectedPreset.is_local
-                              ? selectedPreset.default_api_key || 'lm-studio'
-                              : 'sk-...'
+                              ? 'Optional'
+                              : 'API key...'
                           }
                           autoComplete="off"
                           className="studio-input w-full h-8 pl-2.5 pr-9 text-xs font-mono select-text"

@@ -297,7 +297,7 @@ std::vector<uint32_t> decode_utf8_codepoints(std::string_view s) {
 struct ParsedLocalEndpoint {
     bool valid = false;
     std::string host;
-    int port = 1235;
+    int port = 1234;
     std::string base_path = "/v1";
 };
 
@@ -305,7 +305,7 @@ ParsedLocalEndpoint parse_local_http_endpoint(const std::string& raw_url) {
     ParsedLocalEndpoint out;
     std::string s = util::trim_ascii(raw_url);
     if (s.empty()) {
-        s = "http://localhost:1235/v1";
+        s = "http://localhost:1234/v1";
     }
     const std::string lower = util::to_lower_ascii(s);
     if (lower.rfind("http://", 0) == 0) {
@@ -1900,7 +1900,7 @@ std::string OcrEngine::resolve_paddleocr_vl_lmstudio_model(const OcrOptions& opt
     const auto ep = parse_local_http_endpoint(options.lmstudio_base_url);
     if (!ep.valid) {
         throw std::runtime_error(
-            "PaddleOCR-VL-1.6-GGUF Vision-OCR requires a local HTTP LM Studio endpoint (e.g. http://localhost:1235/v1)." +
+            "PaddleOCR-VL-1.6-GGUF Vision-OCR requires a local HTTP LM Studio endpoint (e.g. http://localhost:1234/v1)." +
             gguf_hint);
     }
 

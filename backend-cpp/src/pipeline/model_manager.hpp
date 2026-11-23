@@ -4,8 +4,8 @@
 //
 // Features:
 // - Persistent model storage at `<portable_root>\models` (or `MANGA_MODELS_DIR`).
-// - Full 4-model Koharu local Hugging Face cache auto-discovery
-//   (`C:\FILE SOFTWARE\Koharu\store\hugging-face\models\<repo>\snapshots\<hash>\`):
+// - Full 4-model Koharu local Hugging Face cache discovery
+//   (via optional `KOHARU_HF_CACHE` env var or user-picked `<cache>\models\<repo>\snapshots\<hash>\`):
 //     1. mayocream--koharu-layout-rfdetr-seg-2xl-1152 (layout & text segmentation)
 //     2. mayocream--lama-manga (manga screentone LaMa inpainter)
 //     3. mayocream--manga-ocr (Japanese OCR)

@@ -1,7 +1,7 @@
 """One-time Koharu Local Cache -> ONNX / GGUF Bridge for Vellum (Phase 10.1).
 
-Auto-discovers Koharu's local Hugging Face cache (default:
-`C:\\FILE SOFTWARE\\Koharu\\store\\hugging-face\\models\\`), resolves each model's
+Discovers Koharu's local Hugging Face cache via the optional `KOHARU_HF_CACHE`
+environment variable or `--koharu-cache <path>`, resolves each model's
 `snapshots/<hash>/` directory, and bridges all 4 Koharu models into Vellum's
 persistent storage (`%LOCALAPPDATA%\\ComicTranslator\\models`):
 
@@ -37,8 +37,6 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from transformers import VisionEncoderDecoderModel
 
-
-DEFAULT_KOHARU_CACHE = Path(r"C:\FILE SOFTWARE\Koharu\store\hugging-face\models")
 
 KOHARU_FOLDERS = {
     "rfdetr": "mayocream--koharu-layout-rfdetr-seg-2xl-1152",
@@ -1324,7 +1322,7 @@ def copy_paddleocr_vl_gguf(cache_root: Path, output_dir: Path, force: bool = Fal
         copied.append({"file": str(dst), "size_bytes": dst.stat().st_size, "action": "copied"})
 
     hint = {
-        "purpose": "Load PaddleOCR-VL-1.6-GGUF in LM Studio (http://localhost:1235/v1) for Vision-OCR mode",
+        "purpose": "Load PaddleOCR-VL-1.6-GGUF in LM Studio (http://localhost:1234/v1) for Vision-OCR mode",
         "files": copied,
         "source_snapshot": str(snap),
     }
@@ -1339,8 +1337,8 @@ def main() -> int:
     parser.add_argument(
         "--koharu-cache",
         type=Path,
-        default=Path(os.environ.get("KOHARU_HF_CACHE", str(DEFAULT_KOHARU_CACHE))),
-        help="Path to Koharu's local Hugging Face models directory.",
+        default=Path(os.environ["KOHARU_HF_CACHE"]) if os.environ.get("KOHARU_HF_CACHE") else None,
+        help="Path to Koharu's local Hugging Face models directory (or set KOHARU_HF_CACHE).",
     )
     parser.add_argument(
         "--output-dir",
@@ -1360,6 +1358,13 @@ def main() -> int:
         help="Re-export/overwrite even if target .onnx/.gguf files already exist.",
     )
     args = parser.parse_args()
+
+    if args.koharu_cache is None:
+        print(
+            "ERROR: No Koharu cache path specified. Pass --koharu-cache <path> or set KOHARU_HF_CACHE.",
+            file=sys.stderr,
+        )
+        return 1
 
     cache_root: Path = args.koharu_cache.expanduser().resolve()
     output_dir: Path = args.output_dir.expanduser().resolve()

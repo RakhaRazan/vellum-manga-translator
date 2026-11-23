@@ -36,10 +36,6 @@ export function formatExecutionProvider(provider) {
 
 export function formatShortModelName(modelName) {
   if (!modelName) return 'No Model';
-  const lower = String(modelName).toLowerCase();
-  if (lower.includes('gemma 4 e2b') || lower.includes('gemma-4-e2b')) {
-    return 'Gemma 4 E2B';
-  }
   return modelName.length > 28 ? `${modelName.slice(0, 26)}…` : modelName;
 }
 
@@ -148,7 +144,7 @@ export default function StatusBar({
   const llmEndpoint =
     (isLocalLmStudio ? lmStudio?.endpoint : activeProviderSummary?.base_url) ||
     pipelineBaseUrl ||
-    'http://localhost:1235/v1';
+    (isLocalLmStudio ? 'http://localhost:1234/v1' : 'Not configured');
 
   const llmTooltip = isLlmConnected
     ? `LLM Provider: ${providerDisplayName}\nEndpoint: ${llmEndpoint}\nActive Model: ${fullModelName || 'Default'}\nClick to refresh status`

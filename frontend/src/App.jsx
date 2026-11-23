@@ -328,7 +328,7 @@ export default function App() {
     } catch (err) {
       setLmStudioStatus({
         connected: false,
-        endpoint: pipelineConfig.baseUrl || 'http://localhost:1235/v1',
+        endpoint: pipelineConfig.baseUrl || '',
         active_model: null,
         error: err?.message || 'LM Studio unreachable',
       });

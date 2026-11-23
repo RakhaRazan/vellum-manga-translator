@@ -942,7 +942,7 @@ std::vector<KoharuSnapshotStatus> ModelManager::inspect_koharu_cache() const {
         {"koharu_layout_rfdetr", kKoharuRfDetrFolder, "Layout & text segmentation detector (RF-DETR-Seg-2XL)"},
         {"koharu_lama_manga", kKoharuLamaFolder, "Manga screentone LaMa inpainter"},
         {"koharu_manga_ocr", kKoharuMangaOcrFolder, "Japanese manga OCR (ViT + BERT)"},
-        {"paddleocr_vl_gguf", kKoharuPaddleVlFolder, "Vision-Language OCR GGUF (for LM Studio localhost:1235)"},
+        {"paddleocr_vl_gguf", kKoharuPaddleVlFolder, "Vision-Language OCR GGUF (for LM Studio localhost:1234)"},
     }};
 
     std::vector<KoharuSnapshotStatus> statuses;
@@ -1451,7 +1451,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
         {"files", std::move(paddle_vl_files)},
         {"runtime", "lmstudio-vision"},
         {"hardware_target", "VLM • Multi-Lang"},
-        {"lm_studio_hint", "Load PaddleOCR-VL-1.6-GGUF in llama-server / LM Studio (http://localhost:1235/v1) for Vision-OCR mode"},
+        {"lm_studio_hint", "Load PaddleOCR-VL-1.6-GGUF in llama-server / LM Studio (http://localhost:1234/v1) for Vision-OCR mode"},
         {"languages", json::array({"ja", "ko", "zh", "en"})},
     });
 
@@ -2074,7 +2074,7 @@ json ModelManager::import_koharu_models(const KoharuImportOptions& options) cons
 
                 if (!gguf_err) {
                     const json hint = {
-                        {"purpose", "Load PaddleOCR-VL-1.6-GGUF in LM Studio (http://localhost:1235/v1) for Vision-OCR mode"},
+                        {"purpose", "Load PaddleOCR-VL-1.6-GGUF in LM Studio (http://localhost:1234/v1) for Vision-OCR mode"},
                         {"files", file_reports},
                         {"source_snapshot", util::path_to_utf8(*snap)},
                     };
@@ -2763,7 +2763,7 @@ json ModelManager::get_status_json() const {
         };
     }
 
-    // Optional Vision-OCR GGUF summary for LM Studio (`localhost:1235`)
+    // Optional Vision-OCR GGUF summary for LM Studio (`localhost:1234`)
     json paddle_vl_json = {{"installed", false}, {"model_gguf", nullptr}, {"mmproj_gguf", nullptr}};
     if (auto gguf = resolve_paddleocr_vl_gguf(); gguf.has_value()) {
         std::uintmax_t sz_total = 0;
@@ -2780,7 +2780,7 @@ json ModelManager::get_status_json() const {
             {"model_gguf", util::path_to_utf8(gguf->model_gguf)},
             {"mmproj_gguf", gguf->mmproj_gguf.empty() ? json(nullptr) : json(util::path_to_utf8(gguf->mmproj_gguf))},
             {"size_mb", round_2(static_cast<double>(sz_total) / (1024.0 * 1024.0))},
-            {"lm_studio_hint", "Load in LM Studio (http://localhost:1235/v1) for Vision-OCR mode"},
+            {"lm_studio_hint", "Load in LM Studio (http://localhost:1234/v1) for Vision-OCR mode"},
         };
     }
 

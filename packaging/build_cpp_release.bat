@@ -201,9 +201,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if exist "%ROOT_DIR%\settings.json" (
-    copy /y "%ROOT_DIR%\settings.json" "%STAGE_DIR%\settings.json" >nul
-)
+REM Never copy local settings.json into release staging (may contain user keys/paths)
 
 if exist "%ROOT_DIR%\fonts" (
     mkdir "%STAGE_DIR%\fonts" >nul 2>&1
@@ -244,13 +242,34 @@ echo       Installed root launcher  : %ROOT_LAUNCHER%
 echo.
 
 REM ----------------------------------------------------------------------------
-REM Step 4/4: Package Clean GitHub Release Archive (`release/Vellum-Windows-x64.zip`)
+REM Step 4/4: Pre-Package Secret Guard & Release Archive Packaging
 REM ----------------------------------------------------------------------------
-echo [4/4] Packaging GitHub Releases archive (`release/Vellum-Windows-x64.zip`) ...
+echo [4/4] Running pre-package secret guard and packaging (`release/Vellum-Windows-x64.zip`) ...
+if exist "%STAGE_DIR%\settings.json" (
+    echo [ERROR] Pre-package secret guard aborted: settings.json must never be staged in "%STAGE_DIR%".
+    exit /b 1
+)
+set "MF_STAGE_DIR=%STAGE_DIR%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$stage = $env:MF_STAGE_DIR;" ^
+    "$badFiles = Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.Name -ieq 'settings.json' };" ^
+    "if ($badFiles) { Write-Error ('ABORT: settings.json found in release stage: ' + $badFiles[0].FullName); exit 1 };" ^
+    "$pattern = '(?i)(C:\\FILE|(?<![A-Za-z0-9_])sk-(?:or-|ant-|proj-|[A-Za-z0-9]{12,})|AIza[0-9A-Za-z_-]{10,})';" ^
+    "$scanExts = @('.json','.js','.jsx','.css','.html','.txt','.md','.bat','.ps1','.cfg','.ini','.yaml','.yml');" ^
+    "foreach ($f in (Get-ChildItem -LiteralPath $stage -Recurse -File)) {" ^
+    "  if ($scanExts -contains $f.Extension.ToLowerInvariant()) {" ^
+    "    $hits = Select-String -LiteralPath $f.FullName -Pattern $pattern -AllMatches;" ^
+    "    if ($hits) { Write-Error ('ABORT: Secret or personal path pattern detected in ' + $f.FullName + ' line ' + $hits[0].LineNumber); exit 1 }" ^
+    "  }" ^
+    "}"
+if errorlevel 1 (
+    echo [ERROR] Pre-package secret guard failed. Release archive was NOT created.
+    exit /b 1
+)
+
 if not exist "%RELEASE_DIR%" mkdir "%RELEASE_DIR%"
 if exist "%ZIP_PATH%" del /f /q "%ZIP_PATH%"
 
-set "MF_STAGE_DIR=%STAGE_DIR%"
 set "MF_ROOT_LAUNCHER=%ROOT_LAUNCHER%"
 set "MF_ZIP_PATH=%ZIP_PATH%"
 

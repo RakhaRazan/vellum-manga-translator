@@ -92,7 +92,7 @@ Each stage runs sequentially with lazy initialization and immediate session unlo
        │
        ▼
 [Stage 4: Multi-Provider Context-Aware LLM Translator] ─ POST /api/stage/translate (or /api/retranslate)
-  • Queries LM Studio (`http://localhost:1235/v1`), Ollama, or Cloud APIs (OpenAI, Gemini, Anthropic, DeepSeek, etc.)
+  • Queries LM Studio (`http://localhost:1234/v1`), Ollama, or Cloud APIs (OpenAI, Gemini, Anthropic, DeepSeek, etc.)
   • Structured JSON Schema output, optional page image vision context, glossary, and custom instructions
        │
        ▼
@@ -113,7 +113,7 @@ Each stage runs sequentially with lazy initialization and immediate session unlo
 - `GET /api/models/download` (alias `GET /api/models/download-stream`)
   - Server-Sent Events (SSE) stream reporting real-time Hugging Face Hub download progress for any missing model weights.
 - `GET /api/lmstudio/status`
-  - Pings `http://localhost:1235/v1/models` and returns connection status, active/resolved model ID, and available models.
+  - Pings `http://localhost:1234/v1/models` and returns connection status, active/resolved model ID, and available models.
 - `GET /api/cache/images/{image_id}.png`
   - Serves cached inpainted PNGs and binary masks from the local temp/cache directory via native `cpp-httplib` file streaming (`media_type="image/png"`, `Cache-Control: public, max-age=3600`). Validates `image_id` strictly (`^[A-Za-z0-9_-]{1,128}$`) against path traversal.
 
@@ -225,7 +225,7 @@ Sent as `response_format` JSON Schema to LM Studio's OpenAI-compatible Chat Comp
   "target_lang": "id",
   "source_language": "ja",
   "target_language": "id",
-  "model": "gemma-4-e2b-uncensored-hauhaucs-aggressive",
+  "model": "qwen2.5-7b-instruct",
   "execution_provider": "CPUExecutionProvider",
   "tiles_inpainted": 4,
   "cleaned_image_id": "3e2eb55408624c4f8df366aeb90fb637",
@@ -319,7 +319,7 @@ Sent as `response_format` JSON Schema to LM Studio's OpenAI-compatible Chat Comp
   ],
   "image_url": "/api/cache/images/9b8264a30d674fb2b3e788d85ccc7c26.png",
   "config": {
-    "model": "Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P",
+    "model": "qwen2.5-7b-instruct",
     "temperature": 0.2,
     "max_tokens": 2048,
     "custom_instructions": "Keep dialogue punchy for shounen action.",
@@ -331,7 +331,7 @@ Sent as `response_format` JSON Schema to LM Studio's OpenAI-compatible Chat Comp
 Response:
 ```json
 {
-  "model": "gemma-4-e2b-uncensored-hauhaucs-aggressive",
+  "model": "qwen2.5-7b-instruct",
   "source_lang": "ja",
   "target_lang": "id",
   "source_language": "ja",
@@ -356,7 +356,7 @@ Response:
 {
   "all_ready": true,
   "execution_provider": "CPUExecutionProvider",
-  "models_dir": "C:\\FILE PROYEKAN\\Manga\\models",
+  "models_dir": "./models",
   "models": {
     "comic_text_detector": { "installed": true, "size_mb": 90, "downloaded_mb": 90.28, "files": [], "missing_files": [] },
     "manga_ocr": { "installed": true, "size_mb": 424, "downloaded_mb": 423.66, "files": [], "missing_files": [] },
@@ -365,10 +365,10 @@ Response:
   },
   "lm_studio": {
     "connected": true,
-    "endpoint": "http://localhost:1235/v1",
-    "active_model": "Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P",
-    "resolved_model_id": "gemma-4-e2b-uncensored-hauhaucs-aggressive",
-    "preferred_model": "Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P",
+    "endpoint": "http://localhost:1234/v1",
+    "active_model": "qwen2.5-7b-instruct",
+    "resolved_model_id": "qwen2.5-7b-instruct",
+    "preferred_model": "qwen2.5-7b-instruct",
     "available_models": []
   }
 }
@@ -408,3 +408,30 @@ Response:
   - `packaging/convert_koharu_to_onnx.py` is strictly an optional standalone developer tool for converting local Hugging Face `.safetensors` model weights to `.onnx`.
 - **One-Click Automated Packager**:
   - `packaging/build_cpp_release.bat` automates frontend building, CMake Release compilation, DLL staging into `Vellum_Runtime/`, and ZIP packaging (`release/Vellum-Windows-x64.zip`).
+
+---
+
+## 8. Vellum v2.5 Studio Core Spec
+
+Vellum v2.5 refines the native C++17 studio core around hardware-safe GPU/CPU execution, zero-secret provider configuration, pure C++17 computer vision heuristics, tiered inpainting, and print-ready export:
+
+1. **Dual-Backend ONNX (`DML`/`CUDA`/`CPU` + `nvcuda.dll` Safe Probe)**:
+   - Probes `nvcuda.dll` via `LoadLibraryExW` / `GetProcAddress` before registering `CUDAExecutionProvider` so systems without an NVIDIA driver never fail on missing CUDA DLLs.
+   - Routes sessions cleanly across `DmlExecutionProvider` (DirectX 12), `CUDAExecutionProvider`, and `CPUExecutionProvider` with automatic CPU fallback.
+2. **Provider-Agnostic LLM Profiles (`"none"` Manual Mode + DPAPI Key Encryption)**:
+   - Supports neutral per-provider profiles (`custom`, `lmstudio` on optional `http://localhost:1234/v1`, `ollama`, `openai`, `gemini`, `anthropic`, `deepseek`, `openrouter`) plus `"none"` manual mode for 100% offline/manual lettering without an LLM.
+   - API keys default to `""` and are encrypted at rest on Windows using DPAPI (`CryptProtectData` / `CryptUnprotectData`) before persisting to `settings.json`.
+3. **Pure C++17 CV Core**:
+   - **5-Stage Otsu Mask**: Luminance grayscale conversion, local contrast normalization, adaptive Otsu thresholding, morphological dilation/erosion, and interior stroke isolation without external CV libraries.
+   - **0-VRAM Sobel 4θ Typography**: Pure CPU Sobel gradient orientation histograms (`0°`, `45°`, `90°`, `135°`) for text-direction and stroke-density analysis at zero VRAM cost.
+   - **Waist-Cutting**: Splits merged vertical/horizontal speech-bubble components at narrow constriction waists.
+   - **Panel-First Reading Order**: Associates bubbles to detected comic panels via IoA and resolves `RTL` (Japanese) or `LTR` (Korean/Chinese) reading order per panel.
+4. **3-Tier CPU-First Inpainting + Tone Match**:
+   - **Tier 1**: Fast CPU flat/median/telea fill for uniform speech-bubble interiors.
+   - **Tier 2**: Local CPU-first ONNX LaMa / AOT tile inpainting (`512x512` ROI).
+   - **Tier 3**: GPU-accelerated ONNX or external API inpainting for complex screentones, paired with boundary **Tone Match** histogram/luminance blending to eliminate seam halos.
+5. **Narrow-Bubble DP Typesetter + Rubylith Brush**:
+   - Dynamic-programming line-breaking typesetter that minimizes raggedness and overflow inside narrow or irregular speech bubbles.
+   - Interactive **Rubylith Brush** overlay in the canvas editor for manual mask painting, erasing, and targeted re-inpainting.
+6. **Layered `.psd` Export**:
+   - Native C++17 Adobe Photoshop `.psd` writer exporting the original page, cleaned/inpainted background, and editable rasterized/grouped text layers so letterers can fine-tune in Photoshop or Clip Studio Paint.

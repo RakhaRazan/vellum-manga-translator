@@ -214,7 +214,7 @@ const std::vector<ProviderSpec>& all_provider_specs() {
         },
         {
             "ollama", "Ollama (Local)", kDefaultOllamaBaseUrl,
-            "qwen2.5:7b", "ollama",
+            "qwen2.5:7b", "",
             false, true, true, "openai",
             true, true, true, true, true,
             {},
@@ -431,7 +431,7 @@ ParsedUrl parse_http_url(const std::string& raw_url) {
 
     if (authority.empty()) return out;
 
-    // Handle bracketed IPv6 host `[::1]:1235`
+    // Handle bracketed IPv6 host `[::1]:1234`
     if (authority.front() == '[') {
         const size_t close_br = authority.find(']');
         if (close_br == std::string::npos) return out;
@@ -2021,18 +2021,8 @@ std::optional<std::string> ComicTranslator::format_display_model_name(
     const std::string& provider_id,
     const std::optional<std::string>& resolved_model_id,
     const std::string& preferred_model) {
-    if (!resolved_model_id.has_value()) {
-        return std::nullopt;
-    }
-    const std::string res_lower = util::to_lower_ascii(*resolved_model_id);
-    const std::string pref_lower = util::to_lower_ascii(preferred_model);
-    if (provider_id == "lmstudio" &&
-        res_lower.find("gemma-4-e2b-uncensored-hauhaucs-aggressive") != std::string::npos &&
-        (pref_lower.empty() ||
-         pref_lower.find("gemma 4 e2b") != std::string::npos ||
-         pref_lower.find("gemma-4-e2b") != std::string::npos)) {
-        return std::string(kDefaultLmStudioModel);
-    }
+    (void)provider_id;
+    (void)preferred_model;
     return resolved_model_id;
 }
 
@@ -2084,7 +2074,7 @@ std::vector<std::string> ComicTranslator::list_provider_models(
         }
         std::string hint;
         if (prov_id == "lmstudio") {
-            hint = "Ensure LM Studio is open and the Local Inference Server is running (default port 1235).";
+            hint = "Ensure LM Studio is open and the Local Inference Server is running (default port 1234).";
         } else if (prov_id == "ollama") {
             hint = "Ensure Ollama is running locally (default port 11434).";
         } else {
@@ -2275,8 +2265,8 @@ std::string ComicTranslator::resolve_provider_model(
             }
         }
 
-        // 2. Fuzzy token match (e.g. "Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P"
-        //    -> "gemma-4-e2b-uncensored-hauhaucs-aggressive")
+        // 2. Fuzzy token match (e.g. "Qwen2.5 7B Instruct"
+        //    -> "qwen2.5-7b-instruct")
         double best_score = -1.0;
         std::string best_cand;
         for (const auto& cand : candidates) {
@@ -3166,7 +3156,7 @@ std::pair<std::string, bool> ComicTranslator::call_openai_chat_completion(
             }
             std::string hint;
             if (config_.provider == "lmstudio") {
-                hint = "Make sure LM Studio is running and listening on port 1235.";
+                hint = "Make sure LM Studio is running and listening on port 1234.";
             } else if (config_.provider == "ollama") {
                 hint = "Make sure Ollama is running locally.";
             } else {
@@ -3429,7 +3419,7 @@ PageTranslationResult ComicTranslator::translate_blocks(
         ? normalize_translation_tone(*options.translation_tone)
         : config_.translation_tone;
 
-    // Tighten max_tokens dynamically for local inference servers (e.g. LM Studio on localhost:1235)
+    // Tighten max_tokens dynamically for local inference servers (e.g. LM Studio on localhost:1234)
     // when reasoning is off to reduce KV-cache overhead and prevent runaway trailing generations.
     int request_max_tokens = eff_max_tokens;
     if (spec_->is_local && eff_reasoning == "off") {

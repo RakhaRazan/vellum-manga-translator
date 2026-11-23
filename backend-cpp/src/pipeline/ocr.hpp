@@ -52,8 +52,8 @@ struct OcrBubbleOutput {
 struct OcrOptions {
     std::string source_lang = "ja";
     std::string ocr_model = "auto";  // "auto" | "manga-ocr" | "paddleocr-vl-gguf" | "rapidocr-ppocrv4"
-    std::string lmstudio_base_url = "http://localhost:1235/v1";
-    std::string lmstudio_api_key = "lm-studio";
+    std::string lmstudio_base_url = "http://localhost:1234/v1";
+    std::string lmstudio_api_key = "";
     bool auto_unload = true;
     bool force_cpu = false;
 };
