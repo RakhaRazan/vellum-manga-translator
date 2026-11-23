@@ -14,7 +14,7 @@ Grab the latest `Vellum-Windows-x64.zip` from [Releases](https://github.com/Hold
 
 ## Architecture & Scale Highlights (v2.0)
 
-- **Smart Hybrid Hardware Routing (`CUDA -> DirectML -> CPU`):** Automatically routes heavy 2D spatial vision models (Detector & Inpainter) to your GPU (`CUDAExecutionProvider` / `DmlExecutionProvider`) while keeping lightweight/autoregressive OCR (`Manga OCR`, `Baberu OCR`, `RapidOCR`) on CPU AVX2—leaving maximum VRAM free for local LLMs in LM Studio. Also supports `Force All GPU` and `CPU Only` modes.
+- **Smart Hybrid Hardware Routing (`CUDA -> DirectML -> CPU`):** Automatically routes heavy 2D spatial vision models (Detector & Inpainter) to your GPU (`CUDAExecutionProvider` / `DmlExecutionProvider`) while keeping lightweight/autoregressive OCR (`Manga OCR`, `Baberu OCR`, `RapidOCR`) on CPU AVX2 leaving maximum VRAM free for local LLMs in LM Studio. Also supports `Force All GPU` and `CPU Only` modes.
 - **Detector Engine v2 & Adaptive Tiling:**
   - Supports **Vellum YOLO11m-Seg** (9-class instance segmentation, FP16 GPU & INT8 CPU), **Koharu Layout RF-DETR-Seg 2XL** (`High-Context • Heavy CPU/CUDA`), and **ComicTextDetector**.
   - Includes **Adaptive Tiling (SAHI + WBF)** for ultra-tall Webtoon strips (`800x12000px+`) and single-tile preservation for high-resolution tankobon pages (`2580x3643px`), interior mask-inscribed `safe_bbox`, IoA panel association, SFX suppression filtering, and cycle-safe DAG topological reading order (`RTL` for Japanese, `LTR` for Korean/Chinese).
