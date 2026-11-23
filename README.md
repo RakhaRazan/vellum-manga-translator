@@ -1,4 +1,4 @@
-# Vellum v2.0
+# Vellum
 
 A high-performance, 100% portable local desktop studio for translating and typesetting Japanese manga, Korean manhwa, and Chinese manhua on Windows.
 
