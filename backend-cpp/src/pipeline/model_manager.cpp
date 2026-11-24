@@ -1,4 +1,5 @@
 #include "model_manager.hpp"
+#include "ort_provider.hpp"
 #include "../utils.hpp"
 
 #include <dxgi.h>
@@ -51,14 +52,6 @@ constexpr std::uintmax_t kMinMangaOcrEncBytes = 100'000'000ULL;
 constexpr std::uintmax_t kMinMangaOcrDecBytes = 30'000'000ULL;
 constexpr std::uintmax_t kMinVocabBytes = 1'000ULL;
 constexpr std::uintmax_t kMinGgufBytes = 100'000'000ULL;
-
-// Minimal ABI-compatible slice of OrtDmlApi from dml_provider_factory.h
-// (avoids requiring DirectML.h from the DirectML NuGet SDK at compile time).
-struct MinimalOrtDmlApi {
-    OrtStatus*(ORT_API_CALL* SessionOptionsAppendExecutionProvider_DML)(
-        OrtSessionOptions* options,
-        int device_id);
-};
 
 struct WinHttpHandle {
     HINTERNET h = nullptr;
@@ -634,80 +627,27 @@ std::string ModelManager::get_ort_version() {
 }
 
 std::vector<std::string> ModelManager::get_available_providers() {
-    try {
-        auto providers = Ort::GetAvailableProviders();
-        if (!providers.empty()) {
-            return providers;
-        }
-    } catch (...) {
-    }
-    return {"CPUExecutionProvider"};
+    return get_safe_available_providers();
 }
 
 std::vector<std::string> ModelManager::get_preferred_providers(bool force_cpu) {
-    if (force_cpu || util::env_flag_enabled(L"MANGA_FORCE_CPU")) {
-        return {"CPUExecutionProvider"};
-    }
-    const auto available = get_available_providers();
-    std::vector<std::string> ordered;
-    for (const char* gpu_ep : {"CUDAExecutionProvider", "DmlExecutionProvider"}) {
-        if (std::find(available.begin(), available.end(), gpu_ep) != available.end()) {
-            ordered.emplace_back(gpu_ep);
-        }
-    }
-    ordered.emplace_back("CPUExecutionProvider");
-    return ordered;
+    return get_ordered_execution_providers(force_cpu);
 }
 
 std::string ModelManager::get_primary_provider(bool force_cpu) {
-    const auto preferred = get_preferred_providers(force_cpu);
-    return preferred.empty() ? "CPUExecutionProvider" : preferred.front();
+    return get_primary_execution_provider(force_cpu);
 }
 
 SystemHardwareProfile ModelManager::query_hardware_profile() {
-    static const auto kStaticGpu = []() -> std::pair<uint64_t, std::string> {
-        uint64_t best_vram_mb = 0;
-        std::string best_name;
-        IDXGIFactory1* factory = nullptr;
-        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) &&
-            factory != nullptr) {
-            IDXGIAdapter1* adapter = nullptr;
-            for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-                DXGI_ADAPTER_DESC1 desc{};
-                if (SUCCEEDED(adapter->GetDesc1(&desc))) {
-                    if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
-                        const uint64_t vram_mb = static_cast<uint64_t>(desc.DedicatedVideoMemory) / (1024ULL * 1024ULL);
-                        if (vram_mb > best_vram_mb || best_name.empty()) {
-                            best_vram_mb = vram_mb;
-                            best_name = util::wide_to_utf8(desc.Description);
-                        }
-                    }
-                }
-                adapter->Release();
-            }
-            factory->Release();
-        }
-        return {best_vram_mb, best_name};
-    }();
-
+    const auto caps = detect_hardware_capabilities(/*force_cpu=*/false);
     SystemHardwareProfile prof;
-    prof.logical_cpus = std::max(1u, std::thread::hardware_concurrency());
-    prof.dedicated_vram_mb = kStaticGpu.first;
-    prof.gpu_name = kStaticGpu.second;
-
-    MEMORYSTATUSEX ms{};
-    ms.dwLength = sizeof(ms);
-    if (GlobalMemoryStatusEx(&ms)) {
-        prof.total_ram_mb = static_cast<uint64_t>(ms.ullTotalPhys) / (1024ULL * 1024ULL);
-        prof.available_ram_mb = static_cast<uint64_t>(ms.ullAvailPhys) / (1024ULL * 1024ULL);
-        prof.memory_load_percent = static_cast<uint32_t>(ms.dwMemoryLoad);
-    }
-
-    // Automatically classify low-spec hardware (<10 GB RAM or <5 GB dedicated GPU VRAM)
-    // so the pipeline stays safe alongside LM Studio on lower-spec PCs.
-    const bool low_ram = (prof.total_ram_mb > 0 && prof.total_ram_mb < 10240ULL);
-    const bool low_vram = (prof.dedicated_vram_mb > 0 && prof.dedicated_vram_mb < 5120ULL);
-    prof.low_memory_mode = low_ram || low_vram;
+    prof.total_ram_mb = caps.total_ram_mb;
+    prof.available_ram_mb = caps.available_ram_mb;
+    prof.memory_load_percent = caps.memory_load_percent;
+    prof.dedicated_vram_mb = caps.vram_mb;
+    prof.logical_cpus = caps.logical_cpus;
+    prof.gpu_name = caps.gpu_name;
+    prof.low_memory_mode = caps.low_memory_mode;
     return prof;
 }
 
@@ -799,35 +739,7 @@ OrtSessionHandle ModelManager::create_ort_session(const fs::path& model_path, bo
             apply_common_resource_opts(opts, /*is_cpu_only=*/false);
             opts.SetIntraOpNumThreads(gpu_host_threads);
 
-            if (provider == "CUDAExecutionProvider") {
-                OrtCUDAProviderOptions cuda_opts{};
-                cuda_opts.device_id = 0;
-                // kSameAsRequested (1) prevents power-of-2 VRAM doubling so CUDA coexists cleanly with LM Studio
-                cuda_opts.arena_extend_strategy = 1;
-                opts.AppendExecutionProvider_CUDA(cuda_opts);
-            } else if (provider == "DmlExecutionProvider") {
-                // DirectML-safe SessionOptions + disable duplicate CPU scratch arena RAM
-                opts.DisableMemPattern();
-                opts.DisableCpuMemArena();
-                opts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-
-                const void* raw_dml_api = nullptr;
-                OrtStatus* api_status = Ort::GetApi().GetExecutionProviderApi(
-                    "DML", ORT_API_VERSION, &raw_dml_api);
-                if (api_status != nullptr || raw_dml_api == nullptr) {
-                    if (api_status != nullptr) {
-                        Ort::GetApi().ReleaseStatus(api_status);
-                    }
-                    continue;
-                }
-                const auto* dml_api = static_cast<const MinimalOrtDmlApi*>(raw_dml_api);
-                OrtStatus* append_status =
-                    dml_api->SessionOptionsAppendExecutionProvider_DML(opts, 0);
-                if (append_status != nullptr) {
-                    Ort::GetApi().ReleaseStatus(append_status);
-                    continue;
-                }
-            } else {
+            if (!append_gpu_execution_provider(opts, provider, /*device_id=*/0)) {
                 continue;
             }
 
@@ -835,6 +747,9 @@ OrtSessionHandle ModelManager::create_ort_session(const fs::path& model_path, bo
             handle.session = std::make_unique<Ort::Session>(env, model_path.c_str(), opts);
             handle.active_provider = provider;
             return handle;
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr, "[Vellum][ORT] Provider %s failed: %s\n", provider.c_str(), ex.what());
+            // Fall through to next provider (ultimately CPUExecutionProvider)
         } catch (...) {
             // Fall through to next provider (ultimately CPUExecutionProvider)
         }
@@ -942,7 +857,7 @@ std::vector<KoharuSnapshotStatus> ModelManager::inspect_koharu_cache() const {
         {"koharu_layout_rfdetr", kKoharuRfDetrFolder, "Layout & text segmentation detector (RF-DETR-Seg-2XL)"},
         {"koharu_lama_manga", kKoharuLamaFolder, "Manga screentone LaMa inpainter"},
         {"koharu_manga_ocr", kKoharuMangaOcrFolder, "Japanese manga OCR (ViT + BERT)"},
-        {"paddleocr_vl_gguf", kKoharuPaddleVlFolder, "Vision-Language OCR GGUF (for LM Studio localhost:1235)"},
+        {"paddleocr_vl_gguf", kKoharuPaddleVlFolder, "Vision-Language OCR GGUF (for LM Studio localhost:1234)"},
     }};
 
     std::vector<KoharuSnapshotStatus> statuses;
@@ -1146,7 +1061,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
 
         detection_models.push_back({
             {"id", "koharu-layout-rfdetr-seg-2xl"},
-            {"name", "Koharu Layout RF-DETR Seg 2XL (High-Context • Heavy CPU/CUDA)"},
+            {"name", "RF-DETR Seg 2XL (High-Context)"},
             {"description", "High-precision 1152px manga layout & text segmentation (text, SFX, bubble, panel)"},
             {"installed", installed},
             {"source", source},
@@ -1198,12 +1113,12 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
     for (const auto& [id, name, desc, filename] : {
              std::tuple<const char*, const char*, const char*, const char*>{
                  "vellum-det-yolo11m-seg-1024-fp16",
-                 "Vellum YOLO11m-Seg (9-Class Fast GPU)",
+                 "YOLO11m-Seg · High-Speed GPU",
                  "9-class 1024px layout, bubble, panel & SFX segmentation (GPU FP16)",
                  "vellum-det-yolo11m-seg-1024-fp16.onnx"},
              std::tuple<const char*, const char*, const char*, const char*>{
                  "vellum-det-yolo11m-seg-1024-int8",
-                 "Vellum YOLO11m-Seg (INT8 CPU)",
+                 "YOLO11m-Seg · Lightweight CPU",
                  "9-class 1024px layout, bubble, panel & SFX segmentation (CPU INT8)",
                  "vellum-det-yolo11m-seg-1024-int8.onnx"}}) {
         bool installed = false;
@@ -1451,7 +1366,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
         {"files", std::move(paddle_vl_files)},
         {"runtime", "lmstudio-vision"},
         {"hardware_target", "VLM • Multi-Lang"},
-        {"lm_studio_hint", "Load PaddleOCR-VL-1.6-GGUF in llama-server / LM Studio (http://localhost:1235/v1) for Vision-OCR mode"},
+        {"lm_studio_hint", "Load PaddleOCR-VL-1.6-GGUF in llama-server / LM Studio (http://localhost:1234/v1) for Vision-OCR mode"},
         {"languages", json::array({"ja", "ko", "zh", "en"})},
     });
 
@@ -1565,7 +1480,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
 
         inpainting_models.push_back({
             {"id", "lama-manga"},
-            {"name", "LaMa (GPU • Screentone)"},
+            {"name", "LaMa · Manga & Screentone"},
             {"description", "Manga-tuned Big-LaMa ONNX inpainter optimized for screentones & line art"},
             {"installed", installed},
             {"source", source},
@@ -1707,7 +1622,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
 
         inpainting_models.push_back({
             {"id", "lama-fp32"},
-            {"name", "LaMa Standard (GPU • FP32)"},
+            {"name", "LaMa · High-Precision Universal"},
             {"description", "General-purpose Big-LaMa FP32 ONNX inpainter (512×512 tiles)"},
             {"installed", installed},
             {"source", source},
@@ -2074,7 +1989,7 @@ json ModelManager::import_koharu_models(const KoharuImportOptions& options) cons
 
                 if (!gguf_err) {
                     const json hint = {
-                        {"purpose", "Load PaddleOCR-VL-1.6-GGUF in LM Studio (http://localhost:1235/v1) for Vision-OCR mode"},
+                        {"purpose", "Load PaddleOCR-VL-1.6-GGUF in LM Studio (http://localhost:1234/v1) for Vision-OCR mode"},
                         {"files", file_reports},
                         {"source_snapshot", util::path_to_utf8(*snap)},
                     };
@@ -2763,7 +2678,7 @@ json ModelManager::get_status_json() const {
         };
     }
 
-    // Optional Vision-OCR GGUF summary for LM Studio (`localhost:1235`)
+    // Optional Vision-OCR GGUF summary for LM Studio (`localhost:1234`)
     json paddle_vl_json = {{"installed", false}, {"model_gguf", nullptr}, {"mmproj_gguf", nullptr}};
     if (auto gguf = resolve_paddleocr_vl_gguf(); gguf.has_value()) {
         std::uintmax_t sz_total = 0;
@@ -2780,7 +2695,7 @@ json ModelManager::get_status_json() const {
             {"model_gguf", util::path_to_utf8(gguf->model_gguf)},
             {"mmproj_gguf", gguf->mmproj_gguf.empty() ? json(nullptr) : json(util::path_to_utf8(gguf->mmproj_gguf))},
             {"size_mb", round_2(static_cast<double>(sz_total) / (1024.0 * 1024.0))},
-            {"lm_studio_hint", "Load in LM Studio (http://localhost:1235/v1) for Vision-OCR mode"},
+            {"lm_studio_hint", "Load in LM Studio (http://localhost:1234/v1) for Vision-OCR mode"},
         };
     }
 

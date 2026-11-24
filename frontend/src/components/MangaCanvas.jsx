@@ -27,6 +27,7 @@ import {
   Loader2,
   Maximize2,
   MousePointer2,
+  Paintbrush,
   Redo2,
   Sparkles,
   Type,
@@ -40,7 +41,9 @@ import useEditorStore, {
   DEFAULT_FONT_FAMILY,
   buildKonvaFontFamily,
   ensurePageFontsLoaded,
+  rgbColorToHex,
 } from '../store/useEditorStore.js';
+import { solveNarrowBubbleLayout } from '../utils/narrowBubbleSolver.js';
 
 // ============================================================================
 // Constants & Shared Helpers
@@ -241,7 +244,17 @@ function useMaskOverlayCanvas(maskSrc, maskImg) {
  * never expanding wider than the actual speech bubble.
  */
 export function getBlockGeometry(block) {
-  const rotation = typeof block?.rotation === 'number' ? block.rotation : 0;
+  const autoTiltEnabled = Boolean(
+    useEditorStore.getState()?.typesetting?.autoTiltText ?? false
+  );
+  const rotation =
+    typeof block?.rotation === 'number'
+      ? block.rotation
+      : autoTiltEnabled &&
+        typeof block?.angle_deg === 'number' &&
+        Number.isFinite(block.angle_deg)
+      ? Number(block.angle_deg.toFixed(2))
+      : 0;
 
   if (
     typeof block?.x === 'number' &&
@@ -363,130 +376,34 @@ export function fitTextToBox(
     typeof effectiveMinFontOrOpts === 'object' && effectiveMinFontOrOpts !== null
       ? effectiveMinFontOrOpts
       : { minFontSize: effectiveMinFontOrOpts, ...extraOpts };
-  const lineHeight = opts.lineHeight ?? 1.18;
-  const cleanText = String(text || '').trim();
-  const minSize = Math.max(10, Math.round(Number(opts.minFontSize) || 12));
-  const startSize = Math.max(minSize, Math.round(Number(effectiveMaxFont) || 18));
-  const ctx = getMeasureCanvasCtx();
-  if (!ctx || !cleanText) {
-    return { fontSize: startSize, text: cleanText };
-  }
-
-  const availW = Math.max(12, Math.min(boxWidth * 0.94, boxWidth - 4));
-  const availH = Math.max(12, Math.min(boxHeight * 0.94, boxHeight - 4));
-  const paragraphs = cleanText.split(/\r?\n/);
-
-  const breakLongWord = (word) => {
-    const chunks = [];
-    let chunk = '';
-    for (let i = 0; i < word.length; i += 1) {
-      const next = chunk + word[i];
-      if (chunk.length > 0 && ctx.measureText(next).width > availW) {
-        chunks.push(chunk);
-        chunk = word[i];
-      } else {
-        chunk = next;
-      }
-    }
-    if (chunk) chunks.push(chunk);
-    return chunks;
+  const solved = solveNarrowBubbleLayout({
+    text,
+    roomPolygon: opts.roomPolygon || null,
+    safeBbox: opts.safeBbox || [0, 0, Math.max(20, boxWidth), Math.max(20, boxHeight)],
+    box: opts.box || { x: 0, y: 0, width: Math.max(20, boxWidth), height: Math.max(20, boxHeight) },
+    baseFontSize: Math.max(10, Math.round(Number(effectiveMaxFont) || 18)),
+    minFontSize: Math.max(8, Math.round(Number(opts.minFontSize) || 10)),
+    lineHeight: opts.lineHeight ?? 1.18,
+    fontFamily: fontFamily || 'sans-serif',
+    fontStyle: opts.fontStyle || 'bold',
+    align: opts.align || 'center',
+    enableHyphenation: opts.enableHyphenation !== false,
+    strokeWidth: opts.strokeWidth ?? 0,
+    lockFontSize: Boolean(opts.lockFontSize),
+    fontRenderKey: opts.fontRenderKey || '',
+  });
+  return {
+    fontSize: solved.fontSize,
+    text: solved.joinedText || String(text || '').trim(),
+    layout: solved,
   };
-
-  const simulateWrap = (size, allowWordBreak) => {
-    ctx.font = `bold ${size}px ${fontFamily || 'sans-serif'}`;
-    const lines = [];
-    let maxLineWidth = 0;
-    let hadOversizedWord = false;
-
-    for (const para of paragraphs) {
-      const words = para.split(/\s+/).filter(Boolean);
-      if (words.length === 0) {
-        lines.push('');
-        continue;
-      }
-      let currentLine = '';
-      for (let i = 0; i < words.length; i += 1) {
-        const word = words[i];
-        const wordW = ctx.measureText(word).width;
-        if (wordW > availW) {
-          if (!allowWordBreak) {
-            hadOversizedWord = true;
-            return { fits: false, lines, maxLineWidth: wordW, hadOversizedWord };
-          }
-          if (currentLine) {
-            const lw = ctx.measureText(currentLine).width;
-            if (lw > maxLineWidth) maxLineWidth = lw;
-            lines.push(currentLine);
-            currentLine = '';
-          }
-          const pieces = breakLongWord(word);
-          for (let p = 0; p < pieces.length - 1; p += 1) {
-            const pw = ctx.measureText(pieces[p]).width;
-            if (pw > maxLineWidth) maxLineWidth = pw;
-            lines.push(pieces[p]);
-          }
-          currentLine = pieces[pieces.length - 1] || '';
-          continue;
-        }
-
-        const candidate = currentLine ? `${currentLine} ${word}` : word;
-        const candW = ctx.measureText(candidate).width;
-        if (candW <= availW) {
-          currentLine = candidate;
-        } else {
-          if (currentLine) {
-            const lw = ctx.measureText(currentLine).width;
-            if (lw > maxLineWidth) maxLineWidth = lw;
-            lines.push(currentLine);
-          }
-          currentLine = word;
-        }
-      }
-      if (currentLine) {
-        const lw = ctx.measureText(currentLine).width;
-        if (lw > maxLineWidth) maxLineWidth = lw;
-        lines.push(currentLine);
-      }
-    }
-
-    const totalHeight = lines.length * size * lineHeight;
-    const fits = maxLineWidth <= availW && totalHeight <= availH;
-    return { fits, lines, maxLineWidth, totalHeight, hadOversizedWord };
-  };
-
-  // Pass 1: Step down fontSize cleanly from effectiveMaxFont to effectiveMinFont without mid-word breaks
-  for (let size = startSize; size >= minSize; size -= 1) {
-    const res = simulateWrap(size, false);
-    if (res.fits) {
-      return { fontSize: size, text: cleanText };
-    }
-  }
-
-  // Pass 2: Safety overflow prevention for unusually cramped/dense bubbles (never spill outside ink borders)
-  const hardMinSize = Math.max(10, Math.round(minSize * 0.5));
-  for (let size = minSize - 1; size >= hardMinSize; size -= 1) {
-    const res = simulateWrap(size, false);
-    if (res.fits) {
-      return { fontSize: size, text: cleanText };
-    }
-  }
-
-  // Pass 3: Allow clean long-word breaking if a single word still exceeded availW
-  for (let size = startSize; size >= hardMinSize; size -= 1) {
-    const res = simulateWrap(size, true);
-    if (res.fits) {
-      return { fontSize: size, text: res.lines.join('\n') };
-    }
-  }
-
-  const fallback = simulateWrap(hardMinSize, true);
-  return { fontSize: hardMinSize, text: fallback.lines.join('\n') || cleanText };
 }
 
 /**
- * Extract canonical Konva typography props shared 1:1 between live canvas and native export.
+ * Resolve lightweight typography metadata for a block (without running the DP solver).
+ * Auto-applies detector `text_color` and `outline` metadata while remaining user-editable.
  */
-export function getBlockTextStyle(block, geom = null, imgWidth = 1000) {
+function resolveBlockStyleMeta(block, imgWidth = 1000) {
   const ts = useEditorStore.getState().typesetting;
   const defaultFontSize = Number(ts?.defaultFontSize) || 18;
   const { effectiveMaxFont, effectiveMinFont } = getResolutionFontBounds(
@@ -495,62 +412,161 @@ export function getBlockTextStyle(block, geom = null, imgWidth = 1000) {
   );
   const rawFontFamily =
     block?.style?.font_family || block?.font_family || ts?.fontFamily || DEFAULT_FONT_FAMILY;
+  // Preserves weak-script font fallback (♡, ♪, …) via configured + manga symbol fallback chain
   const fontFamily = buildKonvaFontFamily(rawFontFamily, ts?.fontFallbackChain);
-  const fill = block?.color || block?.style?.color || ts?.defaultTextColor || '#000000';
-  const strokeColor =
-    block?.style?.stroke_color || block?.stroke_color || ts?.defaultStrokeColor || '#ffffff';
-  const strokeWidth =
-    block?.style?.stroke_width !== undefined
-      ? block.style.stroke_width
+  const fontStyle = block?.style?.font_style || block?.font_style || 'bold';
+  const boldStroke = String(fontStyle).includes('bold') ? 0.5 : 0;
+
+  const detectedTextColor = rgbColorToHex(block?.text_color);
+  const detectedOutlineObj =
+    block?.outline && typeof block.outline === 'object' ? block.outline : null;
+  const detectedOutlineColor = detectedOutlineObj
+    ? rgbColorToHex(detectedOutlineObj.color)
+    : null;
+  const detectedOutlineWidth =
+    detectedOutlineObj && Number.isFinite(Number(detectedOutlineObj.width))
+      ? Math.max(0, Number(detectedOutlineObj.width))
+      : null;
+
+  const fill = block?._userEditedColor
+    ? block?.color || block?.style?.color || ts?.defaultTextColor || '#000000'
+    : block?.color || block?.style?.color || detectedTextColor || ts?.defaultTextColor || '#000000';
+
+  const strokeColor = block?._userEditedOutline
+    ? block?.style?.stroke_color || block?.stroke_color || ts?.defaultStrokeColor || '#ffffff'
+    : block?.style?.stroke_color ||
+      block?.stroke_color ||
+      detectedOutlineColor ||
+      ts?.defaultStrokeColor ||
+      '#ffffff';
+
+  const strokeWidth = block?._userEditedOutline
+    ? block?.style?.stroke_width !== undefined
+      ? Number(block.style.stroke_width)
       : block?.stroke_width !== undefined
-      ? block.stroke_width
-      : ts?.defaultStrokeWidth ?? 4;
+      ? Number(block.stroke_width)
+      : ts?.defaultStrokeWidth ?? 4
+    : block?.style?.stroke_width !== undefined
+    ? Number(block.style.stroke_width)
+    : block?.stroke_width !== undefined
+    ? Number(block.stroke_width)
+    : detectedOutlineWidth !== null
+    ? detectedOutlineWidth
+    : ts?.defaultStrokeWidth ?? 4;
+
   const align = block?.align || block?.style?.align || ts?.defaultAlign || 'center';
-  const lineHeight = block?.style?.line_height || block?.line_height || ts?.defaultLineHeight || 1.18;
+  const lineHeight = Number(
+    block?.style?.line_height || block?.line_height || ts?.defaultLineHeight || 1.18
+  );
   const useAllCaps =
     block?.all_caps !== undefined
       ? Boolean(block.all_caps)
       : block?.style?.all_caps !== undefined
       ? Boolean(block.style.all_caps)
       : Boolean(ts?.allCaps);
-  const rawText = block?.translated_text || '';
-  let displayText = useAllCaps ? rawText.toUpperCase() : rawText;
+  const enableHyphenation =
+    block?.enable_hyphenation !== undefined
+      ? Boolean(block.enable_hyphenation)
+      : block?.style?.enable_hyphenation !== undefined
+      ? Boolean(block.style.enable_hyphenation)
+      : ts?.enableHyphenation !== false;
 
-  let fontSize = effectiveMaxFont;
+  const rawOpacity =
+    typeof block?.opacity === 'number'
+      ? block.opacity
+      : typeof block?.style?.opacity === 'number'
+      ? block.style.opacity
+      : 1;
+  const opacity = Math.max(0, Math.min(1, Number.isFinite(rawOpacity) ? rawOpacity : 1));
+
+  const rawText = block?.translated_text || '';
+  const displayText = useAllCaps ? rawText.toUpperCase() : rawText;
+
   const manualSize = Number(block?.font_size || block?.style?.font_size);
+  const autoFitEnabled = ts?.autoFitFontSize !== false;
+  let baseFontSize = effectiveMaxFont;
+  let lockFontSize = false;
+
   if (block?.manualFontSize && manualSize > 0) {
-    fontSize = Math.max(8, Math.round(manualSize));
-  } else if (ts?.autoFitFontSize !== false && geom && displayText) {
-    const fitted = fitTextToBox(
-      displayText,
-      geom.width,
-      geom.height,
-      fontFamily,
-      effectiveMaxFont,
-      effectiveMinFont,
-      { lineHeight }
-    );
-    fontSize = fitted.fontSize;
-    displayText = fitted.text;
-  } else if (manualSize && manualSize !== defaultFontSize) {
-    fontSize = Math.max(10, Math.round(manualSize));
+    baseFontSize = Math.max(8, Math.round(manualSize));
+    lockFontSize = true;
+  } else if (!autoFitEnabled && manualSize > 0) {
+    baseFontSize = Math.max(10, Math.round(manualSize));
+    lockFontSize = true;
+  }
+
+  const outerStrokeWidth = strokeWidth > 0 ? 2 * (boldStroke + strokeWidth) : 0;
+
+  return {
+    displayText,
+    fontFamily,
+    fontStyle,
+    boldStroke,
+    fill,
+    stroke: strokeWidth > 0 ? strokeColor : undefined,
+    strokeWidth,
+    outerStrokeWidth,
+    align,
+    lineHeight,
+    enableHyphenation,
+    opacity,
+    baseFontSize,
+    minFontSize: effectiveMinFont,
+    lockFontSize,
+  };
+}
+
+/**
+ * Extract canonical Konva typography props + solved narrow-bubble layout
+ * shared 1:1 between live canvas and native export.
+ */
+export function getBlockTextStyle(block, geom = null, imgWidth = 1000, fontRenderKey = '') {
+  const meta = resolveBlockStyleMeta(block, imgWidth);
+  let fontSize = meta.baseFontSize;
+  let displayText = meta.displayText;
+  let layout = null;
+
+  if (geom && displayText) {
+    layout = solveNarrowBubbleLayout({
+      text: displayText,
+      roomPolygon: block?.room_polygon || null,
+      safeBbox: block?.safe_bbox || [geom.x, geom.y, geom.x + geom.width, geom.y + geom.height],
+      box: geom,
+      baseFontSize: meta.baseFontSize,
+      minFontSize: meta.minFontSize,
+      lineHeight: meta.lineHeight,
+      fontFamily: meta.fontFamily,
+      fontStyle: meta.fontStyle,
+      align: meta.align,
+      enableHyphenation: meta.enableHyphenation,
+      strokeWidth: meta.strokeWidth,
+      lockFontSize: meta.lockFontSize,
+      fontRenderKey,
+    });
+    fontSize = layout.fontSize;
+    displayText = layout.joinedText || displayText;
   }
 
   return {
     text: displayText,
     fontSize,
-    fontFamily,
-    fontStyle: 'bold',
-    fill,
-    stroke: strokeWidth > 0 ? strokeColor : undefined,
-    strokeWidth,
+    fontFamily: meta.fontFamily,
+    fontStyle: meta.fontStyle,
+    boldStroke: meta.boldStroke,
+    fill: meta.fill,
+    stroke: meta.stroke,
+    strokeWidth: meta.strokeWidth,
+    outerStrokeWidth: meta.outerStrokeWidth,
     fillAfterStrokeEnabled: true,
     lineJoin: 'round',
-    align,
+    align: meta.align,
     verticalAlign: 'middle',
-    lineHeight,
+    lineHeight: meta.lineHeight,
+    opacity: meta.opacity,
+    enableHyphenation: meta.enableHyphenation,
     wrap: 'word',
     padding: 2,
+    layout,
   };
 }
 
@@ -615,19 +631,136 @@ function buildOffscreenExportStage(page, baseImageEl, format = 'png') {
     const geom = getBlockGeometry(block, width, page?.targetLang);
     const style = getBlockTextStyle(block, geom, width);
     if (!style.text) continue;
-    textLayer.add(
-      new Konva.Text({
-        x: geom.x,
-        y: geom.y,
-        width: geom.width,
-        height: geom.height,
-        rotation: geom.rotation,
-        ...style,
-        listening: false,
-        shadowForStrokeEnabled: false,
-        perfectDrawEnabled: false,
-      })
-    );
+
+    const lines = style.layout?.lines || [];
+    const blockGroup = new Konva.Group({
+      x: geom.x,
+      y: geom.y,
+      width: geom.width,
+      height: geom.height,
+      rotation: geom.rotation,
+      opacity: style.opacity ?? 1,
+      listening: false,
+    });
+
+    const hasOutline = Boolean(style.stroke && style.outerStrokeWidth > 0);
+    if (lines.length > 0) {
+      // Pass 1: Outside stroke drawn beneath fill (width = 2 * (bold + strokeWidth), lineJoin = round)
+      if (hasOutline) {
+        for (let li = 0; li < lines.length; li += 1) {
+          const line = lines[li];
+          blockGroup.add(
+            new Konva.Text({
+              x: line.localX,
+              y: line.localY,
+              width: Math.max(1, line.width),
+              height: style.layout.pitch,
+              text: line.text,
+              fontSize: style.fontSize,
+              fontFamily: style.fontFamily,
+              fontStyle: style.fontStyle,
+              fillEnabled: false,
+              stroke: style.stroke,
+              strokeWidth: style.outerStrokeWidth,
+              lineJoin: 'round',
+              lineCap: 'round',
+              align: style.align,
+              verticalAlign: 'middle',
+              wrap: 'none',
+              listening: false,
+              shadowForStrokeEnabled: false,
+              perfectDrawEnabled: false,
+            })
+          );
+        }
+      }
+      // Pass 2: Crisp fill drawn on top of stroke
+      for (let li = 0; li < lines.length; li += 1) {
+        const line = lines[li];
+        blockGroup.add(
+          new Konva.Text({
+            x: line.localX,
+            y: line.localY,
+            width: Math.max(1, line.width),
+            height: style.layout.pitch,
+            text: line.text,
+            fontSize: style.fontSize,
+            fontFamily: style.fontFamily,
+            fontStyle: style.fontStyle,
+            fill: style.fill,
+            strokeEnabled: false,
+            align: style.align,
+            verticalAlign: 'middle',
+            wrap: 'none',
+            listening: false,
+            shadowForStrokeEnabled: false,
+            perfectDrawEnabled: false,
+          })
+        );
+      }
+    } else {
+      if (hasOutline) {
+        blockGroup.add(
+          new Konva.Text({
+            x: 0,
+            y: 0,
+            width: geom.width,
+            height: geom.height,
+            text: style.text,
+            fontSize: style.fontSize,
+            fontFamily: style.fontFamily,
+            fontStyle: style.fontStyle,
+            fillEnabled: false,
+            stroke: style.stroke,
+            strokeWidth: style.outerStrokeWidth,
+            lineJoin: 'round',
+            lineCap: 'round',
+            align: style.align,
+            verticalAlign: 'middle',
+            lineHeight: style.lineHeight,
+            wrap: 'word',
+            padding: 2,
+            listening: false,
+            shadowForStrokeEnabled: false,
+            perfectDrawEnabled: false,
+          })
+        );
+      }
+      blockGroup.add(
+        new Konva.Text({
+          x: 0,
+          y: 0,
+          width: geom.width,
+          height: geom.height,
+          text: style.text,
+          fontSize: style.fontSize,
+          fontFamily: style.fontFamily,
+          fontStyle: style.fontStyle,
+          fill: style.fill,
+          strokeEnabled: false,
+          align: style.align,
+          verticalAlign: 'middle',
+          lineHeight: style.lineHeight,
+          wrap: 'word',
+          padding: 2,
+          listening: false,
+          shadowForStrokeEnabled: false,
+          perfectDrawEnabled: false,
+        })
+      );
+    }
+
+    // Isolate group opacity when alpha < 1 so stroke beneath fill never double-darkens
+    if ((style.opacity ?? 1) < 1) {
+      const pad = Math.ceil((style.outerStrokeWidth || 0) + 4);
+      blockGroup.cache({
+        x: -pad,
+        y: -pad,
+        width: Math.max(1, geom.width + pad * 2),
+        height: Math.max(1, geom.height + pad * 2),
+      });
+    }
+    textLayer.add(blockGroup);
   }
   stage.add(textLayer);
   stage.draw();
@@ -913,14 +1046,356 @@ export async function exportPagesArchive(
   };
 }
 
+/**
+ * Resolve a page image URL or File into either a backend-resolvable `/api/cache/images/...` path
+ * or a base64 data URI suitable for `POST /api/export/psd`.
+ */
+async function resolvePsdImageRef(urlOrNull, fileOrNull, apiBaseUrl) {
+  if (typeof urlOrNull === 'string' && urlOrNull.trim()) {
+    const trimmed = urlOrNull.trim();
+    const cacheIdx = trimmed.indexOf('/api/cache/images/');
+    if (cacheIdx >= 0) {
+      return trimmed.slice(cacheIdx);
+    }
+    if (trimmed.startsWith('data:')) {
+      return trimmed;
+    }
+    try {
+      const resolved = resolveImageSrc(trimmed, apiBaseUrl);
+      const resp = await fetch(resolved);
+      if (resp.ok) {
+        const blob = await resp.blob();
+        return await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(new Error('Failed to encode image for PSD export.'));
+          reader.readAsDataURL(blob);
+        });
+      }
+    } catch {
+      // Fall through to File fallback
+    }
+  }
+  if (fileOrNull) {
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error('Failed to read page file for PSD export.'));
+      reader.readAsDataURL(fileOrNull);
+    });
+  }
+  return '';
+}
+
+/**
+ * Render each text block of a page to a tight, transparent 1:1 RGBA PNG data URI
+ * with exact `(x, y)` page offsets and Stage 2 typography metadata for `POST /api/export/psd`.
+ */
+function renderPageTextLayersForPsd(page, pageWidth, pageHeight) {
+  const blocks = page?.blocks || [];
+  const results = [];
+
+  for (let i = 0; i < blocks.length; i += 1) {
+    const block = blocks[i];
+    const geom = getBlockGeometry(block, pageWidth, page?.targetLang);
+    const style = getBlockTextStyle(block, geom, pageWidth);
+    if (!style.text) continue;
+
+    const pad = Math.ceil((style.outerStrokeWidth || 0) + 8);
+    const rotRad = ((geom.rotation || 0) * Math.PI) / 180;
+    const cosR = Math.abs(Math.cos(rotRad));
+    const sinR = Math.abs(Math.sin(rotRad));
+    const rotW = Math.ceil(geom.width * cosR + geom.height * sinR);
+    const rotH = Math.ceil(geom.width * sinR + geom.height * cosR);
+
+    const cropX = Math.max(0, Math.floor(geom.x - pad - (rotW - geom.width) / 2));
+    const cropY = Math.max(0, Math.floor(geom.y - pad - (rotH - geom.height) / 2));
+    const cropRight = Math.min(pageWidth, Math.ceil(geom.x + geom.width + pad + (rotW - geom.width) / 2));
+    const cropBottom = Math.min(pageHeight, Math.ceil(geom.y + geom.height + pad + (rotH - geom.height) / 2));
+    const cropW = Math.max(1, cropRight - cropX);
+    const cropH = Math.max(1, cropBottom - cropY);
+
+    const container = document.createElement('div');
+    const stage = new Konva.Stage({
+      container,
+      width: cropW,
+      height: cropH,
+    });
+
+    try {
+      const textLayer = new Konva.Layer({ listening: false });
+      const blockGroup = new Konva.Group({
+        x: geom.x - cropX,
+        y: geom.y - cropY,
+        width: geom.width,
+        height: geom.height,
+        rotation: geom.rotation,
+        opacity: 1,
+        listening: false,
+      });
+
+      const lines = style.layout?.lines || [];
+      const hasOutline = Boolean(style.stroke && style.outerStrokeWidth > 0);
+      if (lines.length > 0) {
+        if (hasOutline) {
+          for (let li = 0; li < lines.length; li += 1) {
+            const line = lines[li];
+            blockGroup.add(
+              new Konva.Text({
+                x: line.localX,
+                y: line.localY,
+                width: Math.max(1, line.width),
+                height: style.layout.pitch,
+                text: line.text,
+                fontSize: style.fontSize,
+                fontFamily: style.fontFamily,
+                fontStyle: style.fontStyle,
+                fillEnabled: false,
+                stroke: style.stroke,
+                strokeWidth: style.outerStrokeWidth,
+                lineJoin: 'round',
+                lineCap: 'round',
+                align: style.align,
+                verticalAlign: 'middle',
+                wrap: 'none',
+                listening: false,
+                shadowForStrokeEnabled: false,
+                perfectDrawEnabled: false,
+              })
+            );
+          }
+        }
+        for (let li = 0; li < lines.length; li += 1) {
+          const line = lines[li];
+          blockGroup.add(
+            new Konva.Text({
+              x: line.localX,
+              y: line.localY,
+              width: Math.max(1, line.width),
+              height: style.layout.pitch,
+              text: line.text,
+              fontSize: style.fontSize,
+              fontFamily: style.fontFamily,
+              fontStyle: style.fontStyle,
+              fill: style.fill,
+              strokeEnabled: false,
+              align: style.align,
+              verticalAlign: 'middle',
+              wrap: 'none',
+              listening: false,
+              shadowForStrokeEnabled: false,
+              perfectDrawEnabled: false,
+            })
+          );
+        }
+      } else {
+        if (hasOutline) {
+          blockGroup.add(
+            new Konva.Text({
+              x: 0,
+              y: 0,
+              width: geom.width,
+              height: geom.height,
+              text: style.text,
+              fontSize: style.fontSize,
+              fontFamily: style.fontFamily,
+              fontStyle: style.fontStyle,
+              fillEnabled: false,
+              stroke: style.stroke,
+              strokeWidth: style.outerStrokeWidth,
+              lineJoin: 'round',
+              lineCap: 'round',
+              align: style.align,
+              verticalAlign: 'middle',
+              lineHeight: style.lineHeight,
+              wrap: 'word',
+              padding: 2,
+              listening: false,
+              shadowForStrokeEnabled: false,
+              perfectDrawEnabled: false,
+            })
+          );
+        }
+        blockGroup.add(
+          new Konva.Text({
+            x: 0,
+            y: 0,
+            width: geom.width,
+            height: geom.height,
+            text: style.text,
+            fontSize: style.fontSize,
+            fontFamily: style.fontFamily,
+            fontStyle: style.fontStyle,
+            fill: style.fill,
+            strokeEnabled: false,
+            align: style.align,
+            verticalAlign: 'middle',
+            lineHeight: style.lineHeight,
+            wrap: 'word',
+            padding: 2,
+            listening: false,
+            shadowForStrokeEnabled: false,
+            perfectDrawEnabled: false,
+          })
+        );
+      }
+
+      textLayer.add(blockGroup);
+      stage.add(textLayer);
+      stage.draw();
+
+      const dataUrl = stage.toDataURL({
+        x: 0,
+        y: 0,
+        width: cropW,
+        height: cropH,
+        pixelRatio: 1,
+        mimeType: 'image/png',
+      });
+
+      const fontStyleStr = String(style.fontStyle || '').toLowerCase();
+      results.push({
+        name: `Text ${String(i + 1).padStart(2, '0')}`,
+        x: cropX,
+        y: cropY,
+        box_x: geom.x,
+        box_y: geom.y,
+        width: geom.width,
+        height: geom.height,
+        rotation: geom.rotation || 0,
+        opacity: style.opacity ?? 1,
+        image: dataUrl,
+        text: style.text,
+        font_family: style.fontFamily || 'ArialMT',
+        font_size: style.fontSize || 18,
+        line_height: style.lineHeight || 1.2,
+        color: style.fill || '#000000',
+        stroke_color: style.stroke || '#ffffff',
+        stroke_width: hasOutline ? (style.outerStrokeWidth || 0) / 2 : 0,
+        align: style.align || 'center',
+        bold: fontStyleStr.includes('bold'),
+        italic: fontStyleStr.includes('italic'),
+        vertical: block?.text_direction === 'vertical',
+      });
+    } finally {
+      stage.destroy();
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Export one or more pages as layered Photoshop `.psd` (single page) or `.zip` of `.psd` files
+ * via native C++17 `POST /api/export/psd`.
+ */
+export async function exportPagesPsd(
+  pages,
+  {
+    apiBaseUrl = DEFAULT_API_BASE_URL,
+    filename = 'vellum_layered',
+    editableTextLayers = true,
+    onProgress = null,
+  } = {}
+) {
+  if (!Array.isArray(pages) || pages.length === 0) {
+    throw new Error('No pages available to export.');
+  }
+
+  const base = String(apiBaseUrl || '').replace(/\/+$/, '');
+  const payloadPages = [];
+
+  for (let idx = 0; idx < pages.length; idx += 1) {
+    const p = pages[idx];
+    if (onProgress) {
+      onProgress({ current: idx + 1, total: pages.length, phase: 'rendering' });
+    }
+    await ensurePageFontsLoaded(p, null, apiBaseUrl);
+
+    const origRef = await resolvePsdImageRef(p.originalUrl, p.file, apiBaseUrl);
+    if (!origRef) continue;
+
+    const inpaintSrc = pickInpaintedSrc(p, apiBaseUrl);
+    const cleanedRef = inpaintSrc
+      ? await resolvePsdImageRef(inpaintSrc, null, apiBaseUrl)
+      : '';
+    const maskRef = p.maskUrl
+      ? await resolvePsdImageRef(p.maskUrl, null, apiBaseUrl)
+      : '';
+
+    const pageW = Math.round(p?.dimensions?.width || 1000);
+    const pageH = Math.round(p?.dimensions?.height || 1400);
+    const textLayers = renderPageTextLayersForPsd(p, pageW, pageH);
+
+    payloadPages.push({
+      filename: p.name || `page_${idx + 1}`,
+      original_image: origRef,
+      cleaned_image: cleanedRef || undefined,
+      mask_image: maskRef || undefined,
+      text_layers: textLayers,
+    });
+  }
+
+  if (payloadPages.length === 0) {
+    throw new Error('No exportable page images found for PSD export.');
+  }
+
+  if (onProgress) {
+    onProgress({ current: payloadPages.length, total: payloadPages.length, phase: 'finalizing' });
+  }
+
+  const resp = await fetch(`${base}/api/export/psd`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      filename,
+      editable_text_layers: Boolean(editableTextLayers),
+      pages: payloadPages,
+    }),
+  });
+
+  if (!resp.ok) {
+    const errJson = await resp.json().catch(() => ({}));
+    throw new Error(errJson?.detail || `PSD export HTTP ${resp.status}`);
+  }
+
+  const isZip = payloadPages.length > 1;
+  const outBlob = await resp.blob();
+  return {
+    blob: outBlob,
+    filename: `${filename}.${isZip ? 'zip' : 'psd'}`,
+    pageCount: payloadPages.length,
+    isZip,
+  };
+}
+
 // ============================================================================
 // Memoized Konva Sub-Components (Zero Sibling Re-Renders)
 // ============================================================================
 
 /**
- * Memoized individual Konva Text Node.
- * Editing, dragging, or styling one bubble only re-renders THAT node,
- * never sibling text nodes on the page.
+ * Build a translation-invariant signature of `room_polygon` relative to `(geom.x, geom.y)`
+ * so dragging a block never invalidates its memoized DP line layout.
+ */
+function buildRelativePolygonKey(roomPolygon, originX, originY) {
+  if (!Array.isArray(roomPolygon) || roomPolygon.length < 3) return '';
+  let key = '';
+  for (let i = 0; i < roomPolygon.length; i += 1) {
+    const pt = roomPolygon[i];
+    const px = Array.isArray(pt) ? Number(pt[0]) : Number(pt?.x);
+    const py = Array.isArray(pt) ? Number(pt[1]) : Number(pt?.y);
+    key += `${Math.round((px - originX) * 2)},${Math.round((py - originY) * 2)};`;
+  }
+  return key;
+}
+
+/**
+ * Memoized individual Konva Text Node with Narrow-Bubble DP Layout & Two-Pass Outside Stroke.
+ * - Memoizes solved line layouts per block and re-runs ONLY when text/style/font/dimensions
+ *   change or on `onTransformEnd` (never during drag frames).
+ * - Renders outlines using two-pass outside stroke (`lineJoin="round"`, width `2 * (bold + strokeWidth)`
+ *   drawn beneath fill) and isolates group opacity via offscreen cache when `alpha < 1` to avoid
+ *   double-darkening.
  */
 const MemoTextNode = React.memo(
   function MemoTextNode({
@@ -940,8 +1415,91 @@ const MemoTextNode = React.memo(
     onBlockDragEnd,
   }) {
     const geom = getBlockGeometry(block, imgWidth, targetLang);
-    const style = getBlockTextStyle(block, geom, imgWidth);
-    void fontRenderKey;
+    const meta = resolveBlockStyleMeta(block, imgWidth);
+    const paintGroupRef = useRef(null);
+
+    const roomPolyKey = buildRelativePolygonKey(block?.room_polygon, geom.x, geom.y);
+    const safeBboxKey = Array.isArray(block?.safe_bbox) && block.safe_bbox.length >= 4
+      ? `${Math.round(block.safe_bbox[0] - geom.x)},${Math.round(block.safe_bbox[1] - geom.y)},${Math.round(block.safe_bbox[2] - geom.x)},${Math.round(block.safe_bbox[3] - geom.y)}`
+      : '';
+
+    // Memoize solved DP line layout: invariant to x/y drag & rotation!
+    const solvedLayout = useMemo(() => {
+      if (!meta.displayText) return null;
+      return solveNarrowBubbleLayout({
+        text: meta.displayText,
+        roomPolygon: block?.room_polygon || null,
+        safeBbox: block?.safe_bbox || [geom.x, geom.y, geom.x + geom.width, geom.y + geom.height],
+        box: { x: geom.x, y: geom.y, width: geom.width, height: geom.height },
+        baseFontSize: meta.baseFontSize,
+        minFontSize: meta.minFontSize,
+        lineHeight: meta.lineHeight,
+        fontFamily: meta.fontFamily,
+        fontStyle: meta.fontStyle,
+        align: meta.align,
+        enableHyphenation: meta.enableHyphenation,
+        strokeWidth: meta.strokeWidth,
+        lockFontSize: meta.lockFontSize,
+        fontRenderKey,
+      });
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [
+      meta.displayText,
+      geom.width,
+      geom.height,
+      roomPolyKey,
+      safeBboxKey,
+      meta.baseFontSize,
+      meta.minFontSize,
+      meta.lineHeight,
+      meta.fontFamily,
+      meta.fontStyle,
+      meta.align,
+      meta.enableHyphenation,
+      meta.strokeWidth,
+      meta.lockFontSize,
+      fontRenderKey,
+    ]);
+
+    const groupAlpha = isEditingInline ? 0.08 : meta.opacity;
+    const hasOutline = Boolean(meta.stroke && meta.outerStrokeWidth > 0);
+    const lines = solvedLayout?.lines || [];
+    const fontSize = solvedLayout?.fontSize || meta.baseFontSize;
+    const pitch = solvedLayout?.pitch || fontSize * meta.lineHeight;
+
+    // Isolate two-pass stroke + fill inside cached group when alpha < 1 to prevent double-darkening
+    useEffect(() => {
+      const node = paintGroupRef.current;
+      if (!node) return;
+      if (groupAlpha < 1) {
+        const pad = Math.ceil((meta.outerStrokeWidth || 0) + 4);
+        const w = Math.max(1, geom.width + pad * 2);
+        const h = Math.max(1, geom.height + pad * 2);
+        try {
+          node.cache({
+            x: -pad,
+            y: -pad,
+            width: w,
+            height: h,
+            pixelRatio: typeof window !== 'undefined' ? Math.min(2, window.devicePixelRatio || 1) : 1,
+          });
+        } catch {
+          // Ignore cache errors on 0-sized detached nodes
+        }
+      } else if (node.isCached()) {
+        node.clearCache();
+      }
+    }, [
+      groupAlpha,
+      solvedLayout,
+      meta.fill,
+      meta.stroke,
+      meta.outerStrokeWidth,
+      meta.fontFamily,
+      geom.width,
+      geom.height,
+      fontRenderKey,
+    ]);
 
     const handleRef = useCallback(
       (node) => {
@@ -951,34 +1509,19 @@ const MemoTextNode = React.memo(
     );
 
     return (
-      <KonvaText
+      <KonvaGroup
         ref={handleRef}
         id={block.id}
         name="translated-text-box"
-        x={geom.x}
-        y={geom.y}
+        x={geom.x + geom.width / 2}
+        y={geom.y + geom.height / 2}
+        offsetX={geom.width / 2}
+        offsetY={geom.height / 2}
         width={geom.width}
         height={geom.height}
         rotation={geom.rotation}
-        text={style.text}
-        fontSize={style.fontSize}
-        fontFamily={style.fontFamily}
-        fontStyle={style.fontStyle}
-        fill={style.fill}
-        stroke={style.stroke}
-        strokeWidth={style.strokeWidth}
-        fillAfterStrokeEnabled={true}
-        lineJoin="round"
-        align={style.align}
-        verticalAlign="middle"
-        lineHeight={style.lineHeight}
-        wrap="word"
-        padding={2}
-        opacity={isEditingInline ? 0.08 : 1}
         draggable={isInteractive && !isEditingInline}
         listening={isInteractive}
-        shadowForStrokeEnabled={false}
-        perfectDrawEnabled={false}
         onMouseEnter={() => onHoverChange(block.id, true)}
         onMouseLeave={() => onHoverChange(block.id, false)}
         onMouseDown={(e) => onBlockMouseDown(block.id, e)}
@@ -990,7 +1533,72 @@ const MemoTextNode = React.memo(
         onDragStart={(e) => onBlockDragStart(block.id, e)}
         onDragMove={(e) => onBlockDragMove(block.id, e)}
         onDragEnd={(e) => onBlockDragEnd(block.id, e)}
-      />
+      >
+        {/* Transparent hit target sized to canonical block bounds for Transformer & drag */}
+        <KonvaRect
+          name="text-hit-rect"
+          x={0}
+          y={0}
+          width={geom.width}
+          height={geom.height}
+          fill="rgba(0,0,0,0.001)"
+          listening={isInteractive}
+          perfectDrawEnabled={false}
+        />
+
+        {/* Isolated paint group for two-pass outside stroke + fill */}
+        <KonvaGroup ref={paintGroupRef} opacity={groupAlpha} listening={false}>
+          {/* Pass 1: Outside stroke drawn beneath fill (width = 2 * (bold + strokeWidth)) */}
+          {hasOutline &&
+            lines.map((line, idx) => (
+              <KonvaText
+                key={`s_${idx}`}
+                x={line.localX}
+                y={line.localY}
+                width={Math.max(1, line.width)}
+                height={pitch}
+                text={line.text}
+                fontSize={fontSize}
+                fontFamily={meta.fontFamily}
+                fontStyle={meta.fontStyle}
+                fillEnabled={false}
+                stroke={meta.stroke}
+                strokeWidth={meta.outerStrokeWidth}
+                lineJoin="round"
+                lineCap="round"
+                align={meta.align}
+                verticalAlign="middle"
+                wrap="none"
+                listening={false}
+                shadowForStrokeEnabled={false}
+                perfectDrawEnabled={false}
+              />
+            ))}
+
+          {/* Pass 2: Solid glyph fill drawn cleanly on top of outside stroke */}
+          {lines.map((line, idx) => (
+            <KonvaText
+              key={`f_${idx}`}
+              x={line.localX}
+              y={line.localY}
+              width={Math.max(1, line.width)}
+              height={pitch}
+              text={line.text}
+              fontSize={fontSize}
+              fontFamily={meta.fontFamily}
+              fontStyle={meta.fontStyle}
+              fill={meta.fill}
+              strokeEnabled={false}
+              align={meta.align}
+              verticalAlign="middle"
+              wrap="none"
+              listening={false}
+              shadowForStrokeEnabled={false}
+              perfectDrawEnabled={false}
+            />
+          ))}
+        </KonvaGroup>
+      </KonvaGroup>
     );
   },
   (prev, next) =>
@@ -1053,8 +1661,10 @@ const MemoBoxGuideNode = React.memo(
     return (
       <KonvaGroup
         ref={handleRef}
-        x={geom.x}
-        y={geom.y}
+        x={geom.x + geom.width / 2}
+        y={geom.y + geom.height / 2}
+        offsetX={geom.width / 2}
+        offsetY={geom.height / 2}
         rotation={geom.rotation}
         listening={false}
       >
@@ -1161,8 +1771,10 @@ const MemoSelectionOutline = React.memo(function MemoSelectionOutline({
   const geom = getBlockGeometry(block);
   return (
     <KonvaRect
-      x={geom.x}
-      y={geom.y}
+      x={geom.x + geom.width / 2}
+      y={geom.y + geom.height / 2}
+      offsetX={geom.width / 2}
+      offsetY={geom.height / 2}
       width={geom.width}
       height={geom.height}
       rotation={geom.rotation}
@@ -1221,6 +1833,8 @@ const MangaCanvas = forwardRef(function MangaCanvas(
     typesettingAllCaps,
     typesettingDefaultFontSize,
     typesettingAutoFit,
+    typesettingEnableHyphenation,
+    typesettingAutoTiltText,
     canUndo,
     canRedo,
     undoCount,
@@ -1231,6 +1845,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
     setActiveTool,
     updateBlock,
     updateBlocksBatch,
+    updatePage,
     addBlock,
     undo,
     redo,
@@ -1252,6 +1867,8 @@ const MangaCanvas = forwardRef(function MangaCanvas(
       typesettingAllCaps: Boolean(s.typesetting?.allCaps),
       typesettingDefaultFontSize: Number(s.typesetting?.defaultFontSize) || 18,
       typesettingAutoFit: s.typesetting?.autoFitFontSize !== false,
+      typesettingEnableHyphenation: s.typesetting?.enableHyphenation !== false,
+      typesettingAutoTiltText: Boolean(s.typesetting?.autoTiltText ?? false),
       canUndo: s.history.past.length > 0,
       canRedo: s.history.future.length > 0,
       undoCount: s.history.past.length,
@@ -1262,6 +1879,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
       setActiveTool: s.setActiveTool,
       updateBlock: s.updateBlock,
       updateBlocksBatch: s.updateBlocksBatch,
+      updatePage: s.updatePage,
       addBlock: s.addBlock,
       undo: s.undo,
       redo: s.redo,
@@ -1315,15 +1933,20 @@ const MangaCanvas = forwardRef(function MangaCanvas(
   const textNodeRefs = useRef({});
   const guideNodeRefs = useRef({});
 
-  const fontRenderKey = `${fontLoadVersion}|${typesettingFontFamily}|${typesettingAllCaps}|${typesettingDefaultFontSize}|${typesettingAutoFit}`;
+  const fontRenderKey = `${fontLoadVersion}|${typesettingFontFamily}|${typesettingAllCaps}|${typesettingDefaultFontSize}|${typesettingAutoFit}|${typesettingEnableHyphenation}|${typesettingAutoTiltText}`;
 
   // Repaint Konva text nodes instantaneously whenever a dynamic FontFace finishes loading
   // or the global Font Fallback Chain / ALL-CAPS typesetting config changes.
   useEffect(() => {
     const nodes = Object.values(textNodeRefs.current || {});
     nodes.forEach((node) => {
-      if (node && typeof node._setTextData === 'function') {
+      if (!node) return;
+      if (typeof node._setTextData === 'function') {
         node._setTextData();
+      } else if (typeof node.find === 'function') {
+        node.find('Text').forEach((t) => {
+          if (typeof t._setTextData === 'function') t._setTextData();
+        });
       }
     });
     if (textLayerRef.current) {
@@ -1356,6 +1979,9 @@ const MangaCanvas = forwardRef(function MangaCanvas(
   const dragSessionRef = useRef(null);
   const didDragBlockRef = useRef(false);
   const isSpacePanningRef = useRef(false);
+  const rubylithCanvasRef = useRef(null);
+  const rubylithStrokeRef = useRef(null);
+  const rubylithKonvaRef = useRef(null);
 
   // ── Minimal React UI State ─────────────────────────────────────────────────
   const [viewport, setViewport] = useState({ width: 900, height: 700 });
@@ -1365,6 +1991,8 @@ const MangaCanvas = forwardRef(function MangaCanvas(
   const [isDraggingFileOver, setIsDraggingFileOver] = useState(false);
   const [splitPercentAria, setSplitPercentAria] = useState(50);
   const [inlineEditState, setInlineEditState] = useState(null); // { id, text, style }
+  const [brushSize, setBrushSize] = useState(24);
+  const [isSpotInpainting, setIsSpotInpainting] = useState(false);
 
   // ── Cached Image & Mask Loading (Zero Base64) ──────────────────────────────
   const inpaintedSrc = useMemo(
@@ -1420,8 +2048,9 @@ const MangaCanvas = forwardRef(function MangaCanvas(
 
   const isPanMode = activeTool === 'pan' || isSpacePanning;
   const isDrawTextMode = activeTool === 'text' && !isSpacePanning;
+  const isBrushMode = activeTool === 'brush' && !isSpacePanning;
   const isTextInteractive =
-    !isHoldComparing && !isPanMode && !isDrawTextMode && showTextLayer;
+    !isHoldComparing && !isPanMode && !isDrawTextMode && !isBrushMode && showTextLayer;
 
   // Keep live refs for stable callbacks (prevents MemoTextNode re-renders!)
   const blocks = useMemo(() => page?.blocks || [], [page?.blocks]);
@@ -1448,6 +2077,19 @@ const MangaCanvas = forwardRef(function MangaCanvas(
 
   const pageRef = useRef(page);
   pageRef.current = page;
+
+  const brushSizeRef = useRef(brushSize);
+  brushSizeRef.current = brushSize;
+
+  // Isolated local HTML5 off-screen <canvas> for 60fps Rubylith brush strokes
+  const rubylithCanvasEl = useMemo(() => {
+    if (typeof document === 'undefined') return null;
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(imageWidth));
+    c.height = Math.max(1, Math.round(imageHeight));
+    rubylithCanvasRef.current = c;
+    return c;
+  }, [page?.id, imageWidth, imageHeight]);
 
   const inlineEditStateRef = useRef(inlineEditState);
   inlineEditStateRef.current = inlineEditState;
@@ -1908,6 +2550,11 @@ const MangaCanvas = forwardRef(function MangaCanvas(
           activeBaseImage: exportBaseImage,
           ...options,
         }),
+      exportPsd: async (targetPages, options = {}) =>
+        exportPagesPsd(targetPages, {
+          apiBaseUrl,
+          ...options,
+        }),
       fitToScreen: fitPageToViewport,
       zoomTo: animateZoomTo,
       getTransform: () => ({ ...transformRef.current }),
@@ -1936,12 +2583,18 @@ const MangaCanvas = forwardRef(function MangaCanvas(
   const syncGuideNodeToTextNode = useCallback((id, textNode) => {
     const guide = guideNodeRefs.current[id];
     if (!guide || !textNode) return;
+    const absSx = Math.abs(textNode.scaleX());
+    const absSy = Math.abs(textNode.scaleY());
+    const scaledW = Math.max(32, textNode.width() * absSx);
+    const scaledH = Math.max(20, textNode.height() * absSy);
     guide.position({ x: textNode.x(), y: textNode.y() });
+    guide.offsetX(scaledW / 2);
+    guide.offsetY(scaledH / 2);
     guide.rotation(textNode.rotation());
     const boxRect = guide.findOne('.guide-box-rect');
     if (boxRect) {
-      boxRect.width(Math.max(32, textNode.width() * Math.abs(textNode.scaleX())));
-      boxRect.height(Math.max(20, textNode.height() * Math.abs(textNode.scaleY())));
+      boxRect.width(scaledW);
+      boxRect.height(scaledH);
     }
   }, []);
 
@@ -2088,27 +2741,51 @@ const MangaCanvas = forwardRef(function MangaCanvas(
         const node = textNodeRefs.current[sid];
         if (!node) continue;
 
-        const newX = Math.round(node.x());
-        const newY = Math.round(node.y());
+        const bw = Math.round(node.width());
+        const bh = Math.round(node.height());
+        const newX = Math.round(node.x() - bw / 2);
+        const newY = Math.round(node.y() - bh / 2);
         const start = session?.starts?.[sid];
+        const startTopLeftX = start ? Math.round(start.x - start.width / 2) : newX;
+        const startTopLeftY = start ? Math.round(start.y - start.height / 2) : newY;
         if (
           start &&
-          Math.round(start.x) === newX &&
-          Math.round(start.y) === newY
+          startTopLeftX === newX &&
+          startTopLeftY === newY
         ) {
           continue;
         }
 
-        const bw = Math.round(node.width());
-        const bh = Math.round(node.height());
-        node.position({ x: newX, y: newY });
+        node.offsetX(bw / 2);
+        node.offsetY(bh / 2);
+        node.position({ x: newX + bw / 2, y: newY + bh / 2 });
         syncGuideNodeToTextNode(sid, node);
 
-        patches[sid] = {
+        const existingBlock = blocksRef.current.find((b) => b.id === sid);
+        const dx = start ? newX - startTopLeftX : 0;
+        const dy = start ? newY - startTopLeftY : 0;
+
+        const patch = {
           x: newX,
           y: newY,
           bbox: [newX, newY, newX + bw, newY + bh],
         };
+        if (dx !== 0 || dy !== 0) {
+          if (Array.isArray(existingBlock?.room_polygon) && existingBlock.room_polygon.length >= 3) {
+            patch.room_polygon = existingBlock.room_polygon.map((pt) =>
+              Array.isArray(pt) ? [Number(pt[0]) + dx, Number(pt[1]) + dy] : pt
+            );
+          }
+          if (Array.isArray(existingBlock?.safe_bbox) && existingBlock.safe_bbox.length >= 4) {
+            patch.safe_bbox = [
+              Number(existingBlock.safe_bbox[0]) + dx,
+              Number(existingBlock.safe_bbox[1]) + dy,
+              Number(existingBlock.safe_bbox[2]) + dx,
+              Number(existingBlock.safe_bbox[3]) + dy,
+            ];
+          }
+        }
+        patches[sid] = patch;
       }
 
       dragSessionRef.current = null;
@@ -2127,27 +2804,15 @@ const MangaCanvas = forwardRef(function MangaCanvas(
   );
 
   // ── Konva Transformer Single & Multi-Select Resize / Rotate ────────────────
+  // 60fps protection: during live transform frames, only sync guide rects imperatively
+  // and NEVER invoke the DP layout solver until `onTransformEnd`.
   const handleTransformerTransform = useCallback(() => {
     const tr = transformerRef.current;
     if (!tr) return;
     const nodes = tr.nodes();
 
-    if (nodes.length === 1) {
-      // Reflow single text box smoothly during resize without distorting font aspect
-      const node = nodes[0];
-      const sx = node.scaleX();
-      const sy = node.scaleY();
-      if (sx !== 1 || sy !== 1) {
-        node.scaleX(1);
-        node.scaleY(1);
-        node.width(Math.max(32, node.width() * Math.abs(sx)));
-        node.height(Math.max(20, node.height() * Math.abs(sy)));
-      }
-      syncGuideNodeToTextNode(node.id(), node);
-    } else {
-      for (let i = 0; i < nodes.length; i += 1) {
-        syncGuideNodeToTextNode(nodes[i].id(), nodes[i]);
-      }
+    for (let i = 0; i < nodes.length; i += 1) {
+      syncGuideNodeToTextNode(nodes[i].id(), nodes[i]);
     }
     boxesLayerRef.current?.batchDraw();
   }, [syncGuideNodeToTextNode]);
@@ -2164,52 +2829,66 @@ const MangaCanvas = forwardRef(function MangaCanvas(
       const node = nodes[i];
       const sx = node.scaleX();
       const sy = node.scaleY();
+      const oldWidth = Math.max(20, node.width());
+      const oldHeight = Math.max(20, node.height());
       node.scaleX(1);
       node.scaleY(1);
 
-      const newX = Math.round(node.x());
-      const newY = Math.round(node.y());
-      const newWidth = Math.round(Math.max(20, node.width() * Math.abs(sx)));
-      const newHeight = Math.round(Math.max(20, node.height() * Math.abs(sy)));
+      const newWidth = Math.round(Math.max(20, oldWidth * Math.abs(sx)));
+      const newHeight = Math.round(Math.max(20, oldHeight * Math.abs(sy)));
       const newRotation = Number(node.rotation().toFixed(2));
+      const newX = Math.round(node.x() - newWidth / 2);
+      const newY = Math.round(node.y() - newHeight / 2);
 
-      node.position({ x: newX, y: newY });
       node.width(newWidth);
       node.height(newHeight);
+      node.offsetX(newWidth / 2);
+      node.offsetY(newHeight / 2);
+      node.position({ x: newX + newWidth / 2, y: newY + newHeight / 2 });
 
       const block = (blocks || []).find((b) => b.id === node.id());
+      const prevGeom = block ? getBlockGeometry(block) : { x: newX, y: newY, width: oldWidth, height: oldHeight };
+      const scaleW = prevGeom.width > 0 ? newWidth / prevGeom.width : 1;
+      const scaleH = prevGeom.height > 0 ? newHeight / prevGeom.height : 1;
+
+      const nextRoomPolygon =
+        Array.isArray(block?.room_polygon) && block.room_polygon.length >= 3
+          ? block.room_polygon.map((pt) =>
+              Array.isArray(pt)
+                ? [
+                    newX + (Number(pt[0]) - prevGeom.x) * scaleW,
+                    newY + (Number(pt[1]) - prevGeom.y) * scaleH,
+                  ]
+                : pt
+            )
+          : undefined;
+      const nextSafeBbox = [newX, newY, newX + newWidth, newY + newHeight];
+
       const { effectiveMaxFont, effectiveMinFont } = getResolutionFontBounds(
         imageDimsRef.current.width,
         ts?.defaultFontSize || 18
       );
       let nextFontSize = effectiveMaxFont;
       if (block && ts?.autoFitFontSize !== false) {
-        const rawFontFamily =
-          block?.style?.font_family || block?.font_family || ts?.fontFamily || DEFAULT_FONT_FAMILY;
-        const fontFamily = buildKonvaFontFamily(rawFontFamily, ts?.fontFallbackChain);
-        const lineHeight =
-          block?.style?.line_height || block?.line_height || ts?.defaultLineHeight || 1.18;
-        const useAllCaps =
-          block?.all_caps !== undefined
-            ? Boolean(block.all_caps)
-            : block?.style?.all_caps !== undefined
-            ? Boolean(block.style.all_caps)
-            : Boolean(ts?.allCaps);
-        const rawText = block?.translated_text || '';
-        const displayText = useAllCaps ? rawText.toUpperCase() : rawText;
-        if (displayText) {
-          const fitted = fitTextToBox(
-            displayText,
-            newWidth,
-            newHeight,
-            fontFamily,
-            effectiveMaxFont,
-            effectiveMinFont,
-            { lineHeight }
-          );
-          nextFontSize = fitted.fontSize;
-          node.fontSize(fitted.fontSize);
-          node.text(fitted.text);
+        const meta = resolveBlockStyleMeta(block, imageDimsRef.current.width);
+        if (meta.displayText) {
+          const solved = solveNarrowBubbleLayout({
+            text: meta.displayText,
+            roomPolygon: nextRoomPolygon || null,
+            safeBbox: nextSafeBbox,
+            box: { x: newX, y: newY, width: newWidth, height: newHeight },
+            baseFontSize: effectiveMaxFont,
+            minFontSize: effectiveMinFont,
+            lineHeight: meta.lineHeight,
+            fontFamily: meta.fontFamily,
+            fontStyle: meta.fontStyle,
+            align: meta.align,
+            enableHyphenation: meta.enableHyphenation,
+            strokeWidth: meta.strokeWidth,
+            lockFontSize: false,
+            fontRenderKey,
+          });
+          nextFontSize = solved.fontSize;
         }
       } else if (block) {
         nextFontSize = block?.font_size || block?.style?.font_size || effectiveMaxFont;
@@ -2223,7 +2902,9 @@ const MangaCanvas = forwardRef(function MangaCanvas(
         width: newWidth,
         height: newHeight,
         rotation: newRotation,
-        bbox: [newX, newY, newX + newWidth, newY + newHeight],
+        bbox: nextSafeBbox,
+        safe_bbox: nextSafeBbox,
+        ...(nextRoomPolygon ? { room_polygon: nextRoomPolygon } : {}),
         font_size: nextFontSize,
         manualFontSize: false,
         style: {
@@ -2244,7 +2925,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
     } else if (changedIds.length > 0) {
       updateBlocksBatch(patches, { recordHistory: true });
     }
-  }, [blocks, onUpdateBlock, syncGuideNodeToTextNode, updateBlocksBatch]);
+  }, [blocks, fontRenderKey, onUpdateBlock, syncGuideNodeToTextNode, updateBlocksBatch]);
 
   // ── 60fps Wheel Zoom (rAF Smooth Interpolation) ────────────────────────────
   const handleWheel = useCallback(
@@ -2416,6 +3097,34 @@ const MangaCanvas = forwardRef(function MangaCanvas(
       if (!pointer) return;
       const pagePt = stagePointToPage(pointer);
 
+      // Manual Spot-Remove Rubylith Brush
+      if (isBrushMode && rubylithCanvasRef.current) {
+        const ctx = rubylithCanvasRef.current.getContext('2d');
+        if (ctx) {
+          const r = Math.max(4, brushSizeRef.current) * 0.5;
+          ctx.clearRect(0, 0, rubylithCanvasRef.current.width, rubylithCanvasRef.current.height);
+          ctx.fillStyle = 'rgba(225, 29, 72, 0.52)';
+          ctx.strokeStyle = 'rgba(225, 29, 72, 0.52)';
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.lineWidth = Math.max(4, brushSizeRef.current);
+          ctx.beginPath();
+          ctx.arc(pagePt.x, pagePt.y, r, 0, Math.PI * 2);
+          ctx.fill();
+          rubylithStrokeRef.current = {
+            lastX: pagePt.x,
+            lastY: pagePt.y,
+            minX: pagePt.x,
+            minY: pagePt.y,
+            maxX: pagePt.x,
+            maxY: pagePt.y,
+            radius: r,
+          };
+          uiLayerRef.current?.batchDraw();
+        }
+        return;
+      }
+
       // Manual Text Box Draw Tool
       if (isDrawTextMode) {
         drawBoxStateRef.current = {
@@ -2464,6 +3173,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
     [
       commitInlineEdit,
       inlineEditState,
+      isBrushMode,
       isDrawTextMode,
       isPanMode,
       stagePointToPage,
@@ -2492,6 +3202,26 @@ const MangaCanvas = forwardRef(function MangaCanvas(
           setCursorPosition(pt.x, pt.y);
         }
       });
+    }
+
+    // Draw Rubylith brush stroke onto isolated off-screen <canvas> (zero Zustand re-renders)
+    if (rubylithStrokeRef.current && rubylithCanvasRef.current) {
+      const rs = rubylithStrokeRef.current;
+      const ctx = rubylithCanvasRef.current.getContext('2d');
+      if (ctx) {
+        ctx.beginPath();
+        ctx.moveTo(rs.lastX, rs.lastY);
+        ctx.lineTo(pagePt.x, pagePt.y);
+        ctx.stroke();
+        rs.lastX = pagePt.x;
+        rs.lastY = pagePt.y;
+        if (pagePt.x < rs.minX) rs.minX = pagePt.x;
+        if (pagePt.y < rs.minY) rs.minY = pagePt.y;
+        if (pagePt.x > rs.maxX) rs.maxX = pagePt.x;
+        if (pagePt.y > rs.maxY) rs.maxY = pagePt.y;
+        uiLayerRef.current?.batchDraw();
+      }
+      return;
     }
 
     // Update Manual Text Box Draw Preview imperatively (zero React re-render)
@@ -2537,6 +3267,102 @@ const MangaCanvas = forwardRef(function MangaCanvas(
   }, [setCursorPosition, stagePointToPage]);
 
   const handleStagePointerUp = useCallback(() => {
+    // 0. Finalize Spot-Remove Rubylith Brush & submit to POST /api/inpaint/region
+    if (rubylithStrokeRef.current && rubylithCanvasRef.current) {
+      const rs = rubylithStrokeRef.current;
+      rubylithStrokeRef.current = null;
+      const canvasEl = rubylithCanvasRef.current;
+      const { width: imgW, height: imgH } = imageDimsRef.current;
+      const pad = Math.ceil(rs.radius + 2);
+      const x1 = Math.max(0, Math.floor(rs.minX - pad));
+      const y1 = Math.max(0, Math.floor(rs.minY - pad));
+      const x2 = Math.min(imgW, Math.ceil(rs.maxX + pad));
+      const y2 = Math.min(imgH, Math.ceil(rs.maxY + pad));
+
+      const maskBase64 = canvasEl.toDataURL('image/png');
+      const ctx = canvasEl.getContext('2d');
+      ctx?.clearRect(0, 0, canvasEl.width, canvasEl.height);
+      uiLayerRef.current?.batchDraw();
+
+      const activePg = pageRef.current;
+      if (activePg && x2 > x1 && y2 > y1) {
+        const cfg = useEditorStore.getState().pipelineConfig;
+        const base = String(apiBaseUrl || '').replace(/\/+$/, '');
+        let imageRef =
+          activePg.cleanedImageUrl ||
+          activePg.inpaintedImageUrl ||
+          activePg.inpaintedUrl ||
+          activePg.cleanedImage ||
+          activePg.inpaintedImage ||
+          activePg.originalUrl;
+
+        // If imageRef is a local blob: URL, encode the current base image as PNG data URI
+        if (imageRef && /^blob:/i.test(imageRef) && exportBaseImage) {
+          const tmp = document.createElement('canvas');
+          tmp.width = imgW;
+          tmp.height = imgH;
+          const tctx = tmp.getContext('2d');
+          if (tctx) {
+            tctx.drawImage(exportBaseImage, 0, 0, imgW, imgH);
+            imageRef = tmp.toDataURL('image/png');
+          }
+        }
+
+        if (imageRef) {
+          setIsSpotInpainting(true);
+          fetch(`${base}/api/inpaint/region`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({
+              page_id: activePg.id,
+              image: imageRef,
+              mask_rect: [x1, y1, x2, y2],
+              mask_png_base64: maskBase64,
+              enable_3tier_inpaint: cfg?.enable3TierInpaint !== false,
+              enable_tone_match: cfg?.enableToneMatch !== false,
+            }),
+          })
+            .then(async (resp) => {
+              if (!resp.ok) {
+                const err = await resp.json().catch(() => ({}));
+                throw new Error(err?.detail || `HTTP ${resp.status}`);
+              }
+              return resp.json();
+            })
+            .then(async (data) => {
+              const nextUrl =
+                data?.cleaned_image_url ||
+                data?.inpainted_image_url ||
+                data?.cleaned_image ||
+                data?.inpainted_image;
+              if (!nextUrl) return;
+              const resolved = resolveImageSrc(nextUrl, apiBaseUrl);
+              if (resolved) {
+                await loadImageElement(resolved);
+              }
+              updatePage(
+                activePg.id,
+                {
+                  cleanedImageUrl: nextUrl,
+                  inpaintedImageUrl: nextUrl,
+                  inpaintedUrl: nextUrl,
+                  cleanedImage: nextUrl,
+                  inpaintedImage: nextUrl,
+                },
+                { recordHistory: true }
+              );
+            })
+            .catch(() => {
+              // Non-fatal; canvas stays responsive
+            })
+            .finally(() => {
+              setIsSpotInpainting(false);
+            });
+        }
+      }
+      return;
+    }
+
     // 1. Finalize Manual Text Box Creation
     if (drawBoxStateRef.current) {
       const ds = drawBoxStateRef.current;
@@ -2620,7 +3446,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
       setSelectedLayers(nextIds);
       if (onSelectBlock) onSelectBlock(nextIds[0] ?? null);
     }
-  }, [addBlock, onSelectBlock, setActiveTool, setSelectedLayers]);
+  }, [addBlock, apiBaseUrl, exportBaseImage, onSelectBlock, setActiveTool, setSelectedLayers, updatePage]);
 
   const handleStagePointerLeave = useCallback(() => {
     if (cursorRafRef.current !== null) {
@@ -2842,7 +3668,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
   // Cursor style reflecting active canvas mode
   const canvasCursorClass = isPanMode
     ? 'cursor-grab active:cursor-grabbing'
-    : isDrawTextMode
+    : isDrawTextMode || isBrushMode
     ? 'cursor-crosshair'
     : 'cursor-default';
 
@@ -3085,6 +3911,7 @@ const MangaCanvas = forwardRef(function MangaCanvas(
                   orderNumber={block.order ?? index + 1}
                   isSelected={selectedIdSet.has(block.id)}
                   isHovered={hoveredBlockId === block.id}
+                  autoTiltText={typesettingAutoTiltText}
                   registerGuideRef={registerGuideRef}
                 />
               ))}
@@ -3131,6 +3958,21 @@ const MangaCanvas = forwardRef(function MangaCanvas(
               listening={false}
               perfectDrawEnabled={false}
             />
+
+            {/* Isolated Off-Screen Rubylith Spot-Remove Brush Overlay */}
+            {rubylithCanvasEl && (
+              <KonvaImage
+                ref={rubylithKonvaRef}
+                name="rubylith-spot-brush-overlay"
+                image={rubylithCanvasEl}
+                x={0}
+                y={0}
+                width={imageWidth}
+                height={imageHeight}
+                listening={false}
+                perfectDrawEnabled={false}
+              />
+            )}
 
             {/* Single & Multi-Select Konva Transformer */}
             <Transformer
@@ -3308,6 +4150,43 @@ const MangaCanvas = forwardRef(function MangaCanvas(
               <Type className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">Text Box</span>
             </button>
+            <button
+              type="button"
+              onClick={() =>
+                setActiveTool(activeTool === 'brush' ? 'select' : 'brush')
+              }
+              aria-pressed={activeTool === 'brush'}
+              title="Spot-Remove Rubylith Brush (Paint over stray text/artifacts to clean)"
+              data-testid="tool-brush-btn"
+              className={`h-6 px-1.5 inline-flex items-center gap-1 rounded-studio-sm text-[11px] font-medium transition-colors cursor-pointer ${
+                activeTool === 'brush'
+                  ? 'bg-rose-600 text-white'
+                  : 'text-studio-text-secondary hover:text-studio-text hover:bg-studio-hover'
+              }`}
+            >
+              {isSpotInpainting ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Paintbrush className="h-3.5 w-3.5" />
+              )}
+              <span className="hidden sm:inline">Spot Clean</span>
+            </button>
+            {activeTool === 'brush' && (
+              <div className="inline-flex items-center gap-1.5 pl-1.5 pr-1 text-[10px] font-mono text-studio-text-secondary">
+                <input
+                  type="range"
+                  aria-label="Spot-Remove Brush Size"
+                  data-testid="spot-brush-size-slider"
+                  min={8}
+                  max={80}
+                  step={2}
+                  value={brushSize}
+                  onChange={(e) => setBrushSize(Number(e.target.value))}
+                  className="w-16 accent-rose-500 cursor-pointer"
+                />
+                <span className="w-7 text-right tabular-nums">{brushSize}px</span>
+              </div>
+            )}
           </div>
 
           <span className="h-4 w-px bg-studio-border mx-0.5" aria-hidden="true" />
@@ -3390,6 +4269,24 @@ const MangaCanvas = forwardRef(function MangaCanvas(
           <div className="inline-flex items-center gap-1.5 rounded-studio border border-sky-400/50 bg-studio-panel/95 px-3 py-1 text-[11px] font-medium text-sky-400 shadow-lg">
             <Type className="h-3.5 w-3.5" />
             <span>Click or drag on page to place a manual text box (Esc to cancel)</span>
+          </div>
+        </div>
+      )}
+
+      {/* Spot-Remove Rubylith Brush Hint Pill */}
+      {hasRenderablePage && isBrushMode && (
+        <div className="absolute top-12 left-1/2 -translate-x-1/2 z-20 pointer-events-none">
+          <div className="inline-flex items-center gap-1.5 rounded-studio border border-rose-500/50 bg-studio-panel/95 px-3 py-1 text-[11px] font-medium text-rose-400 shadow-lg">
+            {isSpotInpainting ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Paintbrush className="h-3.5 w-3.5" />
+            )}
+            <span>
+              {isSpotInpainting
+                ? 'Cleaning painted region…'
+                : 'Paint over stray marks to spot-remove (Esc to exit)'}
+            </span>
           </div>
         </div>
       )}

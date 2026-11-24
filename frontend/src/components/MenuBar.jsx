@@ -186,6 +186,7 @@ export default function MenuBar({
   onExportImage,
   onExportCbz,
   onExportPdf,
+  onExportPsd,
   onSaveProject,
   onOpenProject,
   onProcessProject,
@@ -556,7 +557,7 @@ export default function MenuBar({
       <nav
         ref={menuBarRef}
         aria-label="Application Menu Bar"
-        className="h-7 min-h-[28px] max-h-[28px] shrink-0 border-b border-studio-border bg-studio-panel px-2 flex items-center justify-between gap-2 z-40 select-none"
+        className="h-[var(--studio-bar-h)] min-h-[var(--studio-bar-h)] max-h-[var(--studio-bar-h)] shrink-0 border-b border-studio-border bg-studio-panel px-[var(--studio-pad-x)] flex items-center justify-between gap-[var(--studio-gap)] z-40 select-none transition-[height]"
       >
         {/* Hidden File Inputs for Menu Commands */}
         <input
@@ -666,6 +667,12 @@ export default function MenuBar({
                   label="Export .pdf"
                   disabled={!hasPages || isProcessing}
                   onClick={() => runAndClose(onExportPdf)}
+                />
+                <MenuItem
+                  icon={Layers}
+                  label="Export Layered .psd..."
+                  disabled={!hasPages || isProcessing}
+                  onClick={() => runAndClose(onExportPsd)}
                 />
                 <MenuSeparator />
                 <MenuItem
@@ -1114,7 +1121,7 @@ export default function MenuBar({
               <p className="text-studio-text-secondary leading-relaxed">
                 100% portable native C++17 desktop studio powered by ONNX Runtime C++
                 and Microsoft Edge WebView2 with Smart Hybrid GPU+CPU routing.
-                Supports Vellum YOLO11m-Seg, Koharu RF-DETR-Seg 2XL &amp; ComicTextDetector
+                Supports Vellum YOLO11m-Seg, RF-DETR-Seg 2XL &amp; ComicTextDetector
                 (SAHI+WBF), Manga OCR, Baberu OCR, Hayai OCR, RapidOCR &amp; PaddleOCR-VL 1.6,
                 text-stroke-only LaMa / AOT / FLUX.2 Klein / RORem Mixed inpainting,
                 multi-provider LLM translation, and 64-bit ZIP64 (&gt;4 GB) .cbz/.pdf export.

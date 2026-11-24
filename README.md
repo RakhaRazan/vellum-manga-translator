@@ -1,37 +1,52 @@
-# Vellum v2.0
+# Vellum v2.5 Studio Core
 
-A high-performance, 100% portable local desktop studio for translating and typesetting Japanese manga, Korean manhwa, and Chinese manhua on Windows.
+A high-performance, 100% portable local desktop studio for translating, cleaning, and typesetting Japanese manga, Korean manhwa, and Chinese manhua on Windows.
 
 Built with a pure modern **C++17** backend (**ONNX Runtime C++ API** + **Microsoft Edge WebView2**) and a **React + Konva** canvas editor, `Vellum.exe` runs completely standalone with **zero Python runtime dependency** (no Python, PyTorch, CUDA toolkit, or Electron installation required).
 
-## Download
+---
 
-Grab the latest `Vellum-Windows-x64.zip` from [Releases](https://github.com/HoldMyAss/vellum-manga-translator/releases), extract it anywhere, and double-click `Vellum.exe`.
+## Download (Unified Dual-Core Portable Release)
+
+Download the latest portable archive from [Releases](https://github.com/HoldMyAss/vellum-manga-translator/releases), extract anywhere, and double-click `Vellum.exe`:
+
+| Variant | Archive | Backends Included | Best For |
+| :--- | :--- | :--- | :--- |
+| **Universal Dual-Core** (Recommended) | `Vellum-v2.5-Windows-x64-Universal.zip` | **CUDA 12.9 + DirectML + CPU** | All Windows x64 PCs — automatically launches `Vellum_Core.exe` (CUDA) on NVIDIA RTX GPUs or `Vellum_Core_DML.exe` (DirectML) on AMD Radeon, Intel Arc/iGPU, GTX, or CPU-only desktops, with 1-click backend switching in Settings. |
 
 - **Requirements:** Windows 10/11 (x64) with Microsoft Edge WebView2 Runtime (pre-installed on Windows 11).
 - **100% Portable Relative Paths:** All runtime data resolves strictly relative to `Vellum.exe` (`./models/`, `./fonts/`, `./cache/`, `./projects_cache/`, and `./settings.json`)—zero `%LOCALAPPDATA%` or Registry clutter.
-- On first launch, Vellum automatically checks `./models/` and lets you download missing ONNX models directly from **Settings -> Pipeline** (or import an existing local Koharu Hugging Face cache).
+- **Dynamic VRAM Management:** Configures ONNX Runtime CUDA with `kSameAsRequested` allocation (`arena_extend_strategy = 1`) and live DXGI 1.4 VRAM monitoring so vision models coexist cleanly with local LLMs on 8 GB GPUs.
+- On first launch, Vellum checks `./models/` and lets you download ONNX models directly from **Settings → Pipeline** (or import existing local `.onnx` / Hugging Face model weights).
 
-## Architecture & Scale Highlights (v2.0)
+---
 
-- **Smart Hybrid Hardware Routing (`CUDA -> DirectML -> CPU`):** Automatically routes heavy 2D spatial vision models (Detector & Inpainter) to your GPU (`CUDAExecutionProvider` / `DmlExecutionProvider`) while keeping lightweight/autoregressive OCR (`Manga OCR`, `Baberu OCR`, `RapidOCR`) on CPU AVX2—leaving maximum VRAM free for local LLMs in LM Studio. Also supports `Force All GPU` and `CPU Only` modes.
-- **Detector Engine v2 & Adaptive Tiling:**
-  - Supports **Vellum YOLO11m-Seg** (9-class instance segmentation, FP16 GPU & INT8 CPU), **Koharu Layout RF-DETR-Seg 2XL** (`High-Context • Heavy CPU/CUDA`), and **ComicTextDetector**.
-  - Includes **Adaptive Tiling (SAHI + WBF)** for ultra-tall Webtoon strips (`800x12000px+`) and single-tile preservation for high-resolution tankobon pages (`2580x3643px`), interior mask-inscribed `safe_bbox`, IoA panel association, SFX suppression filtering, and cycle-safe DAG topological reading order (`RTL` for Japanese, `LTR` for Korean/Chinese).
-- **Multi-Engine OCR Router:** Supports **Manga OCR** (JA vertical/Kanji specialist), **Baberu OCR** (fast `JA`/`ZH`/`EN` + SFX), **Hayai OCR** (aspect-ratio-preserving `JA`/`ZH`/`KO`/`EN`), **RapidOCR PP-OCRv4** (`KO`/`ZH`), and **PaddleOCR-VL 1.6** (`.gguf` VLM via local `llama-server` / LM Studio).
-- **Text-Stroke-Only Screentone Inpainting:** Strictly separates the full container `bubble_mask` (used only for `safe_bbox` typesetting) from the `3px`-eroded interior text-stroke mask (used for inpainting), preserving crisp black bubble borders while erasing 100% of original CJK strokes across **LaMa Manga** (`lama_manga.onnx` / `lama_fp32.onnx`), **AOT Inpainting** (`aot-inpainting.onnx`), **FLUX.2 Klein**, and **RORem Mixed**.
-- **Contextual LLM Translation:** Connects to **LM Studio** (`localhost:1235`), **Ollama**, **OpenAI**, **Gemini**, **Anthropic**, **DeepSeek**, **OpenRouter**, or any OpenAI-compatible endpoint with `<think>` tag stripping, O(N) JSON salvage recovery, custom prompts, glossaries, uncensored `adult` localization tone, and optional multimodal page vision.
-- **10,000-Page Single-Volume Endurance & 64-Bit ZIP64 (`>4 GB`) I/O:** Interactive 60fps `react-konva` editor with 2D resolution-proportional bubble auto-fit, per-block manual `font_size` overrides, Windows & Google Fonts manager with symbol fallbacks (`♡ ♪ …`), Split-Curtain Before/After compare, virtualized filmstrip, polygon-stripped disk-backed autosave (`./projects_cache/autosave.vellum.json`), auto-pinned project cache (`50,000`-file LRU ceiling + one-click temp cache purge), Stop/Cancel & Skip-Done Resume batch controls, `O(1)`-RAM 64-bit disk-streaming `.cbz` import (`up to 25,000 pages / 32 GiB`), and explicit **ZIP64 (`>4 GB`)** `.cbz` & `.pdf` export tested up to 10,000-page volumes.
+## Key Capabilities (v2.5 Studio Core)
 
-## Setting Up a Translator (LM Studio)
+### 1. Provider-Agnostic LLM Translation & DPAPI Security
+- **Zero-Lock-In Providers:** Works out of the box with **Cloud APIs** (`OpenAI`, `Google Gemini`, `Anthropic Claude`, `DeepSeek`, `OpenRouter`), **Local LLMs** (`LM Studio` on `localhost:1234`, `Ollama` on `localhost:11434`), **Custom OpenAI-Compatible** endpoints, or **`None` (Manual / No-LLM)** mode for pure CV/inpainting/typesetting workflows.
+- **Windows DPAPI Secret Protection:** `active_provider` defaults to `"none"`. All non-empty API keys written to `settings.json` are encrypted at rest using Windows `CryptProtectData` (`"dpapi:..."`), while project saves (`.vellum.json`), crash-recovery autosaves, and `localStorage` strip all API keys.
+- Includes `<think>` tag stripping, `O(N)` JSON salvage recovery, custom prompts, glossaries, uncensored localization tones, and optional multimodal page vision.
 
-By default, Vellum connects to a local server from [LM Studio](https://lmstudio.ai/) on port `1235`:
+### 2. 0-VRAM Classic CV Typography & Layout Geometry
+- **Classic CV Style Detection:** Pure-C++ Otsu + Sauvola adaptive binarization, stroke-width estimation, vertical/horizontal text orientation, dominant ink color, outline detection, and skew angle (`angle_deg`, `estimated_font_size`, `text_color`, `outline`) running in **~7 ms/page on CPU** with **+0 MB VRAM**.
+- **Conjoined Balloon Waist-Cutting & RDP `room_polygon`:** Separates merged speech balloons via convexity-defect waist chords and squared-Euclidean EDT watershed partitioning, simplified via Ramer–Douglas–Peucker (`<= 32` vertices) for lean project serialization.
+- **Smart Hybrid Hardware Routing (`CUDA → DirectML → CPU`):** Routes 2D vision models (Detector & Inpainter) to GPU while keeping autoregressive/lightweight OCR (`Manga OCR`, `Baberu OCR`, `RapidOCR`) on CPU AVX2.
 
-1. Load a model in LM Studio.
-2. Open the **Developer / Local Server** tab, set the port to `1235`, enable **CORS**, and click **Start Server**.
-3. Vellum detects it automatically.
+### 3. 3-Tier CPU-First Inpainting + Tone Match
+- **Tier 1 (Flat Median Fill) & Tier 2 (Pure-C++ Telea FMM):** Plain white and smooth-gradient speech bubbles are erased directly on CPU in milliseconds, skipping LaMa GPU inference entirely (`gpu_skipped = true` when all bubbles resolve in Tier 1–2).
+- **Tier 3 (Neural LaMa / AOT / Diffusion + Tone Match):** Textured/screentone bubbles route to `LaMa Manga`, `AOT Inpainting`, `FLUX.2 Klein`, or `RORem Mixed`, followed by `4×3` Ridge-regularized affine color matching and separable Gaussian residual diffusion (`σ = 24 px`) to eliminate tile seams.
+- **Text-Stroke-Only Masking:** Separates the container `bubble_mask` (typesetting) from the `3px`-eroded interior text-stroke mask (inpainting) to preserve crisp bubble outlines.
 
-For Ollama or cloud APIs (OpenAI, Gemini, Anthropic, DeepSeek, OpenRouter), configure your endpoint and key under **Settings -> Providers**.
+### 4. Narrow-Bubble DP Typesetter & Spot-Remove Brush
+- **Dynamic Programming Line-Breaker:** Shapes translated dialogue inside narrow or tapered `room_polygon` contours with Knuth–Plass-style penalty optimization, automatic hyphenation, and 2D resolution-proportional auto-fit.
+- **Spot-Remove Brush & Interactive Canvas:** 60fps `react-konva` editor with a non-destructive spot-remove brush, Split-Curtain Before/After compare, Windows & Google Fonts manager with manga symbol fallbacks (`♡ ♪ …`), and virtualized filmstrip.
+
+### 5. Layered `.psd` Export & 10,000-Page Endurance
+- **Native Layered `.psd` Writer:** Exports editable Photoshop documents with `Background`, non-destructive `Cleanup` diff patch, and `Text` layers—including `luni` Unicode names, `TySh` (`EngineData` vector type), and `lfx2` (`FrFX` outline stroke) tagged blocks.
+- **10,000-Page Volume I/O:** `O(1)`-RAM disk-streaming `.cbz` import (up to `25,000` pages / `32 GiB`), explicit **ZIP64 (`>4 GB`)** `.cbz` export, lossless `/DCTDecode` multi-page **PDF 1.4** export, and lean disk-backed crash-recovery autosave (`./projects_cache/autosave.vellum.json`).
+
+---
 
 ## Supported Models
 
@@ -39,7 +54,7 @@ For Ollama or cloud APIs (OpenAI, Gemini, Anthropic, DeepSeek, OpenRouter), conf
 | :--- | :--- | :--- | :--- | :--- |
 | **Detection** | **Vellum YOLO11m-Seg (FP16)** | `vellum-det-yolo11m-seg-1024-fp16.onnx` | 9-class bubble, panel & SFX segmentation (`SAHI+WBF`, `safe_bbox`, IoA, DAG order) | GPU (`CUDA` / `DirectML`) |
 | **Detection** | **Vellum YOLO11m-Seg (INT8)** | `vellum-det-yolo11m-seg-1024-int8.onnx` | 9-class static QDQ INT8 detector for CPU-only systems | CPU AVX2 |
-| **Detection** | **Koharu Layout RF-DETR-Seg 2XL** | `koharu-layout-rfdetr-seg-2xl-1152.onnx` | 1152px high-context layout, panel, bubble & SFX segmentation | Heavy CPU / CUDA |
+| **Detection** | **RF-DETR-Seg 2XL (High-Context)** | `koharu-layout-rfdetr-seg-2xl-1152.onnx` | 1152px high-context layout, panel, bubble & SFX segmentation | CUDA / Heavy CPU |
 | **Detection** | **ComicTextDetector** | `comictextdetector.pt.onnx` | 1024px text box & stroke mask detector | GPU (`CUDA` / `DirectML`) / CPU |
 | **OCR** | **Manga OCR** | `manga-ocr/` (`encoder` + `decoder`) | Japanese (`JA`) vertical tategaki, furigana & Kanji specialist | CPU AVX2 (Hybrid) / GPU |
 | **OCR** | **Baberu OCR** | `baberu-ocr/` (`vision_int4` + `decoder_int8`) | Fast `JA` / `ZH` / `EN` dialogue & stylized SFX OCR | CPU AVX2 (Hybrid) / GPU |
@@ -53,27 +68,35 @@ For Ollama or cloud APIs (OpenAI, Gemini, Anthropic, DeepSeek, OpenRouter), conf
 
 An optional developer conversion helper for local Koharu `.safetensors` caches is included in `packaging/convert_koharu_to_onnx.bat` / `packaging/convert_koharu_to_onnx.py` (requires Python with `torch`, `safetensors`, `onnx`, `transformers`, and `timm`). Standard Vellum users do **not** need Python installed.
 
+---
+
 ## Building from Source
 
 ### Prerequisites
-
 - Windows 10/11 (x64)
 - Visual Studio 2022 (or Build Tools) with **Desktop development with C++** and CMake
 - Node.js 18+
+- *(Optional, for CUDA variant)* NVIDIA CUDA Toolkit 12.x + cuDNN 9.x
 
 All C++ dependencies (`cpp-httplib`, `nlohmann/json`, `webview`, WebView2, ONNX Runtime, `miniz`, `stb`) are fetched automatically by CMake. No `vcpkg` required.
 
-### Release Build
-
+### Dual-Core Release Build
 ```bat
-packaging\build_cpp_release.bat
+REM Build Unified Dual-Core (CUDA + DirectML + CPU) distribution:
+packaging\build_cpp_release.bat AUTO
+
+REM Build CUDA-only or DirectML-only distribution:
+packaging\build_cpp_release.bat CUDA
+packaging\build_cpp_release.bat DML
 ```
+
+---
 
 ## Credits & Acknowledgments
 
 Vellum stands on the shoulders of the open-source manga translation, OCR, and computer vision community:
 
-- **[Koharu](https://github.com/mayocream/koharu)** (`mayocream`) — Inspiration for the modern local-first manga translation workflow, `koharu-layout-rfdetr-seg-2xl-1152`, and `lama-manga` weights.
+- **[Koharu](https://github.com/mayocream/koharu)** (`mayocream`) — Inspiration for the modern local-first manga translation workflow, `koharu-layout-rfdetr-seg-2xl-1152`, `lama-manga`, `aot-inpainting`, and `RORem-mixed-GGUF` weights.
 - **[ogkalu](https://huggingface.co/ogkalu)** — Comic and manga speech-bubble / layout detection datasets and YOLO segmentation research.
 - **[comic-text-detector](https://github.com/dmMaze/comic-text-detector)** (`dmMaze`) — Foundational manga text block and stroke mask detection architecture.
 - **[manga-ocr](https://github.com/kha-white/manga-ocr)** (`kha-white`) — Japanese vertical/horizontal manga OCR model.

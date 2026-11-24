@@ -4,6 +4,7 @@
 #include "../utils.hpp"
 
 #include <winhttp.h>
+#include <wincrypt.h>
 
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -200,6 +201,112 @@ size_t find_icase(const std::string& haystack, const std::string& needle, size_t
 }
 
 // -----------------------------------------------------------------------------
+// In-Memory DPAPI Secret Decryption & Per-Project Conversation History
+// -----------------------------------------------------------------------------
+
+std::string dpapi_decrypt_in_memory(const std::string& raw) {
+    static constexpr const char* kPrefix = "dpapi:";
+    if (raw.rfind(kPrefix, 0) != 0) {
+        return raw;
+    }
+    const auto decoded = util::base64_decode(
+        std::string_view(raw).substr(std::char_traits<char>::length(kPrefix)));
+    if (!decoded.has_value() || decoded->empty()) {
+        return "";
+    }
+    DATA_BLOB in_blob{};
+    in_blob.pbData = const_cast<BYTE*>(decoded->data());
+    in_blob.cbData = static_cast<DWORD>(decoded->size());
+    DATA_BLOB out_blob{};
+    if (!CryptUnprotectData(
+            &in_blob,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &out_blob)) {
+        return "";
+    }
+    std::string plaintext(reinterpret_cast<const char*>(out_blob.pbData), out_blob.cbData);
+    SecureZeroMemory(out_blob.pbData, out_blob.cbData);
+    LocalFree(out_blob.pbData);
+    return plaintext;
+}
+
+std::string strip_base64_data_uris(const std::string& input) {
+    std::string out = input;
+    size_t pos = 0;
+    while ((pos = find_icase(out, "data:image/", pos)) != std::string::npos) {
+        size_t end = pos;
+        while (end < out.size()) {
+            const char ch = out[end];
+            if (ch == '"' || ch == '\'' || ch == ')' || ch == ']' ||
+                std::isspace(static_cast<unsigned char>(ch))) {
+                break;
+            }
+            ++end;
+        }
+        out.replace(pos, end - pos, "[image omitted]");
+        pos += 15;
+    }
+    return out;
+}
+
+struct StoredConversationTurn {
+    std::string user_text;
+    std::string assistant_text;
+    std::vector<std::string> source_lines;
+    std::vector<std::string> translated_lines;
+};
+
+struct ProjectConversationState {
+    std::string compacted_summary;  // 3-section summary: ## Characters, ## Terms, ## Story
+    std::vector<StoredConversationTurn> turns;
+};
+
+std::mutex g_conversation_mutex;
+std::unordered_map<std::string, ProjectConversationState> g_project_conversations;
+
+constexpr size_t kCompactionTurnThreshold = 6;
+constexpr size_t kCompactionCharThreshold = 6000;
+constexpr size_t kKeepRecentTurns = 2;
+
+std::string build_fallback_3section_summary(
+    const std::string& existing_summary,
+    const std::vector<StoredConversationTurn>& older_turns) {
+    std::ostringstream oss;
+    oss << "## Characters\n";
+    oss << "- Maintain consistent speaker tone, pronouns, and relationships from prior pages.\n";
+    oss << "\n## Terms\n";
+    oss << "- Preserve established names, honorifics, and recurring terminology.\n";
+    oss << "\n## Story\n";
+    if (!existing_summary.empty()) {
+        const size_t story_pos = find_icase(existing_summary, "## Story");
+        if (story_pos != std::string::npos) {
+            std::string prev = util::trim_ascii(existing_summary.substr(story_pos + 8));
+            if (prev.size() > 600) prev.resize(600);
+            if (!prev.empty()) oss << prev << "\n";
+        }
+    }
+    int lines_added = 0;
+    for (const auto& t : older_turns) {
+        for (const auto& line : t.translated_lines) {
+            const std::string cleaned = util::trim_ascii(line);
+            if (!cleaned.empty()) {
+                oss << "- " << cleaned.substr(0, 120) << "\n";
+                if (++lines_added >= 8) break;
+            }
+        }
+        if (lines_added >= 8) break;
+    }
+    if (lines_added == 0) {
+        oss << "- Ongoing comic scene dialogue.\n";
+    }
+    return oss.str();
+}
+
+// -----------------------------------------------------------------------------
 // Static Provider & Target Language Registries (Koharu-Style)
 // -----------------------------------------------------------------------------
 
@@ -214,7 +321,7 @@ const std::vector<ProviderSpec>& all_provider_specs() {
         },
         {
             "ollama", "Ollama (Local)", kDefaultOllamaBaseUrl,
-            "qwen2.5:7b", "ollama",
+            "qwen2.5:7b", "",
             false, true, true, "openai",
             true, true, true, true, true,
             {},
@@ -262,6 +369,13 @@ const std::vector<ProviderSpec>& all_provider_specs() {
             "", "",
             false, true, false, "openai",
             true, true, true, true, true,
+            {},
+        },
+        {
+            "none", "None (Manual / No-LLM)", "",
+            "", "",
+            false, false, true, "none",
+            false, false, false, false, false,
             {},
         },
     };
@@ -431,7 +545,7 @@ ParsedUrl parse_http_url(const std::string& raw_url) {
 
     if (authority.empty()) return out;
 
-    // Handle bracketed IPv6 host `[::1]:1235`
+    // Handle bracketed IPv6 host `[::1]:1234`
     if (authority.front() == '[') {
         const size_t close_br = authority.find(']');
         if (close_br == std::string::npos) return out;
@@ -1380,11 +1494,14 @@ json PageTranslationResult::to_json() const {
         diag_arr.push_back(d.to_json());
     }
     return {
+        {"status", status},
         {"provider", provider},
         {"model", model},
         {"source_language", source_language},
         {"target_language", target_language},
         {"vision_used", vision_used},
+        {"echo_retried", echo_retried},
+        {"history_compacted", history_compacted},
         {"reasoning_effort", reasoning_effort},
         {"translations", translations},
         {"dialogues", std::move(diag_arr)},
@@ -1439,20 +1556,44 @@ TranslatorConfig TranslatorConfig::from_settings(const json& settings) {
         return cfg;
     }
 
-    if (settings.contains("provider") && settings["provider"].is_string()) {
+    if (settings.contains("active_provider") && settings["active_provider"].is_string() &&
+        !util::trim_ascii(settings["active_provider"].get<std::string>()).empty()) {
+        cfg.provider = ComicTranslator::normalize_provider_id(settings["active_provider"].get<std::string>());
+    } else if (settings.contains("provider") && settings["provider"].is_string()) {
         cfg.provider = ComicTranslator::normalize_provider_id(settings["provider"].get<std::string>());
     }
     const auto& spec = ComicTranslator::get_provider_spec(cfg.provider);
 
-    cfg.base_url = settings.contains("base_url") && settings["base_url"].is_string()
-        ? ComicTranslator::normalize_provider_base_url(cfg.provider, settings["base_url"].get<std::string>())
-        : spec.default_base_url;
-    cfg.api_key = settings.contains("api_key") && settings["api_key"].is_string()
-        ? ComicTranslator::resolve_provider_api_key(cfg.provider, settings["api_key"].get<std::string>())
-        : spec.default_api_key;
-    cfg.preferred_model = settings.contains("model") && settings["model"].is_string()
-        ? util::trim_ascii(settings["model"].get<std::string>())
-        : "";
+    const json* active_profile = nullptr;
+    if (settings.contains("providers") && settings["providers"].is_object() &&
+        settings["providers"].contains(cfg.provider) && settings["providers"][cfg.provider].is_object()) {
+        active_profile = &settings["providers"][cfg.provider];
+    }
+
+    std::string raw_base_url;
+    if (settings.contains("base_url") && settings["base_url"].is_string() &&
+        !util::trim_ascii(settings["base_url"].get<std::string>()).empty()) {
+        raw_base_url = settings["base_url"].get<std::string>();
+    } else if (active_profile && active_profile->contains("base_url") && (*active_profile)["base_url"].is_string()) {
+        raw_base_url = (*active_profile)["base_url"].get<std::string>();
+    }
+    cfg.base_url = ComicTranslator::normalize_provider_base_url(cfg.provider, raw_base_url);
+
+    std::string raw_api_key;
+    if (settings.contains("api_key") && settings["api_key"].is_string() &&
+        !util::trim_ascii(settings["api_key"].get<std::string>()).empty()) {
+        raw_api_key = settings["api_key"].get<std::string>();
+    } else if (active_profile && active_profile->contains("api_key") && (*active_profile)["api_key"].is_string()) {
+        raw_api_key = (*active_profile)["api_key"].get<std::string>();
+    }
+    cfg.api_key = ComicTranslator::resolve_provider_api_key(cfg.provider, raw_api_key);
+
+    if (settings.contains("model") && settings["model"].is_string() &&
+        !util::trim_ascii(settings["model"].get<std::string>()).empty()) {
+        cfg.preferred_model = util::trim_ascii(settings["model"].get<std::string>());
+    } else if (active_profile && active_profile->contains("model") && (*active_profile)["model"].is_string()) {
+        cfg.preferred_model = util::trim_ascii((*active_profile)["model"].get<std::string>());
+    }
     if (cfg.preferred_model.empty()) {
         cfg.preferred_model = spec.default_model;
     }
@@ -1677,9 +1818,15 @@ TranslatorConfig TranslatorConfig::from_settings_with_overrides(
 std::string ComicTranslator::normalize_provider_id(const std::string& raw) {
     const std::string cleaned = util::to_lower_ascii(util::trim_ascii(raw));
     if (cleaned.empty()) {
-        return "lmstudio";
+        return "none";
     }
     static const std::unordered_map<std::string, std::string> kAliases = {
+        {"none", "none"},
+        {"manual", "none"},
+        {"disabled", "none"},
+        {"off", "none"},
+        {"no-llm", "none"},
+        {"no_llm", "none"},
         {"lmstudio", "lmstudio"},
         {"lm-studio", "lmstudio"},
         {"lm_studio", "lmstudio"},
@@ -1752,7 +1899,8 @@ std::string ComicTranslator::normalize_provider_base_url(
 std::string ComicTranslator::resolve_provider_api_key(
     const std::string& provider_id,
     const std::string& raw_api_key) {
-    const std::string cleaned = util::trim_ascii(raw_api_key);
+    const std::string decrypted = dpapi_decrypt_in_memory(util::trim_ascii(raw_api_key));
+    const std::string cleaned = util::trim_ascii(decrypted);
     if (!cleaned.empty()) return cleaned;
     return get_provider_spec(provider_id).default_api_key;
 }
@@ -2021,18 +2169,8 @@ std::optional<std::string> ComicTranslator::format_display_model_name(
     const std::string& provider_id,
     const std::optional<std::string>& resolved_model_id,
     const std::string& preferred_model) {
-    if (!resolved_model_id.has_value()) {
-        return std::nullopt;
-    }
-    const std::string res_lower = util::to_lower_ascii(*resolved_model_id);
-    const std::string pref_lower = util::to_lower_ascii(preferred_model);
-    if (provider_id == "lmstudio" &&
-        res_lower.find("gemma-4-e2b-uncensored-hauhaucs-aggressive") != std::string::npos &&
-        (pref_lower.empty() ||
-         pref_lower.find("gemma 4 e2b") != std::string::npos ||
-         pref_lower.find("gemma-4-e2b") != std::string::npos)) {
-        return std::string(kDefaultLmStudioModel);
-    }
+    (void)provider_id;
+    (void)preferred_model;
     return resolved_model_id;
 }
 
@@ -2047,6 +2185,9 @@ std::vector<std::string> ComicTranslator::list_provider_models(
     double timeout_seconds,
     bool include_embeddings) {
     const std::string prov_id = normalize_provider_id(provider);
+    if (prov_id == "none") {
+        return {};
+    }
     const auto& spec = get_provider_spec(prov_id);
     const std::string resolved_url = normalize_provider_base_url(prov_id, base_url);
     const std::string resolved_key = resolve_provider_api_key(prov_id, api_key);
@@ -2074,7 +2215,26 @@ std::vector<std::string> ComicTranslator::list_provider_models(
         headers.emplace_back("Authorization", "Bearer " + resolved_key);
     }
 
-    const HttpResponse resp = perform_http_request("GET", models_url, headers, "", timeout_seconds);
+    HttpResponse resp = perform_http_request("GET", models_url, headers, "", timeout_seconds);
+
+    // Gemini native fallback: if OpenAI-compat `/v1beta/openai/models` fails (or user supplied native `/v1beta`),
+    // query `GET https://generativelanguage.googleapis.com/v1beta/models` using `x-goog-api-key` header (key never in URL).
+    if (prov_id == "gemini" && (resp.transport_error || resp.status_code >= 400) && !resolved_key.empty()) {
+        std::string native_base = resolved_url;
+        const std::string lower_base = util::to_lower_ascii(native_base);
+        if (lower_base.size() >= 7 && lower_base.compare(lower_base.size() - 7, 7, "/openai") == 0) {
+            native_base.resize(native_base.size() - 7);
+        }
+        const std::string native_url = native_base + "/models";
+        const std::vector<std::pair<std::string, std::string>> gemini_headers = {
+            {"Accept", "application/json"},
+            {"x-goog-api-key", resolved_key},
+        };
+        const HttpResponse native_resp = perform_http_request("GET", native_url, gemini_headers, "", timeout_seconds);
+        if (!native_resp.transport_error && native_resp.status_code >= 200 && native_resp.status_code < 300) {
+            resp = native_resp;
+        }
+    }
     if (resp.transport_error) {
         if (resp.timed_out) {
             std::ostringstream oss;
@@ -2084,7 +2244,7 @@ std::vector<std::string> ComicTranslator::list_provider_models(
         }
         std::string hint;
         if (prov_id == "lmstudio") {
-            hint = "Ensure LM Studio is open and the Local Inference Server is running (default port 1235).";
+            hint = "Ensure LM Studio is open and the Local Inference Server is running (default port 1234).";
         } else if (prov_id == "ollama") {
             hint = "Ensure Ollama is running locally (default port 11434).";
         } else {
@@ -2275,8 +2435,8 @@ std::string ComicTranslator::resolve_provider_model(
             }
         }
 
-        // 2. Fuzzy token match (e.g. "Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P"
-        //    -> "gemma-4-e2b-uncensored-hauhaucs-aggressive")
+        // 2. Fuzzy token match (e.g. "Qwen2.5 7B Instruct"
+        //    -> "qwen2.5-7b-instruct")
         double best_score = -1.0;
         std::string best_cand;
         for (const auto& cand : candidates) {
@@ -2331,6 +2491,14 @@ ProviderTestResult ComicTranslator::test_provider_connection(
     res.provider_name = spec.name;
     res.endpoint = resolved_url;
     res.preferred_model = pref_model;
+
+    if (prov_id == "none") {
+        res.ok = false;
+        res.connected = false;
+        res.message = "No translation provider configured (active_provider is 'none').";
+        res.error = "provider_not_configured";
+        return res;
+    }
 
     const auto t0 = std::chrono::steady_clock::now();
     try {
@@ -2540,8 +2708,16 @@ std::string ComicTranslator::build_system_prompt(
 
     std::ostringstream oss;
     oss << "Translate " << source_desc << " comic dialogue into " << target_desc << ". "
-        << thinking_directive << "\n"
-        << "Rules:\n"
+        << thinking_directive << "\n";
+
+    // Inject the user's Instruction Bar at HIGH PRIORITY right at the top of the system prompt
+    const std::string ci = util::trim_ascii(custom_instructions);
+    if (!ci.empty()) {
+        oss << "\n### HIGH-PRIORITY USER DIRECTIVES (STRICTLY FOLLOW — OVERRIDES DEFAULT STYLE):\n"
+            << ci << "\n";
+    }
+
+    oss << "\nRules:\n"
         << "1. Keep scene context, pronouns, and speaker tone consistent across all bubbles.\n"
         << "2. " << tgt_spec.style_rule << "\n"
         << "3. " << honorific_rule << "\n";
@@ -2575,11 +2751,6 @@ std::string ComicTranslator::build_system_prompt(
                 oss << "\n- " << line;
             }
         }
-    }
-
-    const std::string ci = util::trim_ascii(custom_instructions);
-    if (!ci.empty()) {
-        oss << "\nExtra: " << ci;
     }
 
     if (has_page_image) {
@@ -2936,6 +3107,15 @@ std::string ComicTranslator::resolve_model(bool force_refresh) {
     return resolved;
 }
 
+void ComicTranslator::clear_project_conversation(const std::string& project_id) {
+    std::lock_guard<std::mutex> lock(g_conversation_mutex);
+    if (project_id.empty()) {
+        g_project_conversations.clear();
+    } else {
+        g_project_conversations.erase(project_id);
+    }
+}
+
 std::pair<std::string, bool> ComicTranslator::call_anthropic_messages(
     const std::string& model_id,
     const std::string& system_prompt,
@@ -2945,7 +3125,8 @@ std::pair<std::string, bool> ComicTranslator::call_anthropic_messages(
     std::optional<int> top_k,
     int max_tokens,
     const std::string& reasoning_effort,
-    const std::optional<std::string>& page_image_data_uri) const {
+    const std::optional<std::string>& page_image_data_uri,
+    const std::vector<ConversationMessage>& history) const {
     if (config_.api_key.empty()) {
         throw ProviderConnectionError("API key is required for Anthropic (Claude).");
     }
@@ -2996,13 +3177,19 @@ std::pair<std::string, bool> ComicTranslator::call_anthropic_messages(
         const int budget = include_thinking ? thinking_budget_for(reasoning_effort) : 0;
         const int eff_max_tokens = (budget > 0) ? std::max(max_tokens, budget + 1024) : max_tokens;
 
+        json messages_arr = json::array();
+        for (const auto& h : history) {
+            if (!h.content.empty()) {
+                messages_arr.push_back({{"role", h.role}, {"content", h.content}});
+            }
+        }
+        messages_arr.push_back({{"role", "user"}, {"content", content_blocks}});
+
         json body = {
             {"model", model_id},
             {"max_tokens", eff_max_tokens},
             {"system", system_prompt},
-            {"messages", json::array({
-                {{"role", "user"}, {"content", content_blocks}},
-            })},
+            {"messages", std::move(messages_arr)},
         };
 
         if (budget > 0) {
@@ -3113,7 +3300,8 @@ std::pair<std::string, bool> ComicTranslator::call_openai_chat_completion(
     int max_tokens,
     std::optional<double> frequency_penalty,
     const std::string& reasoning_effort,
-    const std::optional<std::string>& page_image_data_uri) const {
+    const std::optional<std::string>& page_image_data_uri,
+    const std::vector<ConversationMessage>& history) const {
     if (config_.base_url.empty()) {
         throw ProviderConnectionError("Provider '" + config_.provider + "' is missing a valid Base URL.");
     }
@@ -3133,23 +3321,32 @@ std::pair<std::string, bool> ComicTranslator::call_openai_chat_completion(
         headers.emplace_back("Authorization", "Bearer " + config_.api_key);
     }
 
-    const json text_messages = json::array({
-        {{"role", "system"}, {"content", system_prompt}},
-        {{"role", "user"}, {"content", user_payload}},
-    });
+    json text_messages = json::array();
+    text_messages.push_back({{"role", "system"}, {"content", system_prompt}});
+    for (const auto& h : history) {
+        if (!h.content.empty()) {
+            text_messages.push_back({{"role", h.role}, {"content", h.content}});
+        }
+    }
+    text_messages.push_back({{"role", "user"}, {"content", user_payload}});
 
     std::optional<json> vision_messages;
     if (page_image_data_uri.has_value() && !page_image_data_uri->empty()) {
-        vision_messages = json::array({
-            {{"role", "system"}, {"content", system_prompt}},
-            {
-                {"role", "user"},
-                {"content", json::array({
-                    {{"type", "text"}, {"text", user_payload}},
-                    {{"type", "image_url"}, {"image_url", {{"url", *page_image_data_uri}}}},
-                })},
-            },
+        json vm = json::array();
+        vm.push_back({{"role", "system"}, {"content", system_prompt}});
+        for (const auto& h : history) {
+            if (!h.content.empty()) {
+                vm.push_back({{"role", h.role}, {"content", h.content}});
+            }
+        }
+        vm.push_back({
+            {"role", "user"},
+            {"content", json::array({
+                {{"type", "text"}, {"text", user_payload}},
+                {{"type", "image_url"}, {"image_url", {{"url", *page_image_data_uri}}}},
+            })},
         });
+        vision_messages = std::move(vm);
     }
 
     const std::string openai_effort = (reasoning_effort == "off") ? "none" : reasoning_effort;
@@ -3166,7 +3363,7 @@ std::pair<std::string, bool> ComicTranslator::call_openai_chat_completion(
             }
             std::string hint;
             if (config_.provider == "lmstudio") {
-                hint = "Make sure LM Studio is running and listening on port 1235.";
+                hint = "Make sure LM Studio is running and listening on port 1234.";
             } else if (config_.provider == "ollama") {
                 hint = "Make sure Ollama is running locally.";
             } else {
@@ -3344,6 +3541,79 @@ std::pair<std::string, bool> ComicTranslator::call_openai_chat_completion(
     return {content_str, vision_used};
 }
 
+std::string ComicTranslator::compact_conversation_history(
+    const std::string& model_id,
+    const std::string& existing_summary,
+    const std::vector<ConversationMessage>& older_turns) const {
+    if (older_turns.empty()) return existing_summary;
+
+    const std::string compact_sys =
+        "You are a manga/comic translation continuity editor. "
+        "Merge the prior summary (if any) and the older dialogue turns into a concise, factual "
+        "continuity glossary with EXACTLY these 3 markdown sections:\n"
+        "## Characters\n(names, pronouns, speech register, relationships)\n"
+        "## Terms\n(recurring names, honorifics, locations, special terms)\n"
+        "## Story\n(brief bullet points of key events so far)\n"
+        "Keep it compact (under 350 words). No thinking tags or extra commentary.";
+
+    std::ostringstream oss;
+    if (!existing_summary.empty()) {
+        oss << "Existing Summary:\n" << existing_summary << "\n\n";
+    }
+    oss << "Older Turns to Compact:\n";
+    for (const auto& m : older_turns) {
+        oss << "[" << m.role << "] " << strip_base64_data_uris(m.content).substr(0, 600) << "\n";
+    }
+
+    try {
+        std::string raw;
+        if (spec_->protocol == "anthropic") {
+            std::tie(raw, std::ignore) = call_anthropic_messages(
+                model_id, compact_sys, oss.str(), 0.1, std::nullopt, std::nullopt, 512, "off", std::nullopt, {});
+        } else {
+            // Plain text completion (no JSON schema) for markdown 3-section summary
+            const std::string completions_url = config_.base_url + "/chat/completions";
+            std::vector<std::pair<std::string, std::string>> headers = {
+                {"Content-Type", "application/json"},
+                {"Accept", "application/json"},
+            };
+            for (const auto& kv : spec_->extra_headers) headers.push_back(kv);
+            if (!config_.api_key.empty()) {
+                headers.emplace_back("Authorization", "Bearer " + config_.api_key);
+            }
+            const json body = {
+                {"model", model_id},
+                {"messages", json::array({
+                    {{"role", "system"}, {"content", compact_sys}},
+                    {{"role", "user"}, {"content", oss.str()}},
+                })},
+                {"temperature", 0.1},
+                {"max_tokens", 512},
+            };
+            const HttpResponse resp = perform_http_request(
+                "POST", completions_url, headers, safe_json_dump(body), std::min(30.0, config_.timeout_seconds));
+            if (!resp.transport_error && resp.status_code >= 200 && resp.status_code < 300) {
+                const json p = json::parse(resp.body, nullptr, false);
+                if (!p.is_discarded() && p.is_object() && p.contains("choices") &&
+                    p["choices"].is_array() && !p["choices"].empty() &&
+                    p["choices"][0].contains("message") && p["choices"][0]["message"].contains("content") &&
+                    p["choices"][0]["message"]["content"].is_string()) {
+                    raw = p["choices"][0]["message"]["content"].get<std::string>();
+                }
+            }
+        }
+        const std::string cleaned = util::trim_ascii(strip_thinking_tags(strip_base64_data_uris(raw)));
+        if (find_icase(cleaned, "## Characters") != std::string::npos &&
+            find_icase(cleaned, "## Terms") != std::string::npos &&
+            find_icase(cleaned, "## Story") != std::string::npos) {
+            return cleaned;
+        }
+    } catch (...) {
+        // Fall through to deterministic 3-section fallback
+    }
+    return {};
+}
+
 PageTranslationResult ComicTranslator::translate_blocks(
     const std::vector<DialogueBlockInput>& blocks,
     const TranslateRequestOptions& options) {
@@ -3360,6 +3630,24 @@ PageTranslationResult ComicTranslator::translate_blocks(
             bid = buf;
         }
         normalized_blocks.push_back({bid, collapse_whitespace(blocks[i].source_text)});
+    }
+
+    // Graceful non-fatal handling when active_provider == "none"
+    if (config_.provider == "none") {
+        PageTranslationResult none_res;
+        none_res.status = "provider_not_configured";
+        none_res.provider = "none";
+        none_res.model = "";
+        none_res.source_language = src_lang;
+        none_res.target_language = tgt_lang;
+        none_res.vision_used = false;
+        none_res.reasoning_effort = "off";
+        none_res.dialogues.reserve(normalized_blocks.size());
+        for (const auto& b : normalized_blocks) {
+            none_res.translations[b.id] = b.source_text;
+            none_res.dialogues.push_back({b.id, b.source_text, b.source_text});
+        }
+        return none_res;
     }
 
     const std::string model_id = resolve_model();
@@ -3385,6 +3673,7 @@ PageTranslationResult ComicTranslator::translate_blocks(
     const bool eff_use_vision = options.use_vision.value_or(config_.use_vision);
 
     PageTranslationResult result;
+    result.status = "ok";
     result.provider = config_.provider;
     result.model = model_id;
     result.source_language = src_lang;
@@ -3429,8 +3718,6 @@ PageTranslationResult ComicTranslator::translate_blocks(
         ? normalize_translation_tone(*options.translation_tone)
         : config_.translation_tone;
 
-    // Tighten max_tokens dynamically for local inference servers (e.g. LM Studio on localhost:1235)
-    // when reasoning is off to reduce KV-cache overhead and prevent runaway trailing generations.
     int request_max_tokens = eff_max_tokens;
     if (spec_->is_local && eff_reasoning == "off") {
         const int tight_budget = clamp_i(
@@ -3446,7 +3733,7 @@ PageTranslationResult ComicTranslator::translate_blocks(
         resolved_image_uri = util::trim_ascii(*options.page_image_data_uri);
     }
 
-    const std::string system_prompt = build_system_prompt(
+    const std::string base_system_prompt = build_system_prompt(
         src_lang,
         tgt_lang,
         eff_reasoning,
@@ -3454,6 +3741,36 @@ PageTranslationResult ComicTranslator::translate_blocks(
         merged_glossary,
         resolved_image_uri.has_value(),
         eff_tone);
+
+    // Load per-project Conversation history (already stripped of base64 images & <think> blocks)
+    const std::string conv_key = util::trim_ascii(options.project_id).empty()
+        ? std::string("default")
+        : util::trim_ascii(options.project_id);
+
+    std::vector<ConversationMessage> history_msgs;
+    std::string compacted_summary;
+    std::optional<StoredConversationTurn> prev_turn;
+    if (options.use_history) {
+        std::lock_guard<std::mutex> lock(g_conversation_mutex);
+        const auto it = g_project_conversations.find(conv_key);
+        if (it != g_project_conversations.end()) {
+            compacted_summary = it->second.compacted_summary;
+            for (const auto& t : it->second.turns) {
+                if (!t.user_text.empty() && !t.assistant_text.empty()) {
+                    history_msgs.push_back({"user", t.user_text});
+                    history_msgs.push_back({"assistant", t.assistant_text});
+                }
+            }
+            if (!it->second.turns.empty()) {
+                prev_turn = it->second.turns.back();
+            }
+        }
+    }
+
+    std::string system_prompt_with_ctx = base_system_prompt;
+    if (!compacted_summary.empty()) {
+        system_prompt_with_ctx += "\n\n### Continuity Glossary & Story Context:\n" + compacted_summary;
+    }
 
     json dialogues_json = json::array();
     for (const auto& b : non_empty_blocks) {
@@ -3464,37 +3781,61 @@ PageTranslationResult ComicTranslator::translate_blocks(
     }
     const std::string user_payload = safe_json_dump({{"dialogues", std::move(dialogues_json)}});
 
-    std::string raw_output;
-    bool vision_used = false;
-    if (spec_->protocol == "anthropic") {
-        std::tie(raw_output, vision_used) = call_anthropic_messages(
-            model_id,
-            system_prompt,
-            user_payload,
-            eff_temp,
-            eff_top_p,
-            eff_top_k,
-            request_max_tokens,
-            eff_reasoning,
-            resolved_image_uri);
-    } else {
-        std::tie(raw_output, vision_used) = call_openai_chat_completion(
-            model_id,
-            system_prompt,
-            user_payload,
-            eff_temp,
-            eff_top_p,
-            eff_top_k,
-            request_max_tokens,
-            eff_freq_pen,
-            eff_reasoning,
-            resolved_image_uri);
-    }
+    auto invoke_llm = [&](const std::string& sys_prompt,
+                          const std::vector<ConversationMessage>& hist) -> std::pair<std::string, bool> {
+        if (spec_->protocol == "anthropic") {
+            return call_anthropic_messages(
+                model_id, sys_prompt, user_payload, eff_temp, eff_top_p, eff_top_k,
+                request_max_tokens, eff_reasoning, resolved_image_uri, hist);
+        }
+        return call_openai_chat_completion(
+            model_id, sys_prompt, user_payload, eff_temp, eff_top_p, eff_top_k,
+            request_max_tokens, eff_freq_pen, eff_reasoning, resolved_image_uri, hist);
+    };
 
+    auto [raw_output, vision_used] = invoke_llm(system_prompt_with_ctx, history_msgs);
     auto translation_map = extract_and_clean_translations(
         raw_output,
         normalized_blocks,
         config_.strip_thinking);
+
+    // Echo-Retry: if a small local model repeats >= 2 lines AND >= 50% of translated lines
+    // identically from the previous page while source OCR text differs, retry ONCE with empty history.
+    if (options.use_history && prev_turn.has_value() && (!history_msgs.empty() || !compacted_summary.empty())) {
+        std::unordered_set<std::string> prev_trans_set;
+        for (const auto& pt : prev_turn->translated_lines) {
+            const std::string cleaned = util::trim_ascii(pt);
+            if (!cleaned.empty()) prev_trans_set.insert(cleaned);
+        }
+        std::unordered_set<std::string> prev_src_set;
+        for (const auto& ps : prev_turn->source_lines) {
+            const std::string cleaned = util::trim_ascii(ps);
+            if (!cleaned.empty()) prev_src_set.insert(cleaned);
+        }
+
+        size_t echo_count = 0;
+        size_t total_lines = 0;
+        for (const auto& b : non_empty_blocks) {
+            const auto it = translation_map.find(b.id);
+            const std::string trans = (it != translation_map.end()) ? util::trim_ascii(it->second) : "";
+            if (trans.empty()) continue;
+            ++total_lines;
+            const std::string src_clean = util::trim_ascii(b.source_text);
+            if (prev_trans_set.count(trans) && !prev_src_set.count(src_clean)) {
+                ++echo_count;
+            }
+        }
+
+        if (echo_count >= 2 && total_lines > 0 &&
+            (static_cast<double>(echo_count) / static_cast<double>(total_lines)) >= 0.50) {
+            std::tie(raw_output, vision_used) = invoke_llm(base_system_prompt, {});
+            translation_map = extract_and_clean_translations(
+                raw_output,
+                normalized_blocks,
+                config_.strip_thinking);
+            result.echo_retried = true;
+        }
+    }
 
     // Apply deterministic post-translation glossary replacement rules if any source terms remain
     if (!merged_glossary.empty()) {
@@ -3508,10 +3849,71 @@ PageTranslationResult ComicTranslator::translate_blocks(
     result.vision_used = vision_used;
     result.translations = translation_map;
     result.dialogues.reserve(normalized_blocks.size());
+    std::vector<std::string> cur_src_lines;
+    std::vector<std::string> cur_trans_lines;
+    cur_src_lines.reserve(non_empty_blocks.size());
+    cur_trans_lines.reserve(non_empty_blocks.size());
     for (const auto& b : normalized_blocks) {
         const auto it = translation_map.find(b.id);
         const std::string trans = (it != translation_map.end()) ? it->second : b.source_text;
         result.dialogues.push_back({b.id, b.source_text, trans});
+        if (!b.source_text.empty()) {
+            cur_src_lines.push_back(b.source_text);
+            cur_trans_lines.push_back(trans);
+        }
+    }
+
+    // Append cleaned turn (base64 images & <think>...</think> stripped) to per-project Conversation
+    // and auto-compact older turns into a 3-section summary (## Characters, ## Terms, ## Story) if needed.
+    if (options.use_history) {
+        StoredConversationTurn new_turn;
+        new_turn.user_text = strip_base64_data_uris(user_payload);
+        new_turn.assistant_text = util::trim_ascii(strip_thinking_tags(strip_base64_data_uris(raw_output)));
+        new_turn.source_lines = std::move(cur_src_lines);
+        new_turn.translated_lines = std::move(cur_trans_lines);
+
+        std::vector<ConversationMessage> to_compact_msgs;
+        std::vector<StoredConversationTurn> to_compact_turns;
+        std::string existing_sum;
+        bool needs_compact = false;
+
+        {
+            std::lock_guard<std::mutex> lock(g_conversation_mutex);
+            auto& state = g_project_conversations[conv_key];
+            if (!new_turn.assistant_text.empty()) {
+                state.turns.push_back(std::move(new_turn));
+            }
+            size_t total_chars = 0;
+            for (const auto& t : state.turns) {
+                total_chars += t.user_text.size() + t.assistant_text.size();
+            }
+            if (state.turns.size() > kCompactionTurnThreshold ||
+                (state.turns.size() > kKeepRecentTurns && total_chars > kCompactionCharThreshold)) {
+                needs_compact = true;
+                existing_sum = state.compacted_summary;
+                const size_t keep = std::min(kKeepRecentTurns, state.turns.size());
+                const size_t cut = state.turns.size() - keep;
+                for (size_t i = 0; i < cut; ++i) {
+                    to_compact_msgs.push_back({"user", state.turns[i].user_text});
+                    to_compact_msgs.push_back({"assistant", state.turns[i].assistant_text});
+                    to_compact_turns.push_back(state.turns[i]);
+                }
+            }
+        }
+
+        if (needs_compact && !to_compact_msgs.empty()) {
+            std::string compacted = compact_conversation_history(model_id, existing_sum, to_compact_msgs);
+            if (compacted.empty()) {
+                compacted = build_fallback_3section_summary(existing_sum, to_compact_turns);
+            }
+            std::lock_guard<std::mutex> lock(g_conversation_mutex);
+            auto& state = g_project_conversations[conv_key];
+            state.compacted_summary = std::move(compacted);
+            if (state.turns.size() > kKeepRecentTurns) {
+                state.turns.erase(state.turns.begin(), state.turns.end() - static_cast<std::ptrdiff_t>(kKeepRecentTurns));
+            }
+            result.history_compacted = true;
+        }
     }
 
     return result;

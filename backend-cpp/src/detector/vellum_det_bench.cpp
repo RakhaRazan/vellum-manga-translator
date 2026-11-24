@@ -10,6 +10,7 @@
 #include <psapi.h>
 
 #include "adaptive_tiler.hpp"
+#include "cv_typography.hpp"
 #include "detector_engine.hpp"
 #include "export_artifacts.hpp"
 
@@ -215,6 +216,32 @@ int main(int argc, char** argv) {
         std::cout << "  Postproc  p50       : " << percentileMs(img_post_ms, 50.0) << " ms\n";
         std::cout << "  Detections          : panels=" << last_res.panels.size()
                   << ", bubbles/regions=" << last_res.detections.size() << "\n";
+        for (const auto& det : last_res.detections) {
+            std::cout << "    det[" << det.id << "] order=" << det.reading_order
+                      << " panel=" << det.panel_id
+                      << " (" << det.class_name << "): "
+                      << "room_polygon=" << det.room_polygon.size() << " pts";
+            if (det.angle_deg.has_value()) {
+                std::cout << ", {angle_deg: " << *det.angle_deg
+                          << ", estimated_font_size: " << det.estimated_font_size.value_or(0.0f);
+                if (det.text_color.has_value()) {
+                    std::cout << ", text_color: [" << static_cast<int>((*det.text_color)[0])
+                              << "," << static_cast<int>((*det.text_color)[1])
+                              << "," << static_cast<int>((*det.text_color)[2]) << "]";
+                }
+                std::cout << ", outline: ";
+                if (det.outline.has_value()) {
+                    std::cout << "{color: [" << static_cast<int>(det.outline->color[0])
+                              << "," << static_cast<int>(det.outline->color[1])
+                              << "," << static_cast<int>(det.outline->color[2])
+                              << "], width: " << det.outline->width << "}";
+                } else {
+                    std::cout << "null";
+                }
+                std::cout << "}";
+            }
+            std::cout << "\n";
+        }
     }
 
     std::cout << "\n=== Summary ===\n";

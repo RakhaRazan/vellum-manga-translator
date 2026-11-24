@@ -87,33 +87,24 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(webview)
 
 # ------------------------------------------------------------------------------
-# 4. Official Prebuilt ONNX Runtime (win-x64: DirectML / CUDA / CPU)
+# 4. Official Prebuilt ONNX Runtime (win-x64: CUDA [Universal default] / DML / CPU)
 # ------------------------------------------------------------------------------
-if(DEFINED VELLUM_ORT_BACKEND AND NOT DEFINED MANGAFLOW_ORT_BACKEND)
-    set(MANGAFLOW_ORT_BACKEND "${VELLUM_ORT_BACKEND}")
+if(DEFINED MANGAFLOW_ORT_BACKEND AND NOT DEFINED VELLUM_ORT_BACKEND)
+    set(VELLUM_ORT_BACKEND "${MANGAFLOW_ORT_BACKEND}" CACHE STRING "ONNX Runtime prebuilt backend: CUDA (universal default with safe CPU fallback), DML, CPU, or AUTO")
+else()
+    set(VELLUM_ORT_BACKEND "CUDA" CACHE STRING "ONNX Runtime prebuilt backend: CUDA (universal default with safe CPU fallback), DML, CPU, or AUTO")
 endif()
-set(MANGAFLOW_ORT_BACKEND "AUTO" CACHE STRING "ONNX Runtime prebuilt backend: AUTO, CUDA, DIRECTML, or CPU")
-set_property(CACHE MANGAFLOW_ORT_BACKEND PROPERTY STRINGS AUTO CUDA DIRECTML CPU)
+set_property(CACHE VELLUM_ORT_BACKEND PROPERTY STRINGS CUDA DML DIRECTML CPU AUTO)
 set(MANGAFLOW_ORT_URL "" CACHE STRING "Optional custom URL to an official onnxruntime-win-x64 zip/nupkg archive")
 
-set(_RESOLVED_ORT_BACKEND "${MANGAFLOW_ORT_BACKEND}")
+string(TOUPPER "${VELLUM_ORT_BACKEND}" _RESOLVED_ORT_BACKEND)
+if(_RESOLVED_ORT_BACKEND STREQUAL "DML")
+    set(_RESOLVED_ORT_BACKEND "DIRECTML")
+endif()
 if(_RESOLVED_ORT_BACKEND STREQUAL "AUTO")
-    # Probe CUDA 12 + cuDNN 9 DLLs on PATH, CUDA_PATH, NVIDIA Toolkit, or LM Studio before falling back to DirectML
-    set(_CUDA_SEARCH_DIRS "")
-    if(DEFINED ENV{CUDA_PATH} AND EXISTS "$ENV{CUDA_PATH}/bin")
-        list(APPEND _CUDA_SEARCH_DIRS "$ENV{CUDA_PATH}/bin")
-    endif()
-    file(GLOB _NVIDIA_CUDA_BINS "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.*/bin")
-    list(APPEND _CUDA_SEARCH_DIRS ${_NVIDIA_CUDA_BINS})
-    find_file(_FOUND_CUBLAS12 NAMES cublas64_12.dll PATHS ${_CUDA_SEARCH_DIRS})
-    find_file(_FOUND_CUDNN9 NAMES cudnn64_9.dll PATHS ${_CUDA_SEARCH_DIRS})
-    if(_FOUND_CUBLAS12 AND _FOUND_CUDNN9)
-        set(_RESOLVED_ORT_BACKEND "CUDA")
-        message(STATUS "[Vellum] Detected CUDA 12 + cuDNN 9 (${_FOUND_CUBLAS12}) -> selecting CUDAExecutionProvider")
-    else()
-        set(_RESOLVED_ORT_BACKEND "DIRECTML")
-        message(STATUS "[Vellum] CUDA 12 + cuDNN 9 DLLs not found on system -> selecting DmlExecutionProvider")
-    endif()
+    # Default Universal build uses Microsoft.ML.OnnxRuntime.Gpu.Windows with dynamic VRAM + safe CPU fallback
+    set(_RESOLVED_ORT_BACKEND "CUDA")
+    message(STATUS "[Vellum] AUTO backend -> selecting Microsoft.ML.OnnxRuntime.Gpu (CUDA + safe CPU fallback)")
 endif()
 
 if(MANGAFLOW_ORT_URL)
@@ -132,7 +123,7 @@ elseif(_RESOLVED_ORT_BACKEND STREQUAL "CPU")
     set(_ORT_DOWNLOAD_URL "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${_ORT_VERSION}/microsoft.ml.onnxruntime.${_ORT_VERSION}.nupkg")
     set(_ORT_DOWNLOAD_NAME "onnxruntime-win-x64-${_ORT_VERSION}.zip")
 else()
-    message(FATAL_ERROR "Invalid MANGAFLOW_ORT_BACKEND='${MANGAFLOW_ORT_BACKEND}'. Choose AUTO, CUDA, DIRECTML, or CPU.")
+    message(FATAL_ERROR "Invalid VELLUM_ORT_BACKEND='${VELLUM_ORT_BACKEND}'. Choose DML, DIRECTML, CUDA, CPU, or AUTO.")
 endif()
 
 FetchContent_Declare(
@@ -220,7 +211,7 @@ set_target_properties(stb::headers PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${stb_headers_SOURCE_DIR}"
 )
 
-message(STATUS "[Vellum] ONNX Runtime backend : ${MANGAFLOW_ORT_BACKEND} (resolved: ${_RESOLVED_ORT_BACKEND})")
+message(STATUS "[Vellum] ONNX Runtime backend : ${VELLUM_ORT_BACKEND} (resolved: ${_RESOLVED_ORT_BACKEND})")
 message(STATUS "[Vellum] ONNX Runtime include : ${ONNXRUNTIME_INCLUDE_DIR}")
 message(STATUS "[Vellum] ONNX Runtime lib dir : ${ONNXRUNTIME_LIB_DIR}")
 message(STATUS "[Vellum] DirectML header      : ${MANGAFLOW_HAS_DML}")
@@ -248,9 +239,17 @@ add_executable(MangaFlowAI WIN32
     src/settings_manager.cpp
     src/font_manager.cpp
     src/exporter.cpp
+    src/psd_writer.hpp
+    src/psd_writer.cpp
     src/detector/detector_types.hpp
     src/detector/detector_engine.hpp
     src/detector/detector_engine.cpp
+    src/detector/cv_refinement.hpp
+    src/detector/cv_refinement.cpp
+    src/detector/cv_typography.hpp
+    src/detector/cv_typography.cpp
+    src/detector/cv_geometry.hpp
+    src/detector/cv_geometry.cpp
     src/detector/geometry_postproc.hpp
     src/detector/geometry_postproc.cpp
     src/detector/yolo_seg_backend.hpp
@@ -261,6 +260,7 @@ add_executable(MangaFlowAI WIN32
     src/detector/adaptive_tiler.cpp
     src/detector/export_artifacts.hpp
     src/detector/export_artifacts.cpp
+    src/pipeline/ort_provider.cpp
     src/pipeline/model_manager.cpp
     src/pipeline/detector.cpp
     src/pipeline/ocr.cpp
@@ -315,6 +315,7 @@ target_link_libraries(MangaFlowAI PRIVATE
     dwmapi
     dxgi
     winhttp
+    crypt32
 )
 
 # Copy ONNX Runtime DLLs next to Vellum.exe after every build
@@ -327,6 +328,20 @@ foreach(_dll IN LISTS ONNXRUNTIME_RUNTIME_DLLS)
         COMMENT "Copying ONNX Runtime DLL: ${_dll}"
     )
 endforeach()
+
+# Copy self-contained NVIDIA CUDA 12 + cuDNN 9 redistributable DLLs (if present in build_deps/cuda_runtime/bin)
+set(VELLUM_CUDA_RUNTIME_BIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build_deps/cuda_runtime/bin")
+if(_RESOLVED_ORT_BACKEND STREQUAL "CUDA" AND EXISTS "${VELLUM_CUDA_RUNTIME_BIN_DIR}")
+    file(GLOB VELLUM_CUDA_RUNTIME_DLLS "${VELLUM_CUDA_RUNTIME_BIN_DIR}/*.dll")
+    foreach(_cuda_dll IN LISTS VELLUM_CUDA_RUNTIME_DLLS)
+        add_custom_command(TARGET MangaFlowAI POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_cuda_dll}"
+                "$<TARGET_FILE_DIR:MangaFlowAI>"
+            COMMENT "Copying CUDA Runtime DLL: ${_cuda_dll}"
+        )
+    endforeach()
+endif()
 
 # ------------------------------------------------------------------------------
 # 7. Root One-Click Native Launcher (`Manga/Vellum.exe`)
@@ -378,6 +393,12 @@ add_executable(vellum_det_bench
     src/detector/detector_types.hpp
     src/detector/detector_engine.hpp
     src/detector/detector_engine.cpp
+    src/detector/cv_refinement.hpp
+    src/detector/cv_refinement.cpp
+    src/detector/cv_typography.hpp
+    src/detector/cv_typography.cpp
+    src/detector/cv_geometry.hpp
+    src/detector/cv_geometry.cpp
     src/detector/geometry_postproc.hpp
     src/detector/geometry_postproc.cpp
     src/detector/yolo_seg_backend.hpp
@@ -389,6 +410,7 @@ add_executable(vellum_det_bench
     src/detector/export_artifacts.hpp
     src/detector/export_artifacts.cpp
     src/pipeline/detector.cpp
+    src/pipeline/ort_provider.cpp
     src/pipeline/model_manager.cpp
 )
 
@@ -429,4 +451,89 @@ target_link_libraries(vellum_det_bench PRIVATE
     dxgi
     winhttp
     ws2_32
+)
+
+# ------------------------------------------------------------------------------
+# 9. Standalone Layered PSD Writer Unit Test (`test_psd_writer.exe`)
+# ------------------------------------------------------------------------------
+add_executable(test_psd_writer
+    tests/test_psd_writer.cpp
+    src/psd_writer.hpp
+    src/psd_writer.cpp
+)
+
+target_compile_features(test_psd_writer PRIVATE cxx_std_17)
+
+if(MSVC)
+    target_compile_options(test_psd_writer PRIVATE
+        /W4
+        /utf-8
+        /permissive-
+        /EHsc
+        $<$<CONFIG:Release>:/O2>
+        $<$<CONFIG:Release>:/GL>
+        $<$<CONFIG:Release>:/Gy>
+        $<$<CONFIG:Release>:/Gw>
+    )
+    target_link_options(test_psd_writer PRIVATE
+        $<$<CONFIG:Release>:/LTCG>
+        $<$<CONFIG:Release>:/INCREMENTAL:NO>
+        $<$<CONFIG:Release>:/OPT:REF>
+        $<$<CONFIG:Release>:/OPT:ICF>
+    )
+endif()
+
+target_link_libraries(test_psd_writer PRIVATE
+    stb::headers
+)
+
+# ------------------------------------------------------------------------------
+# 10. v2.5 Studio Core Execution-Based Audit & Regression Suite (`test_v25_audit.exe`)
+# ------------------------------------------------------------------------------
+add_executable(test_v25_audit
+    tests/test_v25_audit.cpp
+    src/settings_manager.cpp
+    src/exporter.cpp
+    src/detector/cv_refinement.cpp
+    src/detector/cv_typography.cpp
+    src/detector/cv_geometry.cpp
+    src/detector/geometry_postproc.cpp
+    src/pipeline/ort_provider.cpp
+    src/pipeline/model_manager.cpp
+    src/pipeline/detector.cpp
+    src/pipeline/ocr.cpp
+    src/pipeline/inpainter.cpp
+    src/pipeline/translator.cpp
+)
+
+target_compile_features(test_v25_audit PRIVATE cxx_std_17)
+
+target_compile_definitions(test_v25_audit PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    _WIN32_WINNT=0x0A00
+    MANGAFLOW_HAS_DML=${MANGAFLOW_HAS_DML}
+)
+
+if(MSVC)
+    target_compile_options(test_v25_audit PRIVATE
+        /W4
+        /utf-8
+        /permissive-
+        /EHsc
+        /MP
+        $<$<CONFIG:Release>:/O2>
+    )
+endif()
+
+target_link_libraries(test_v25_audit PRIVATE
+    httplib::httplib
+    nlohmann_json::nlohmann_json
+    onnxruntime::onnxruntime
+    miniz_static
+    stb::headers
+    ws2_32
+    dxgi
+    winhttp
+    crypt32
 )

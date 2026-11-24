@@ -1,5 +1,8 @@
 #include "settings_manager.hpp"
+#include "pipeline/ort_provider.hpp"
 #include "utils.hpp"
+
+#include <wincrypt.h>
 
 #include <algorithm>
 #include <cmath>
@@ -44,12 +47,9 @@ struct TargetLanguageSpec {
 
 const std::vector<ProviderPreset>& provider_presets() {
     static const std::vector<ProviderPreset> kPresets = {
-        {"lmstudio", "LM Studio (Local)", "http://localhost:1235/v1",
-         "Gemma 4 E2B Uncensored HauhauCS Aggressive Q4 K P", "lm-studio",
-         false, true, true, "openai", true, true, true, true, true},
-        {"ollama", "Ollama (Local)", "http://localhost:11434/v1",
-         "qwen2.5:7b", "ollama",
-         false, true, true, "openai", true, true, true, true, true},
+        {"none", "None (Manual / No-LLM)", "",
+         "", "",
+         false, false, true, "none", false, false, false, false, false},
         {"openai", "OpenAI", "https://api.openai.com/v1",
          "gpt-4o-mini", "",
          true, true, false, "openai", true, true, false, true, true},
@@ -65,6 +65,12 @@ const std::vector<ProviderPreset>& provider_presets() {
         {"openrouter", "OpenRouter", "https://openrouter.ai/api/v1",
          "google/gemini-2.5-flash", "",
          true, true, false, "openai", true, true, true, true, true},
+        {"lmstudio", "LM Studio (Local)", "http://localhost:1234/v1",
+         "", "",
+         false, true, true, "openai", true, true, true, true, true},
+        {"ollama", "Ollama (Local)", "http://localhost:11434/v1",
+         "qwen2.5:7b", "",
+         false, true, true, "openai", true, true, true, true, true},
         {"custom", "Custom (OpenAI-Compatible)", "",
          "", "",
          false, true, false, "openai", true, true, true, true, true},
@@ -84,9 +90,15 @@ const ProviderPreset& find_provider_preset(const std::string& id) {
 std::string normalize_provider_id(const std::string& raw) {
     const std::string cleaned = util::to_lower_ascii(util::trim_ascii(raw));
     if (cleaned.empty()) {
-        return "lmstudio";
+        return "none";
     }
     static const std::unordered_map<std::string, std::string> kAliases = {
+        {"none", "none"},
+        {"manual", "none"},
+        {"disabled", "none"},
+        {"off", "none"},
+        {"no-llm", "none"},
+        {"no_llm", "none"},
         {"lmstudio", "lmstudio"},
         {"lm-studio", "lmstudio"},
         {"lm_studio", "lmstudio"},
@@ -461,9 +473,105 @@ std::string format_font_family_stack(const std::vector<std::string>& chain) {
     return joined;
 }
 
+constexpr const char* kDpapiPrefix = "dpapi:";
+
+std::string dpapi_encrypt_secret(const std::string& plaintext) {
+    if (plaintext.empty()) {
+        return "";
+    }
+    if (plaintext.rfind(kDpapiPrefix, 0) == 0) {
+        return plaintext;
+    }
+    DATA_BLOB in_blob{};
+    in_blob.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(plaintext.data()));
+    in_blob.cbData = static_cast<DWORD>(plaintext.size());
+    DATA_BLOB out_blob{};
+    if (!CryptProtectData(
+            &in_blob,
+            L"VellumApiKey",
+            nullptr,
+            nullptr,
+            nullptr,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &out_blob)) {
+        return plaintext;
+    }
+    std::string encoded = std::string(kDpapiPrefix) +
+                          util::base64_encode(out_blob.pbData, out_blob.cbData);
+    LocalFree(out_blob.pbData);
+    return encoded;
+}
+
+std::string dpapi_decrypt_secret(const std::string& stored) {
+    if (stored.empty()) {
+        return "";
+    }
+    if (stored.rfind(kDpapiPrefix, 0) != 0) {
+        // Legacy plaintext key from v2.0.0 settings.json -> pass through cleanly
+        return stored;
+    }
+    const auto decoded = util::base64_decode(
+        std::string_view(stored).substr(std::char_traits<char>::length(kDpapiPrefix)));
+    if (!decoded.has_value() || decoded->empty()) {
+        return "";
+    }
+    DATA_BLOB in_blob{};
+    in_blob.pbData = const_cast<BYTE*>(decoded->data());
+    in_blob.cbData = static_cast<DWORD>(decoded->size());
+    DATA_BLOB out_blob{};
+    if (!CryptUnprotectData(
+            &in_blob,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &out_blob)) {
+        return "";
+    }
+    std::string plaintext(reinterpret_cast<const char*>(out_blob.pbData), out_blob.cbData);
+    LocalFree(out_blob.pbData);
+    return plaintext;
+}
+
+void decrypt_settings_secrets(json& obj) {
+    if (!obj.is_object()) return;
+    if (obj.contains("api_key") && obj["api_key"].is_string()) {
+        obj["api_key"] = dpapi_decrypt_secret(obj["api_key"].get<std::string>());
+    }
+    if (obj.contains("providers") && obj["providers"].is_object()) {
+        for (auto it = obj["providers"].begin(); it != obj["providers"].end(); ++it) {
+            if (it.value().is_object() &&
+                it.value().contains("api_key") &&
+                it.value()["api_key"].is_string()) {
+                it.value()["api_key"] = dpapi_decrypt_secret(it.value()["api_key"].get<std::string>());
+            }
+        }
+    }
+}
+
+void encrypt_settings_secrets(json& obj) {
+    if (!obj.is_object()) return;
+    if (obj.contains("api_key") && obj["api_key"].is_string()) {
+        obj["api_key"] = dpapi_encrypt_secret(obj["api_key"].get<std::string>());
+    }
+    if (obj.contains("providers") && obj["providers"].is_object()) {
+        for (auto it = obj["providers"].begin(); it != obj["providers"].end(); ++it) {
+            if (it.value().is_object() &&
+                it.value().contains("api_key") &&
+                it.value()["api_key"].is_string()) {
+                it.value()["api_key"] = dpapi_encrypt_secret(it.value()["api_key"].get<std::string>());
+            }
+        }
+    }
+}
+
 json build_default_provider_profiles() {
     json profiles = json::object();
     for (const auto& preset : provider_presets()) {
+        if (std::string_view(preset.id) == "none") {
+            continue;
+        }
         profiles[preset.id] = {
             {"base_url", preset.default_base_url},
             {"api_key", preset.default_api_key},
@@ -665,12 +773,13 @@ std::string SettingsManager::normalize_inpainting_model(const std::string& raw) 
 }
 
 json SettingsManager::build_default_settings() {
-    const auto& lm = find_provider_preset("lmstudio");
+    const auto hw = pipeline::detect_hardware_capabilities(/*force_cpu=*/false);
     return {
-        {"provider", "lmstudio"},
-        {"base_url", lm.default_base_url},
-        {"api_key", lm.default_api_key},
-        {"model", lm.default_model},
+        {"active_provider", "none"},
+        {"provider", "none"},
+        {"base_url", ""},
+        {"api_key", ""},
+        {"model", ""},
         {"timeout", 90.0},
         {"source_lang", "ja"},
         {"target_lang", "id"},
@@ -691,8 +800,8 @@ json SettingsManager::build_default_settings() {
         {"theme", "dark"},
         {"accent_color", "amber"},
         {"ui_density", "compact"},
-        // Tab 2: Pipeline (Vellum YOLO11m-Seg default + Smart Hybrid GPU/CPU settings)
-        {"detection_model", "vellum-det-yolo11m-seg-1024-fp16"},
+        // Tab 2: Pipeline (Hardware-aware defaults + Smart Hybrid GPU/CPU settings)
+        {"detection_model", hw.recommended_detection_model},
         {"text_threshold", nullptr},
         {"bubble_threshold", nullptr},
         {"panel_threshold", nullptr},
@@ -703,7 +812,8 @@ json SettingsManager::build_default_settings() {
         {"ocr_model", "auto"},
         {"inpainting_model", "lama-manga"},
         {"inpaint_api_url", "http://127.0.0.1:8188"},
-        {"execution_mode", "hybrid"},
+        {"execution_mode", hw.recommended_execution_mode},
+        {"preferred_backend", "auto"},
         {"conf_threshold", 0.35},
         {"nms_threshold", 0.45},
         {"mask_threshold", 0.5},
@@ -712,10 +822,17 @@ json SettingsManager::build_default_settings() {
         {"reading_order", "auto"},
         {"auto_unload_vram", true},
         {"refine_mask", true},
+        // v2.5 Studio Core feature flags (backward-compatible, default true)
+        {"enable_3tier_inpaint", hw.recommended_3tier_inpaint},
+        {"enable_tone_match", true},
+        {"enable_cv_style_detect", true},
+        {"enable_waist_cut", true},
+        {"enable_hyphenation", true},
         // Tab 5: Typesetting
         {"font_family", R"("CC Wild Words", "Anime Ace", "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans", sans-serif)"},
         {"font_fallback_chain", json::array({"CC Wild Words", "Anime Ace", "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans", "sans-serif"})},
         {"auto_fit_font_size", true},
+        {"auto_tilt_text", false},
         {"default_font_size", 18},
         {"default_stroke_width", 4.0},
         {"default_stroke_color", "#ffffff"},
@@ -740,6 +857,7 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
             if (!it.value().is_object()) continue;
             try {
                 const std::string norm_pid = normalize_provider_id(it.key());
+                if (norm_pid == "none") continue;
                 const auto& preset = find_provider_preset(norm_pid);
                 profiles[norm_pid] = {
                     {"base_url", it.value().value("base_url", std::string(preset.default_base_url))},
@@ -757,6 +875,7 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
             if (!it.value().is_object()) continue;
             try {
                 const std::string norm_pid = normalize_provider_id(it.key());
+                if (norm_pid == "none") continue;
                 json& cur_prof = profiles[norm_pid];
                 if (it.value().contains("base_url") && !it.value()["base_url"].is_null()) {
                     cur_prof["base_url"] = util::trim_ascii(json_to_string(it.value()["base_url"]));
@@ -772,56 +891,65 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         }
     }
 
-    const std::string prev_provider = current.value("provider", std::string("lmstudio"));
+    const std::string prev_provider = normalize_provider_id(
+        current.value("active_provider", current.value("provider", std::string("none"))));
     std::string active_provider = prev_provider;
-    if (raw.contains("provider") && !raw["provider"].is_null()) {
+    if (raw.contains("active_provider") && !raw["active_provider"].is_null()) {
+        active_provider = normalize_provider_id(json_to_string(raw["active_provider"]));
+    } else if (raw.contains("provider") && !raw["provider"].is_null()) {
         active_provider = normalize_provider_id(json_to_string(raw["provider"]));
     }
 
     const bool provider_switched = (active_provider != prev_provider);
     const auto& preset = find_provider_preset(active_provider);
-    const json active_profile = profiles[active_provider];
 
     std::string base_url;
-    if (raw.contains("base_url") && !raw["base_url"].is_null()) {
-        base_url = normalize_provider_base_url(active_provider, json_to_string(raw["base_url"]));
-    } else if (provider_switched) {
-        base_url = normalize_provider_base_url(active_provider, active_profile.value("base_url", std::string("")));
-    } else {
-        base_url = normalize_provider_base_url(active_provider, current.value("base_url", std::string("")));
-    }
-
     std::string api_key;
-    if (raw.contains("api_key") && !raw["api_key"].is_null()) {
-        api_key = util::trim_ascii(json_to_string(raw["api_key"]));
-        if (api_key.empty() && std::string(preset.default_api_key).size() > 0) {
-            api_key = preset.default_api_key;
-        }
-    } else if (provider_switched) {
-        api_key = active_profile.value("api_key", std::string(preset.default_api_key));
-    } else {
-        api_key = current.value("api_key", std::string(preset.default_api_key));
-    }
-
     std::string model;
-    if (raw.contains("model") && !raw["model"].is_null()) {
-        model = util::trim_ascii(json_to_string(raw["model"]));
-        if (model.empty() && !provider_switched) {
-            model = preset.default_model;
-        }
-    } else if (provider_switched) {
-        model = active_profile.value("model", std::string(""));
-        if (model.empty()) model = preset.default_model;
-    } else {
-        model = current.value("model", std::string(""));
-        if (model.empty()) model = preset.default_model;
-    }
 
-    profiles[active_provider] = {
-        {"base_url", base_url},
-        {"api_key", api_key},
-        {"model", model},
-    };
+    if (active_provider != "none") {
+        const json active_profile = profiles.contains(active_provider) && profiles[active_provider].is_object()
+            ? profiles[active_provider]
+            : json::object();
+
+        if (raw.contains("base_url") && !raw["base_url"].is_null()) {
+            base_url = normalize_provider_base_url(active_provider, json_to_string(raw["base_url"]));
+        } else if (provider_switched) {
+            base_url = normalize_provider_base_url(active_provider, active_profile.value("base_url", std::string("")));
+        } else {
+            base_url = normalize_provider_base_url(active_provider, current.value("base_url", std::string("")));
+        }
+
+        if (raw.contains("api_key") && !raw["api_key"].is_null()) {
+            api_key = util::trim_ascii(json_to_string(raw["api_key"]));
+            if (api_key.empty() && std::string(preset.default_api_key).size() > 0) {
+                api_key = preset.default_api_key;
+            }
+        } else if (provider_switched) {
+            api_key = active_profile.value("api_key", std::string(preset.default_api_key));
+        } else {
+            api_key = current.value("api_key", std::string(preset.default_api_key));
+        }
+
+        if (raw.contains("model") && !raw["model"].is_null()) {
+            model = util::trim_ascii(json_to_string(raw["model"]));
+            if (model.empty() && !provider_switched) {
+                model = preset.default_model;
+            }
+        } else if (provider_switched) {
+            model = active_profile.value("model", std::string(""));
+            if (model.empty()) model = preset.default_model;
+        } else {
+            model = current.value("model", std::string(""));
+            if (model.empty()) model = preset.default_model;
+        }
+
+        profiles[active_provider] = {
+            {"base_url", base_url},
+            {"api_key", api_key},
+            {"model", model},
+        };
+    }
 
     std::string source_lang = current.value("source_lang", std::string("ja"));
     if (raw.contains("source_lang") && !raw["source_lang"].is_null()) {
@@ -895,7 +1023,9 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
 
     const bool strip_thinking = (raw.contains("strip_thinking") && !raw["strip_thinking"].is_null())
         ? coerce_bool(raw["strip_thinking"], current.value("strip_thinking", true))
-        : current.value("strip_thinking", true);
+        : ((raw.contains("strip_think_tags") && !raw["strip_think_tags"].is_null())
+            ? coerce_bool(raw["strip_think_tags"], current.value("strip_thinking", true))
+            : current.value("strip_thinking", true));
 
     // Tab 1: Appearance
     std::string theme = current.value("theme", std::string("dark"));
@@ -986,6 +1116,14 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
     }
     util::set_env_utf8(L"MANGA_FORCE_CPU", execution_mode == "cpu_only" ? "1" : "0");
 
+    std::string preferred_backend = pipeline::normalize_preferred_backend(
+        current.value("preferred_backend", std::string("auto")));
+    if (raw.contains("preferred_backend") && !raw["preferred_backend"].is_null()) {
+        preferred_backend = pipeline::normalize_preferred_backend(
+            json_to_string(raw["preferred_backend"]));
+    }
+    pipeline::set_preferred_backend(preferred_backend);
+
     const double conf_threshold = (raw.contains("conf_threshold") && !raw["conf_threshold"].is_null())
         ? clamp_double(raw["conf_threshold"], 0.05, 0.95, current.value("conf_threshold", 0.35))
         : current.value("conf_threshold", 0.35);
@@ -1019,6 +1157,27 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
     const bool refine_mask = (raw.contains("refine_mask") && !raw["refine_mask"].is_null())
         ? coerce_bool(raw["refine_mask"], current.value("refine_mask", true))
         : current.value("refine_mask", true);
+
+    // v2.5 Studio Core feature flags (backward-compatible, default true)
+    const bool enable_3tier_inpaint = (raw.contains("enable_3tier_inpaint") && !raw["enable_3tier_inpaint"].is_null())
+        ? coerce_bool(raw["enable_3tier_inpaint"], current.value("enable_3tier_inpaint", true))
+        : current.value("enable_3tier_inpaint", true);
+
+    const bool enable_tone_match = (raw.contains("enable_tone_match") && !raw["enable_tone_match"].is_null())
+        ? coerce_bool(raw["enable_tone_match"], current.value("enable_tone_match", true))
+        : current.value("enable_tone_match", true);
+
+    const bool enable_cv_style_detect = (raw.contains("enable_cv_style_detect") && !raw["enable_cv_style_detect"].is_null())
+        ? coerce_bool(raw["enable_cv_style_detect"], current.value("enable_cv_style_detect", true))
+        : current.value("enable_cv_style_detect", true);
+
+    const bool enable_waist_cut = (raw.contains("enable_waist_cut") && !raw["enable_waist_cut"].is_null())
+        ? coerce_bool(raw["enable_waist_cut"], current.value("enable_waist_cut", true))
+        : current.value("enable_waist_cut", true);
+
+    const bool enable_hyphenation = (raw.contains("enable_hyphenation") && !raw["enable_hyphenation"].is_null())
+        ? coerce_bool(raw["enable_hyphenation"], current.value("enable_hyphenation", true))
+        : current.value("enable_hyphenation", true);
 
     // Tab 5: Typesetting
     std::vector<std::string> font_fallback_chain;
@@ -1077,6 +1236,10 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         ? coerce_bool(raw["auto_fit_font_size"], current.value("auto_fit_font_size", true))
         : current.value("auto_fit_font_size", true);
 
+    const bool auto_tilt_text = (raw.contains("auto_tilt_text") && !raw["auto_tilt_text"].is_null())
+        ? coerce_bool(raw["auto_tilt_text"], current.value("auto_tilt_text", false))
+        : current.value("auto_tilt_text", false);
+
     const int default_font_size = (raw.contains("default_font_size") && !raw["default_font_size"].is_null())
         ? clamp_int(raw["default_font_size"], 8, 96, current.value("default_font_size", 18))
         : current.value("default_font_size", 18);
@@ -1112,6 +1275,7 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         : current.value("all_caps", false);
 
     return {
+        {"active_provider", active_provider},
         {"provider", active_provider},
         {"base_url", base_url},
         {"api_key", api_key},
@@ -1147,6 +1311,7 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         {"inpainting_model", inpainting_model},
         {"inpaint_api_url", inpaint_api_url},
         {"execution_mode", execution_mode},
+        {"preferred_backend", preferred_backend},
         {"conf_threshold", conf_threshold},
         {"nms_threshold", nms_threshold},
         {"mask_threshold", mask_threshold},
@@ -1155,9 +1320,15 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         {"reading_order", reading_order},
         {"auto_unload_vram", auto_unload_vram},
         {"refine_mask", refine_mask},
+        {"enable_3tier_inpaint", enable_3tier_inpaint},
+        {"enable_tone_match", enable_tone_match},
+        {"enable_cv_style_detect", enable_cv_style_detect},
+        {"enable_waist_cut", enable_waist_cut},
+        {"enable_hyphenation", enable_hyphenation},
         {"font_family", font_family},
         {"font_fallback_chain", font_fallback_chain},
         {"auto_fit_font_size", auto_fit_font_size},
+        {"auto_tilt_text", auto_tilt_text},
         {"default_font_size", default_font_size},
         {"default_stroke_width", default_stroke_width},
         {"default_stroke_color", default_stroke_color},
@@ -1188,8 +1359,9 @@ json SettingsManager::load(bool force_reload) {
     }
 
     try {
-        const json parsed = json::parse(bytes->begin(), bytes->end());
+        json parsed = json::parse(bytes->begin(), bytes->end());
         if (parsed.is_object()) {
+            decrypt_settings_secrets(parsed);
             cache_ = sanitize_and_merge(parsed, defaults);
         } else {
             cache_ = defaults;
@@ -1202,7 +1374,9 @@ json SettingsManager::load(bool force_reload) {
 }
 
 void SettingsManager::save_locked(const json& settings) {
-    const std::string serialized = settings.dump(2) + "\n";
+    json on_disk = settings;
+    encrypt_settings_secrets(on_disk);
+    const std::string serialized = on_disk.dump(2) + "\n";
     std::string err;
     if (!util::atomic_write_bytes(path_, serialized.data(), serialized.size(), &err)) {
         throw std::runtime_error("Failed to persist settings to disk: " + err);
@@ -1221,8 +1395,13 @@ json SettingsManager::update(const json& patch) {
         if (fs::is_regular_file(path_, ec) && !ec) {
             if (const auto bytes = util::read_file_bytes(path_)) {
                 try {
-                    const json parsed = json::parse(bytes->begin(), bytes->end());
-                    current = parsed.is_object() ? sanitize_and_merge(parsed, defaults) : defaults;
+                    json parsed = json::parse(bytes->begin(), bytes->end());
+                    if (parsed.is_object()) {
+                        decrypt_settings_secrets(parsed);
+                        current = sanitize_and_merge(parsed, defaults);
+                    } else {
+                        current = defaults;
+                    }
                 } catch (...) {
                     current = defaults;
                 }
@@ -1253,9 +1432,11 @@ json SettingsManager::format_api_response(const json& settings) const {
 
 json SettingsManager::get_active_provider_summary() {
     const json s = load();
-    const std::string pid = s.value("provider", std::string("lmstudio"));
+    const std::string pid = normalize_provider_id(
+        s.value("active_provider", s.value("provider", std::string("none"))));
     const auto& preset = find_provider_preset(pid);
     return {
+        {"active_provider", pid},
         {"provider", pid},
         {"provider_name", preset.name},
         {"endpoint", s.value("base_url", std::string(preset.default_base_url))},

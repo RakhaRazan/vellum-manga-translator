@@ -2,6 +2,7 @@
 
 #include "inpainter.hpp"
 #include "detector.hpp"
+#include "../detector/cv_typography.hpp"
 #include "../utils.hpp"
 
 #ifdef _MSC_VER
@@ -258,6 +259,496 @@ void stbi_write_vec_callback(void* context, void* data, int size) {
     vec->insert(vec->end(), bytes, bytes + size);
 }
 
+// -----------------------------------------------------------------------------
+// Pure-C++ Telea Fast-Marching Method (FMM) Inpainter (Tier 2 CPU-First)
+// -----------------------------------------------------------------------------
+
+enum TeleaState : uint8_t {
+    kTeleaKnown = 0,
+    kTeleaBand = 1,
+    kTeleaInside = 2,
+};
+
+inline float solve_eikonal_2d(
+    int x1, int y1, int x2, int y2,
+    int w, int h,
+    const std::vector<uint8_t>& state,
+    const std::vector<float>& dist) {
+    constexpr float kLarge = 1.0e6f;
+    float t1 = kLarge;
+    float t2 = kLarge;
+    if (x1 >= 0 && x1 < w && y1 >= 0 && y1 < h) {
+        const size_t i1 = static_cast<size_t>(y1) * static_cast<size_t>(w) + static_cast<size_t>(x1);
+        if (state[i1] == kTeleaKnown) t1 = dist[i1];
+    }
+    if (x2 >= 0 && x2 < w && y2 >= 0 && y2 < h) {
+        const size_t i2 = static_cast<size_t>(y2) * static_cast<size_t>(w) + static_cast<size_t>(x2);
+        if (state[i2] == kTeleaKnown) t2 = dist[i2];
+    }
+    if (t1 >= kLarge && t2 >= kLarge) return kLarge;
+    if (t1 >= kLarge) return t2 + 1.0f;
+    if (t2 >= kLarge) return t1 + 1.0f;
+
+    const float diff = t1 - t2;
+    const float r = 2.0f - diff * diff;
+    if (r >= 0.0f) {
+        const float s = 0.5f * (t1 + t2 + std::sqrt(r));
+        if (s >= t1 && s >= t2) return s;
+    }
+    return std::min(t1, t2) + 1.0f;
+}
+
+void telea_inpaint_crop(
+    std::vector<uint8_t>& crop_rgb,
+    const std::vector<uint8_t>& hole_mask,
+    const std::vector<uint8_t>& exclude_mask,
+    int w,
+    int h,
+    float radius) {
+    if (w <= 0 || h <= 0) return;
+    const size_t total = static_cast<size_t>(w) * static_cast<size_t>(h);
+    constexpr float kLarge = 1.0e6f;
+    const int rad_i = std::max(1, static_cast<int>(std::ceil(radius)));
+    const float rad_sq = radius * radius;
+
+    std::vector<uint8_t> state(total, kTeleaKnown);
+    std::vector<float> dist(total, 0.0f);
+    std::vector<float> img_f(total * 3ULL, 0.0f);
+    for (size_t i = 0; i < total; ++i) {
+        img_f[i * 3 + 0] = static_cast<float>(crop_rgb[i * 3 + 0]);
+        img_f[i * 3 + 1] = static_cast<float>(crop_rgb[i * 3 + 1]);
+        img_f[i * 3 + 2] = static_cast<float>(crop_rgb[i * 3 + 2]);
+        if (hole_mask[i] > 0) {
+            state[i] = kTeleaInside;
+            dist[i] = kLarge;
+        }
+    }
+
+    struct HeapItem {
+        float t;
+        int idx;
+        bool operator>(const HeapItem& o) const noexcept { return t > o.t; }
+    };
+    std::priority_queue<HeapItem, std::vector<HeapItem>, std::greater<HeapItem>> heap;
+
+    static constexpr int kDx4[4] = {-1, 1, 0, 0};
+    static constexpr int kDy4[4] = {0, 0, -1, 1};
+
+    auto compute_t = [&](int x, int y) -> float {
+        float t = kLarge;
+        t = std::min(t, solve_eikonal_2d(x - 1, y, x, y - 1, w, h, state, dist));
+        t = std::min(t, solve_eikonal_2d(x + 1, y, x, y - 1, w, h, state, dist));
+        t = std::min(t, solve_eikonal_2d(x - 1, y, x, y + 1, w, h, state, dist));
+        t = std::min(t, solve_eikonal_2d(x + 1, y, x, y + 1, w, h, state, dist));
+        return t;
+    };
+
+    // Seed narrow band with INSIDE pixels adjacent to KNOWN pixels
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x);
+            if (state[idx] != kTeleaInside) continue;
+            bool touches_known = false;
+            for (int k = 0; k < 4; ++k) {
+                const int nx = x + kDx4[k];
+                const int ny = y + kDy4[k];
+                if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                    const size_t nidx = static_cast<size_t>(ny) * static_cast<size_t>(w) + static_cast<size_t>(nx);
+                    if (state[nidx] == kTeleaKnown) {
+                        touches_known = true;
+                        break;
+                    }
+                }
+            }
+            if (touches_known) {
+                state[idx] = kTeleaBand;
+                dist[idx] = 1.0f;
+                heap.push({1.0f, static_cast<int>(idx)});
+            }
+        }
+    }
+
+    auto inpaint_pixel = [&](int qx, int qy) {
+        const size_t qidx = static_cast<size_t>(qy) * static_cast<size_t>(w) + static_cast<size_t>(qx);
+        const float tq = dist[qidx];
+
+        // Estimate gradT at q from known 4-neighbors
+        float grad_tx = 0.0f;
+        float grad_ty = 0.0f;
+        const bool has_l = (qx > 0 && state[qidx - 1] == kTeleaKnown);
+        const bool has_r = (qx + 1 < w && state[qidx + 1] == kTeleaKnown);
+        if (has_l && has_r) grad_tx = 0.5f * (dist[qidx + 1] - dist[qidx - 1]);
+        else if (has_r) grad_tx = dist[qidx + 1] - tq;
+        else if (has_l) grad_tx = tq - dist[qidx - 1];
+
+        const bool has_u = (qy > 0 && state[qidx - static_cast<size_t>(w)] == kTeleaKnown);
+        const bool has_d = (qy + 1 < h && state[qidx + static_cast<size_t>(w)] == kTeleaKnown);
+        if (has_u && has_d) grad_ty = 0.5f * (dist[qidx + static_cast<size_t>(w)] - dist[qidx - static_cast<size_t>(w)]);
+        else if (has_d) grad_ty = dist[qidx + static_cast<size_t>(w)] - tq;
+        else if (has_u) grad_ty = tq - dist[qidx - static_cast<size_t>(w)];
+
+        double num[3] = {0.0, 0.0, 0.0};
+        double w_sum = 0.0;
+
+        const int py0 = std::max(0, qy - rad_i);
+        const int py1 = std::min(h - 1, qy + rad_i);
+        const int px0 = std::max(0, qx - rad_i);
+        const int px1 = std::min(w - 1, qx + rad_i);
+
+        for (int py = py0; py <= py1; ++py) {
+            const float ry = static_cast<float>(qy - py);
+            const size_t prow = static_cast<size_t>(py) * static_cast<size_t>(w);
+            for (int px = px0; px <= px1; ++px) {
+                const float rx = static_cast<float>(qx - px);
+                const float d2 = rx * rx + ry * ry;
+                if (d2 <= 0.0f || d2 > rad_sq) continue;
+                const size_t pidx = prow + static_cast<size_t>(px);
+                if (state[pidx] != kTeleaKnown) continue;
+                if (!exclude_mask.empty() && exclude_mask[pidx] > 0) continue;
+
+                const float d = std::sqrt(d2);
+                float w_dir = std::fabs(rx * grad_tx + ry * grad_ty) / d;
+                if (w_dir < 1.0e-6f) w_dir = 1.0e-6f;
+                const float w_dst = 1.0f / d2;
+                const float w_lev = 1.0f / (1.0f + std::fabs(tq - dist[pidx]));
+                const double wt = static_cast<double>(w_dir) * static_cast<double>(w_dst) * static_cast<double>(w_lev);
+
+                // First-order Taylor gradient extrapolation from known neighbors of p
+                const bool pl = (px > 0 && state[pidx - 1] == kTeleaKnown &&
+                                 (exclude_mask.empty() || exclude_mask[pidx - 1] == 0));
+                const bool pr = (px + 1 < w && state[pidx + 1] == kTeleaKnown &&
+                                 (exclude_mask.empty() || exclude_mask[pidx + 1] == 0));
+                const bool pu = (py > 0 && state[pidx - static_cast<size_t>(w)] == kTeleaKnown &&
+                                 (exclude_mask.empty() || exclude_mask[pidx - static_cast<size_t>(w)] == 0));
+                const bool pd = (py + 1 < h && state[pidx + static_cast<size_t>(w)] == kTeleaKnown &&
+                                 (exclude_mask.empty() || exclude_mask[pidx + static_cast<size_t>(w)] == 0));
+
+                for (int c = 0; c < 3; ++c) {
+                    const float ip = img_f[pidx * 3 + c];
+                    float gx_i = 0.0f;
+                    float gy_i = 0.0f;
+                    if (pl && pr) {
+                        gx_i = 0.5f * (img_f[(pidx + 1) * 3 + c] - img_f[(pidx - 1) * 3 + c]);
+                    } else if (pr) {
+                        gx_i = img_f[(pidx + 1) * 3 + c] - ip;
+                    } else if (pl) {
+                        gx_i = ip - img_f[(pidx - 1) * 3 + c];
+                    }
+                    if (pu && pd) {
+                        gy_i = 0.5f * (img_f[(pidx + static_cast<size_t>(w)) * 3 + c] -
+                                       img_f[(pidx - static_cast<size_t>(w)) * 3 + c]);
+                    } else if (pd) {
+                        gy_i = img_f[(pidx + static_cast<size_t>(w)) * 3 + c] - ip;
+                    } else if (pu) {
+                        gy_i = ip - img_f[(pidx - static_cast<size_t>(w)) * 3 + c];
+                    }
+                    const float est = clampf(ip + gx_i * rx + gy_i * ry, 0.0f, 255.0f);
+                    num[c] += wt * static_cast<double>(est);
+                }
+                w_sum += wt;
+            }
+        }
+
+        if (w_sum > 1.0e-12) {
+            for (int c = 0; c < 3; ++c) {
+                img_f[qidx * 3 + c] = clampf(static_cast<float>(num[c] / w_sum), 0.0f, 255.0f);
+            }
+        }
+    };
+
+    while (!heap.empty()) {
+        const HeapItem top = heap.top();
+        heap.pop();
+        const size_t idx = static_cast<size_t>(top.idx);
+        if (state[idx] == kTeleaKnown) continue;
+
+        const int cx = top.idx % w;
+        const int cy = top.idx / w;
+        inpaint_pixel(cx, cy);
+        state[idx] = kTeleaKnown;
+
+        for (int k = 0; k < 4; ++k) {
+            const int nx = cx + kDx4[k];
+            const int ny = cy + kDy4[k];
+            if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+            const size_t nidx = static_cast<size_t>(ny) * static_cast<size_t>(w) + static_cast<size_t>(nx);
+            if (state[nidx] == kTeleaKnown) continue;
+            const float nt = compute_t(nx, ny);
+            if (nt < dist[nidx]) {
+                dist[nidx] = nt;
+                state[nidx] = kTeleaBand;
+                heap.push({nt, static_cast<int>(nidx)});
+            }
+        }
+    }
+
+    for (size_t i = 0; i < total; ++i) {
+        if (hole_mask[i] > 0) {
+            crop_rgb[i * 3 + 0] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(img_f[i * 3 + 0])), 0, 255));
+            crop_rgb[i * 3 + 1] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(img_f[i * 3 + 1])), 0, 255));
+            crop_rgb[i * 3 + 2] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(img_f[i * 3 + 2])), 0, 255));
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Seam Elimination / Tone Match: 4x3 Ridge Affine Color Regression +
+// Separable 1D Gaussian Residual Diffusion (sigma = 24.0 px)
+// -----------------------------------------------------------------------------
+
+void separable_gaussian_blur_f32(
+    const std::vector<float>& src,
+    std::vector<float>& dst,
+    int w,
+    int h,
+    float sigma) {
+    const size_t total = static_cast<size_t>(w) * static_cast<size_t>(h);
+    dst.assign(total, 0.0f);
+    if (w <= 0 || h <= 0 || sigma <= 0.0f) {
+        dst = src;
+        return;
+    }
+
+    const int radius = std::max(1, static_cast<int>(std::ceil(3.0 * static_cast<double>(sigma))));
+    std::vector<float> kernel(static_cast<size_t>(radius + 1), 0.0f);
+    const double inv_2sig2 = 1.0 / (2.0 * static_cast<double>(sigma) * static_cast<double>(sigma));
+    double ksum = 1.0;
+    kernel[0] = 1.0f;
+    for (int d = 1; d <= radius; ++d) {
+        const double val = std::exp(-static_cast<double>(d * d) * inv_2sig2);
+        kernel[static_cast<size_t>(d)] = static_cast<float>(val);
+        ksum += 2.0 * val;
+    }
+    const float inv_ksum = static_cast<float>(1.0 / ksum);
+    for (float& kv : kernel) kv *= inv_ksum;
+
+    std::vector<float> tmp(total, 0.0f);
+
+    // Horizontal pass (clamp-to-edge)
+    for (int y = 0; y < h; ++y) {
+        const float* srow = src.data() + static_cast<size_t>(y) * static_cast<size_t>(w);
+        float* trow = tmp.data() + static_cast<size_t>(y) * static_cast<size_t>(w);
+        for (int x = 0; x < w; ++x) {
+            float acc = srow[x] * kernel[0];
+            for (int d = 1; d <= radius; ++d) {
+                const int xl = (x - d < 0) ? 0 : (x - d);
+                const int xr = (x + d >= w) ? (w - 1) : (x + d);
+                acc += (srow[xl] + srow[xr]) * kernel[static_cast<size_t>(d)];
+            }
+            trow[x] = acc;
+        }
+    }
+
+    // Vertical pass (clamp-to-edge)
+    for (int y = 0; y < h; ++y) {
+        float* drow = dst.data() + static_cast<size_t>(y) * static_cast<size_t>(w);
+        const float* crow = tmp.data() + static_cast<size_t>(y) * static_cast<size_t>(w);
+        const float k0 = kernel[0];
+        for (int x = 0; x < w; ++x) {
+            drow[x] = crow[x] * k0;
+        }
+        for (int d = 1; d <= radius; ++d) {
+            const int yu = (y - d < 0) ? 0 : (y - d);
+            const int yd = (y + d >= h) ? (h - 1) : (y + d);
+            const float* urow = tmp.data() + static_cast<size_t>(yu) * static_cast<size_t>(w);
+            const float* lrow = tmp.data() + static_cast<size_t>(yd) * static_cast<size_t>(w);
+            const float kd = kernel[static_cast<size_t>(d)];
+            for (int x = 0; x < w; ++x) {
+                drow[x] += (urow[x] + lrow[x]) * kd;
+            }
+        }
+    }
+}
+
+bool solve_4x4_ridge_affine(
+    const double A_in[4][4],
+    const double B_in[4][3],
+    double W_out[4][3]) {
+    double M[4][7]{};
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) M[r][c] = A_in[r][c];
+        for (int c = 0; c < 3; ++c) M[r][4 + c] = B_in[r][c];
+    }
+
+    double det = 1.0;
+    for (int col = 0; col < 4; ++col) {
+        int pivot = col;
+        double max_abs = std::fabs(M[col][col]);
+        for (int r = col + 1; r < 4; ++r) {
+            const double v = std::fabs(M[r][col]);
+            if (v > max_abs) {
+                max_abs = v;
+                pivot = r;
+            }
+        }
+        if (max_abs < 1.0e-12) {
+            return false;
+        }
+        if (pivot != col) {
+            for (int c = col; c < 7; ++c) {
+                std::swap(M[col][c], M[pivot][c]);
+            }
+            det = -det;
+        }
+        const double diag = M[col][col];
+        det *= diag;
+        for (int r = col + 1; r < 4; ++r) {
+            const double factor = M[r][col] / diag;
+            M[r][col] = 0.0;
+            for (int c = col + 1; c < 7; ++c) {
+                M[r][c] -= factor * M[col][c];
+            }
+        }
+    }
+
+    if (!std::isfinite(det) || std::fabs(det) < 1.0e-8) {
+        return false;
+    }
+
+    // Back-substitution for all 3 output channels
+    for (int ch = 0; ch < 3; ++ch) {
+        for (int r = 3; r >= 0; --r) {
+            double rhs = M[r][4 + ch];
+            for (int c = r + 1; c < 4; ++c) {
+                rhs -= M[r][c] * W_out[c][ch];
+            }
+            W_out[r][ch] = rhs / M[r][r];
+            if (!std::isfinite(W_out[r][ch])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool apply_tone_match(
+    const uint8_t* src_rgb,
+    std::vector<uint8_t>& pred_rgb,
+    const uint8_t* mask,
+    int w,
+    int h) {
+    if (!src_rgb || !mask || w <= 0 || h <= 0) return false;
+    const size_t total = static_cast<size_t>(w) * static_cast<size_t>(h);
+    if (pred_rgb.size() < total * 3ULL) return false;
+
+    size_t k_count = 0;
+    double A[4][4]{};
+    double B[4][3]{};
+    static constexpr double kInv255 = 1.0 / 255.0;
+
+    for (size_t i = 0; i < total; ++i) {
+        if (mask[i] != 0) continue;
+        ++k_count;
+        const double x[4] = {
+            static_cast<double>(pred_rgb[i * 3 + 0]) * kInv255,
+            static_cast<double>(pred_rgb[i * 3 + 1]) * kInv255,
+            static_cast<double>(pred_rgb[i * 3 + 2]) * kInv255,
+            1.0
+        };
+        const double y[3] = {
+            static_cast<double>(src_rgb[i * 3 + 0]) * kInv255,
+            static_cast<double>(src_rgb[i * 3 + 1]) * kInv255,
+            static_cast<double>(src_rgb[i * 3 + 2]) * kInv255
+        };
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                A[r][c] += x[r] * x[c];
+            }
+            for (int ch = 0; ch < 3; ++ch) {
+                B[r][ch] += x[r] * y[ch];
+            }
+        }
+    }
+
+    // No-op guard: require at least 16 unmasked context pixels
+    if (k_count < 16) {
+        return false;
+    }
+
+    // Normalize normal equations by k_count so ridge lambda is invariant to tile size,
+    // and regularize toward the identity transform (I_3) on the 3x3 RGB diagonal ONLY
+    // (intercept A[3][3] unregularized). This prevents ill-conditioning on grayscale /
+    // rank-1 manga tiles where R ~= G ~= B would otherwise cause large off-diagonal
+    // cancellation weights and clamping artifacts inside the inpainted hole.
+    const double inv_k = 1.0 / static_cast<double>(k_count);
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            A[r][c] *= inv_k;
+        }
+        for (int ch = 0; ch < 3; ++ch) {
+            B[r][ch] *= inv_k;
+        }
+    }
+    static constexpr double kRidgeLambda = 0.01;
+    for (int c = 0; c < 3; ++c) {
+        A[c][c] += kRidgeLambda;
+        B[c][c] += kRidgeLambda;
+    }
+
+    double W[4][3]{};
+    if (!solve_4x4_ridge_affine(A, B, W)) {
+        return false;
+    }
+
+    // Compute affine-matched image and context residuals r_c = I_src - I_affine
+    std::vector<float> aff_r(total, 0.0f);
+    std::vector<float> aff_g(total, 0.0f);
+    std::vector<float> aff_b(total, 0.0f);
+    std::vector<float> weight_map(total, 0.0f);
+    std::vector<float> res_r(total, 0.0f);
+    std::vector<float> res_g(total, 0.0f);
+    std::vector<float> res_b(total, 0.0f);
+
+    for (size_t i = 0; i < total; ++i) {
+        const double p0 = static_cast<double>(pred_rgb[i * 3 + 0]) * kInv255;
+        const double p1 = static_cast<double>(pred_rgb[i * 3 + 1]) * kInv255;
+        const double p2 = static_cast<double>(pred_rgb[i * 3 + 2]) * kInv255;
+
+        const float ar = static_cast<float>(W[0][0] * p0 + W[1][0] * p1 + W[2][0] * p2 + W[3][0]);
+        const float ag = static_cast<float>(W[0][1] * p0 + W[1][1] * p1 + W[2][1] * p2 + W[3][1]);
+        const float ab = static_cast<float>(W[0][2] * p0 + W[1][2] * p1 + W[2][2] * p2 + W[3][2]);
+        aff_r[i] = ar;
+        aff_g[i] = ag;
+        aff_b[i] = ab;
+
+        if (mask[i] == 0) {
+            weight_map[i] = 1.0f;
+            res_r[i] = static_cast<float>(static_cast<double>(src_rgb[i * 3 + 0]) * kInv255) - ar;
+            res_g[i] = static_cast<float>(static_cast<double>(src_rgb[i * 3 + 1]) * kInv255) - ag;
+            res_b[i] = static_cast<float>(static_cast<double>(src_rgb[i * 3 + 2]) * kInv255) - ab;
+        }
+    }
+
+    // Diffuse residuals across the hole via separable 1D Gaussian blur (sigma = 24.0 px)
+    static constexpr float kToneMatchSigma = 24.0f;
+    std::vector<float> blur_w;
+    std::vector<float> blur_rr;
+    std::vector<float> blur_rg;
+    std::vector<float> blur_rb;
+    separable_gaussian_blur_f32(weight_map, blur_w, w, h, kToneMatchSigma);
+    separable_gaussian_blur_f32(res_r, blur_rr, w, h, kToneMatchSigma);
+    separable_gaussian_blur_f32(res_g, blur_rg, w, h, kToneMatchSigma);
+    separable_gaussian_blur_f32(res_b, blur_rb, w, h, kToneMatchSigma);
+
+    for (size_t i = 0; i < total; ++i) {
+        if (mask[i] == 0) continue;
+        float out_r = aff_r[i];
+        float out_g = aff_g[i];
+        float out_b = aff_b[i];
+        if (blur_w[i] > 1.0e-3f) {
+            const float inv_w = 1.0f / blur_w[i];
+            out_r += blur_rr[i] * inv_w;
+            out_g += blur_rg[i] * inv_w;
+            out_b += blur_rb[i] * inv_w;
+        }
+        pred_rgb[i * 3 + 0] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(clampf(out_r, 0.0f, 1.0f) * 255.0f)), 0, 255));
+        pred_rgb[i * 3 + 1] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(clampf(out_g, 0.0f, 1.0f) * 255.0f)), 0, 255));
+        pred_rgb[i * 3 + 2] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(clampf(out_b, 0.0f, 1.0f) * 255.0f)), 0, 255));
+    }
+
+    return true;
+}
+
 }  // namespace
 
 // -----------------------------------------------------------------------------
@@ -427,6 +918,83 @@ std::string LamaInpainter::rgb_to_data_uri(
     int height) {
     const auto png = encode_rgb_png(rgb, width, height);
     return "data:image/png;base64," + TextDetector::base64_encode(png.data(), png.size());
+}
+
+void LamaInpainter::composite_feathered_region(
+    std::vector<uint8_t>& dst_rgb,
+    const std::vector<uint8_t>& src_rgb,
+    const std::vector<uint8_t>& mask,
+    int width,
+    int height,
+    const std::array<int, 4>& roi,
+    float feather_px) {
+    if (width <= 0 || height <= 0) return;
+    const size_t total = static_cast<size_t>(width) * static_cast<size_t>(height);
+    if (dst_rgb.size() < total * 3ULL || src_rgb.size() < total * 3ULL || mask.size() < total) {
+        return;
+    }
+
+    const int pad = std::max(2, static_cast<int>(std::ceil(std::max(0.0f, feather_px))) + 2);
+    const int lx0 = clampi(roi[0] - pad, 0, width);
+    const int ly0 = clampi(roi[1] - pad, 0, height);
+    const int lx1 = clampi(roi[2] + pad, 0, width);
+    const int ly1 = clampi(roi[3] + pad, 0, height);
+    const int lw = lx1 - lx0;
+    const int lh = ly1 - ly0;
+    if (lw <= 0 || lh <= 0) return;
+
+    if (feather_px <= 0.0f) {
+        for (int ly = 0; ly < lh; ++ly) {
+            const int gy = ly0 + ly;
+            const uint8_t* mrow = mask.data() + static_cast<size_t>(gy) * static_cast<size_t>(width);
+            const uint8_t* srow = src_rgb.data() + static_cast<size_t>(gy) * static_cast<size_t>(width) * 3ULL;
+            uint8_t* drow = dst_rgb.data() + static_cast<size_t>(gy) * static_cast<size_t>(width) * 3ULL;
+            for (int lx = 0; lx < lw; ++lx) {
+                const int gx = lx0 + lx;
+                if (mrow[gx] > 0) {
+                    drow[gx * 3 + 0] = srow[gx * 3 + 0];
+                    drow[gx * 3 + 1] = srow[gx * 3 + 1];
+                    drow[gx * 3 + 2] = srow[gx * 3 + 2];
+                }
+            }
+        }
+        return;
+    }
+
+    // Distance from each masked pixel to the nearest unmasked pixel using Felzenszwalb-Huttenlocher 2D EDT
+    std::vector<uint8_t> bg_mask(static_cast<size_t>(lw) * static_cast<size_t>(lh), 0);
+    for (int ly = 0; ly < lh; ++ly) {
+        const uint8_t* mrow = mask.data() + static_cast<size_t>(ly0 + ly) * static_cast<size_t>(width) + static_cast<size_t>(lx0);
+        uint8_t* brow = bg_mask.data() + static_cast<size_t>(ly) * static_cast<size_t>(lw);
+        for (int lx = 0; lx < lw; ++lx) {
+            brow[lx] = (mrow[lx] == 0) ? 255 : 0;
+        }
+    }
+
+    std::vector<float> dist_sq;
+    const bool has_bg = vellum::detector::computeEuclideanDistanceSqFH(bg_mask.data(), lw, lh, dist_sq);
+    const float inv_feather = 1.0f / feather_px;
+
+    for (int ly = 0; ly < lh; ++ly) {
+        const int gy = ly0 + ly;
+        const uint8_t* mrow = mask.data() + static_cast<size_t>(gy) * static_cast<size_t>(width);
+        const uint8_t* srow = src_rgb.data() + static_cast<size_t>(gy) * static_cast<size_t>(width) * 3ULL;
+        uint8_t* drow = dst_rgb.data() + static_cast<size_t>(gy) * static_cast<size_t>(width) * 3ULL;
+        const size_t lrow = static_cast<size_t>(ly) * static_cast<size_t>(lw);
+        for (int lx = 0; lx < lw; ++lx) {
+            const int gx = lx0 + lx;
+            if (mrow[gx] == 0) continue;
+            const float alpha = has_bg
+                ? clampf(std::sqrt(std::max(0.0f, dist_sq[lrow + static_cast<size_t>(lx)])) * inv_feather, 0.0f, 1.0f)
+                : 1.0f;
+            const float inv_a = 1.0f - alpha;
+            for (int c = 0; c < 3; ++c) {
+                const float blended = alpha * static_cast<float>(srow[gx * 3 + c]) +
+                                      inv_a * static_cast<float>(drow[gx * 3 + c]);
+                drow[gx * 3 + c] = static_cast<uint8_t>(clampi(static_cast<int>(std::lround(blended)), 0, 255));
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -796,7 +1364,9 @@ bool LamaInpainter::inpaint_roi(
     int padding,
     int tile_size,
     const ResolvedLamaModel& resolved,
-    bool force_cpu) {
+    bool force_cpu,
+    bool enable_tone_match,
+    bool* tone_match_applied_out) {
     const int win_size = clampi(tile_size, 256, 1024);
     const int x1 = clampi(bbox[0] - padding, 0, orig_w);
     const int y1 = clampi(bbox[1] - padding, 0, orig_h);
@@ -860,6 +1430,13 @@ bool LamaInpainter::inpaint_roi(
             inpainted_tile = resize_rgb_bilinear(inpainted_512.data(), kTileSize, kTileSize, win_size, win_size);
         }
 
+        if (enable_tone_match) {
+            if (apply_tone_match(tile_rgb.data(), inpainted_tile, tile_mask.data(), win_size, win_size) &&
+                tone_match_applied_out) {
+                *tone_match_applied_out = true;
+            }
+        }
+
         // Lossless composite: patch ONLY pixels where tile_mask > 0
         for (int ty = 0; ty < win_size; ++ty) {
             const uint8_t* mrow = tile_mask.data() + static_cast<size_t>(ty) * static_cast<size_t>(win_size);
@@ -897,8 +1474,15 @@ bool LamaInpainter::inpaint_roi(
 
     const std::vector<uint8_t> inpainted_512 =
         run_tile_512(resized_rgb.data(), resized_mask.data(), resolved, force_cpu);
-    const std::vector<uint8_t> restored_roi =
+    std::vector<uint8_t> restored_roi =
         resize_rgb_bilinear(inpainted_512.data(), kTileSize, kTileSize, roi_w, roi_h);
+
+    if (enable_tone_match) {
+        if (apply_tone_match(roi_rgb.data(), restored_roi, roi_mask.data(), roi_w, roi_h) &&
+            tone_match_applied_out) {
+            *tone_match_applied_out = true;
+        }
+    }
 
     for (int ry = 0; ry < roi_h; ++ry) {
         const uint8_t* mrow = roi_mask.data() + static_cast<size_t>(ry) * static_cast<size_t>(roi_w);
@@ -936,6 +1520,428 @@ InpaintResult LamaInpainter::inpaint_rgb(
     const bool wants_aot = (requested_model == "aot-inpainting");
     const bool wants_diffusion = (requested_model == "flux-2-klein" || requested_model == "rorem-mixed");
 
+    const int eff_tile_size = clampi(options.tile_size, 256, 1024);
+
+    const std::vector<std::array<int, 4>> mask_boxes =
+        extract_bboxes_from_mask(binary_mask, width, height);
+    const std::vector<std::array<int, 4>>& roi_boxes =
+        (options.bboxes.has_value() && !options.bboxes->empty())
+            ? *options.bboxes
+            : mask_boxes;
+
+    std::vector<uint8_t> working_mask = (options.refine_mask && !roi_boxes.empty())
+        ? refine_bubble_mask(rgb_data, binary_mask, roi_boxes, width, height, options.dilate_kernel_size)
+        : binary_mask;
+
+    const size_t rgb_bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 3ULL;
+    std::vector<uint8_t> canvas(rgb_data, rgb_data + rgb_bytes);
+
+    int tier1_blocks = 0;
+    int tier2_blocks = 0;
+    int tier3_blocks = 0;
+    int tiles_count = 0;
+    bool tone_match_applied = false;
+
+    std::vector<std::array<int, 4>> neural_boxes;
+
+    if (options.enable_3tier_inpaint) {
+        // Immutable snapshot of all blocks' masks so ring sampling always excludes other blocks' masks
+        const std::vector<uint8_t> all_blocks_mask = working_mask;
+
+        constexpr int kRingPx = 4;
+        constexpr int kBubbleCorePx = 3;
+        constexpr size_t kMinRingPixels = 16;
+        constexpr double kMaxMeanDev = 10.0;
+        constexpr double kMaxOutlierDev = 64.0;
+        constexpr int kTeleaCollar = 8;
+        constexpr float kTeleaRadius = 5.0f;
+
+        const std::vector<std::array<int, 4>>& block_list = !roi_boxes.empty() ? roi_boxes : mask_boxes;
+
+        struct RingSample {
+            int x;
+            int y;
+            uint8_t r;
+            uint8_t g;
+            uint8_t b;
+        };
+
+        const int dilate_pad = options.refine_mask
+            ? std::max(0, options.dilate_kernel_size / 2)
+            : 0;
+
+        for (const auto& box : block_list) {
+            const int bx1 = clampi(box[0] - dilate_pad, 0, width);
+            const int by1 = clampi(box[1] - dilate_pad, 0, height);
+            const int bx2 = clampi(box[2] + dilate_pad, 0, width);
+            const int by2 = clampi(box[3] + dilate_pad, 0, height);
+            if (bx2 <= bx1 || by2 <= by1) continue;
+
+            bool has_fg = false;
+            for (int y = by1; y < by2 && !has_fg; ++y) {
+                const uint8_t* mrow = working_mask.data() + static_cast<size_t>(y) * static_cast<size_t>(width);
+                for (int x = bx1; x < bx2; ++x) {
+                    if (mrow[x] > 0) {
+                        has_fg = true;
+                        break;
+                    }
+                }
+            }
+            if (!has_fg) continue;
+
+            // Local padded window for ring sampling + bubble wall erosion
+            const int pad = kRingPx + kBubbleCorePx + 4;
+            const int lx0 = clampi(bx1 - pad, 0, width);
+            const int ly0 = clampi(by1 - pad, 0, height);
+            const int lx1 = clampi(bx2 + pad, 0, width);
+            const int ly1 = clampi(by2 + pad, 0, height);
+            const int lw = lx1 - lx0;
+            const int lh = ly1 - ly0;
+            if (lw <= 0 || lh <= 0) {
+                neural_boxes.push_back(box);
+                continue;
+            }
+
+            const size_t ltotal = static_cast<size_t>(lw) * static_cast<size_t>(lh);
+            std::vector<uint8_t> local_block_mask(ltotal, 0);
+            for (int gy = by1; gy < by2; ++gy) {
+                const uint8_t* mrow = working_mask.data() + static_cast<size_t>(gy) * static_cast<size_t>(width);
+                uint8_t* lrow = local_block_mask.data() + static_cast<size_t>(gy - ly0) * static_cast<size_t>(lw);
+                for (int gx = bx1; gx < bx2; ++gx) {
+                    if (mrow[gx] > 0) {
+                        lrow[gx - lx0] = 255;
+                    }
+                }
+            }
+
+            std::vector<float> dist_to_block_sq;
+            if (!vellum::detector::computeEuclideanDistanceSqFH(local_block_mask.data(), lw, lh, dist_to_block_sq)) {
+                continue;
+            }
+
+            // First estimate rough ring luma to handle both light and dark bubbles when detecting bubble walls
+            std::array<int, 256> rough_luma_hist{};
+            int rough_cnt = 0;
+            const float ring_sq = static_cast<float>(kRingPx * kRingPx);
+            for (int ly = 0; ly < lh; ++ly) {
+                const int gy = ly0 + ly;
+                const uint8_t* amrow = all_blocks_mask.data() + static_cast<size_t>(gy) * static_cast<size_t>(width);
+                const uint8_t* crow = canvas.data() + static_cast<size_t>(gy) * static_cast<size_t>(width) * 3ULL;
+                const size_t lrow = static_cast<size_t>(ly) * static_cast<size_t>(lw);
+                for (int lx = 0; lx < lw; ++lx) {
+                    const float d2 = dist_to_block_sq[lrow + static_cast<size_t>(lx)];
+                    if (d2 <= 0.0f || d2 > ring_sq) continue;
+                    const int gx = lx0 + lx;
+                    if (amrow[gx] > 0) continue;
+                    const uint8_t* px = crow + static_cast<size_t>(gx) * 3ULL;
+                    ++rough_luma_hist[rgb_to_luma(px[0], px[1], px[2])];
+                    ++rough_cnt;
+                }
+            }
+            if (rough_cnt < static_cast<int>(kMinRingPixels)) {
+                neural_boxes.push_back(box);
+                continue;
+            }
+            uint8_t rough_median_luma = 255;
+            {
+                int acc = 0;
+                const int target = rough_cnt / 2;
+                for (int i = 0; i < 256; ++i) {
+                    acc += rough_luma_hist[static_cast<size_t>(i)];
+                    if (acc >= target) {
+                        rough_median_luma = static_cast<uint8_t>(i);
+                        break;
+                    }
+                }
+            }
+
+            // Detect bubble walls (dark/bright outline strokes & sharp edges outside all_blocks_mask)
+            // and erode BUBBLE_CORE = 3 px inward from bubble walls
+            std::vector<uint8_t> wall_mask(ltotal, 0);
+            bool any_wall = false;
+            const bool is_light_bubble = (rough_median_luma >= 128);
+            for (int ly = 0; ly < lh; ++ly) {
+                const int gy = ly0 + ly;
+                const uint8_t* amrow = all_blocks_mask.data() + static_cast<size_t>(gy) * static_cast<size_t>(width);
+                const uint8_t* crow = canvas.data() + static_cast<size_t>(gy) * static_cast<size_t>(width) * 3ULL;
+                const size_t lrow = static_cast<size_t>(ly) * static_cast<size_t>(lw);
+                for (int lx = 0; lx < lw; ++lx) {
+                    const int gx = lx0 + lx;
+                    if (amrow[gx] > 0) continue;
+                    const uint8_t* px = crow + static_cast<size_t>(gx) * 3ULL;
+                    const uint8_t luma = rgb_to_luma(px[0], px[1], px[2]);
+                    bool is_wall = (is_light_bubble && luma < 160) || (!is_light_bubble && luma > 160);
+                    if (!is_wall) {
+                        static constexpr int kDx4[4] = {-1, 1, 0, 0};
+                        static constexpr int kDy4[4] = {0, 0, -1, 1};
+                        for (int k = 0; k < 4; ++k) {
+                            const int ngx = gx + kDx4[k];
+                            const int ngy = gy + kDy4[k];
+                            if (ngx < 0 || ngx >= width || ngy < 0 || ngy >= height) continue;
+                            if (all_blocks_mask[static_cast<size_t>(ngy) * static_cast<size_t>(width) + static_cast<size_t>(ngx)] > 0) {
+                                continue;
+                            }
+                            const uint8_t* npx = canvas.data() +
+                                                 (static_cast<size_t>(ngy) * static_cast<size_t>(width) + static_cast<size_t>(ngx)) * 3ULL;
+                            const int diff = std::max({
+                                std::abs(static_cast<int>(px[0]) - static_cast<int>(npx[0])),
+                                std::abs(static_cast<int>(px[1]) - static_cast<int>(npx[1])),
+                                std::abs(static_cast<int>(px[2]) - static_cast<int>(npx[2]))
+                            });
+                            if (diff > 48) {
+                                is_wall = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (is_wall) {
+                        wall_mask[lrow + static_cast<size_t>(lx)] = 255;
+                        any_wall = true;
+                    }
+                }
+            }
+
+            std::vector<float> dist_to_wall_sq;
+            const bool has_walls = any_wall &&
+                                   vellum::detector::computeEuclideanDistanceSqFH(wall_mask.data(), lw, lh, dist_to_wall_sq);
+            const float core_sq = static_cast<float>(kBubbleCorePx * kBubbleCorePx);
+
+            // Sample valid exterior ring pixels (RING = 4 px, eroded BUBBLE_CORE = 3 px from walls,
+            // excluding this block's mask and all other blocks' masks)
+            std::vector<RingSample> samples;
+            samples.reserve(static_cast<size_t>(rough_cnt));
+            std::array<int, 256> r_hist{};
+            std::array<int, 256> g_hist{};
+            std::array<int, 256> b_hist{};
+
+            for (int ly = 0; ly < lh; ++ly) {
+                const int gy = ly0 + ly;
+                const uint8_t* amrow = all_blocks_mask.data() + static_cast<size_t>(gy) * static_cast<size_t>(width);
+                const uint8_t* crow = canvas.data() + static_cast<size_t>(gy) * static_cast<size_t>(width) * 3ULL;
+                const size_t lrow = static_cast<size_t>(ly) * static_cast<size_t>(lw);
+                for (int lx = 0; lx < lw; ++lx) {
+                    const size_t lidx = lrow + static_cast<size_t>(lx);
+                    const float d2 = dist_to_block_sq[lidx];
+                    if (d2 <= 0.0f || d2 > ring_sq) continue;
+                    const int gx = lx0 + lx;
+                    if (amrow[gx] > 0) continue;
+                    if (has_walls && dist_to_wall_sq[lidx] <= core_sq) continue;
+                    const uint8_t* px = crow + static_cast<size_t>(gx) * 3ULL;
+                    samples.push_back({gx, gy, px[0], px[1], px[2]});
+                    ++r_hist[px[0]];
+                    ++g_hist[px[1]];
+                    ++b_hist[px[2]];
+                }
+            }
+
+            if (samples.size() < kMinRingPixels) {
+                neural_boxes.push_back(box);
+                continue;
+            }
+
+            auto hist_median = [&samples](const std::array<int, 256>& h) -> uint8_t {
+                size_t acc = 0;
+                const size_t target = samples.size() / 2;
+                for (int i = 0; i < 256; ++i) {
+                    acc += static_cast<size_t>(h[static_cast<size_t>(i)]);
+                    if (acc > target) return static_cast<uint8_t>(i);
+                }
+                return 255;
+            };
+
+            // Tier 1: Flat Median
+            const uint8_t med_r = hist_median(r_hist);
+            const uint8_t med_g = hist_median(g_hist);
+            const uint8_t med_b = hist_median(b_hist);
+
+            double dev_sum = 0.0;
+            int max_dev = 0;
+            for (const auto& s : samples) {
+                const int d = std::max({
+                    std::abs(static_cast<int>(s.r) - static_cast<int>(med_r)),
+                    std::abs(static_cast<int>(s.g) - static_cast<int>(med_g)),
+                    std::abs(static_cast<int>(s.b) - static_cast<int>(med_b))
+                });
+                dev_sum += static_cast<double>(d);
+                if (d > max_dev) max_dev = d;
+            }
+            const double mean_dev = dev_sum / static_cast<double>(samples.size());
+
+            if (mean_dev <= kMaxMeanDev && static_cast<double>(max_dev) < kMaxOutlierDev) {
+                for (int gy = by1; gy < by2; ++gy) {
+                    uint8_t* mrow = working_mask.data() + static_cast<size_t>(gy) * static_cast<size_t>(width);
+                    uint8_t* crow = canvas.data() + static_cast<size_t>(gy) * static_cast<size_t>(width) * 3ULL;
+                    for (int gx = bx1; gx < bx2; ++gx) {
+                        if (mrow[gx] > 0) {
+                            crow[gx * 3 + 0] = med_r;
+                            crow[gx * 3 + 1] = med_g;
+                            crow[gx * 3 + 2] = med_b;
+                            mrow[gx] = 0;
+                        }
+                    }
+                }
+                ++tier1_blocks;
+                continue;
+            }
+
+            // Tier 2: Linear Plane f_c(x, y) = c_bar + a_c*(x - x_bar) + b_c*(y - y_bar) + Telea FMM
+            const double inv_n = 1.0 / static_cast<double>(samples.size());
+            double mean_x = 0.0, mean_y = 0.0;
+            double mean_c[3] = {0.0, 0.0, 0.0};
+            for (const auto& s : samples) {
+                mean_x += static_cast<double>(s.x);
+                mean_y += static_cast<double>(s.y);
+                mean_c[0] += static_cast<double>(s.r);
+                mean_c[1] += static_cast<double>(s.g);
+                mean_c[2] += static_cast<double>(s.b);
+            }
+            mean_x *= inv_n;
+            mean_y *= inv_n;
+            mean_c[0] *= inv_n;
+            mean_c[1] *= inv_n;
+            mean_c[2] *= inv_n;
+
+            double sxx = 0.0, sxy = 0.0, syy = 0.0;
+            double sxc[3] = {0.0, 0.0, 0.0};
+            double syc[3] = {0.0, 0.0, 0.0};
+            for (const auto& s : samples) {
+                const double dx = static_cast<double>(s.x) - mean_x;
+                const double dy = static_cast<double>(s.y) - mean_y;
+                sxx += dx * dx;
+                sxy += dx * dy;
+                syy += dy * dy;
+                const double dc[3] = {
+                    static_cast<double>(s.r) - mean_c[0],
+                    static_cast<double>(s.g) - mean_c[1],
+                    static_cast<double>(s.b) - mean_c[2]
+                };
+                for (int c = 0; c < 3; ++c) {
+                    sxc[c] += dx * dc[c];
+                    syc[c] += dy * dc[c];
+                }
+            }
+
+            const double det = sxx * syy - sxy * sxy;
+            double ac[3] = {0.0, 0.0, 0.0};
+            double bc[3] = {0.0, 0.0, 0.0};
+            if (std::fabs(det) > 1.0e-6) {
+                const double inv_det = 1.0 / det;
+                for (int c = 0; c < 3; ++c) {
+                    ac[c] = (syy * sxc[c] - sxy * syc[c]) * inv_det;
+                    bc[c] = (sxx * syc[c] - sxy * sxc[c]) * inv_det;
+                }
+            }
+
+            double res_sum = 0.0;
+            double max_res = 0.0;
+            for (const auto& s : samples) {
+                const double dx = static_cast<double>(s.x) - mean_x;
+                const double dy = static_cast<double>(s.y) - mean_y;
+                const double pr = mean_c[0] + ac[0] * dx + bc[0] * dy;
+                const double pg = mean_c[1] + ac[1] * dx + bc[1] * dy;
+                const double pb = mean_c[2] + ac[2] * dx + bc[2] * dy;
+                const double r_err = std::max({
+                    std::fabs(static_cast<double>(s.r) - pr),
+                    std::fabs(static_cast<double>(s.g) - pg),
+                    std::fabs(static_cast<double>(s.b) - pb)
+                });
+                res_sum += r_err;
+                if (r_err > max_res) max_res = r_err;
+            }
+            const double mean_res = res_sum * inv_n;
+
+            if (mean_res <= kMaxMeanDev && max_res < kMaxOutlierDev) {
+                const int cx0 = clampi(bx1 - kTeleaCollar, 0, width);
+                const int cy0 = clampi(by1 - kTeleaCollar, 0, height);
+                const int cx1 = clampi(bx2 + kTeleaCollar, 0, width);
+                const int cy1 = clampi(by2 + kTeleaCollar, 0, height);
+                const int cw = cx1 - cx0;
+                const int ch = cy1 - cy0;
+                if (cw > 0 && ch > 0) {
+                    const size_t ctotal = static_cast<size_t>(cw) * static_cast<size_t>(ch);
+                    std::vector<uint8_t> crop_rgb(ctotal * 3ULL, 0);
+                    std::vector<uint8_t> hole_mask(ctotal, 0);
+                    std::vector<uint8_t> exclude_mask(ctotal, 0);
+
+                    for (int cy = 0; cy < ch; ++cy) {
+                        const int gy = cy0 + cy;
+                        std::memcpy(
+                            crop_rgb.data() + static_cast<size_t>(cy) * static_cast<size_t>(cw) * 3ULL,
+                            canvas.data() + (static_cast<size_t>(gy) * static_cast<size_t>(width) + static_cast<size_t>(cx0)) * 3ULL,
+                            static_cast<size_t>(cw) * 3ULL);
+                        const uint8_t* wmrow = working_mask.data() + static_cast<size_t>(gy) * static_cast<size_t>(width);
+                        const uint8_t* amrow = all_blocks_mask.data() + static_cast<size_t>(gy) * static_cast<size_t>(width);
+                        for (int cx = 0; cx < cw; ++cx) {
+                            const int gx = cx0 + cx;
+                            const size_t cidx = static_cast<size_t>(cy) * static_cast<size_t>(cw) + static_cast<size_t>(cx);
+                            const bool in_box = (gx >= bx1 && gx < bx2 && gy >= by1 && gy < by2);
+                            if (in_box && wmrow[gx] > 0) {
+                                hole_mask[cidx] = 255;
+                            } else if (amrow[gx] > 0 && wmrow[gx] > 0) {
+                                // Unfilled mask pixels belonging to other blocks are excluded from Telea weights
+                                exclude_mask[cidx] = 255;
+                            }
+                        }
+                    }
+
+                    telea_inpaint_crop(crop_rgb, hole_mask, exclude_mask, cw, ch, kTeleaRadius);
+
+                    for (int gy = by1; gy < by2; ++gy) {
+                        uint8_t* wmrow = working_mask.data() + static_cast<size_t>(gy) * static_cast<size_t>(width);
+                        uint8_t* drow = canvas.data() + static_cast<size_t>(gy) * static_cast<size_t>(width) * 3ULL;
+                        const uint8_t* srow = crop_rgb.data() + static_cast<size_t>(gy - cy0) * static_cast<size_t>(cw) * 3ULL;
+                        for (int gx = bx1; gx < bx2; ++gx) {
+                            if (wmrow[gx] > 0) {
+                                const int lx = gx - cx0;
+                                drow[gx * 3 + 0] = srow[lx * 3 + 0];
+                                drow[gx * 3 + 1] = srow[lx * 3 + 1];
+                                drow[gx * 3 + 2] = srow[lx * 3 + 2];
+                                wmrow[gx] = 0;
+                            }
+                        }
+                    }
+                    ++tier2_blocks;
+                    continue;
+                }
+            }
+
+            // Tier 3: Textured/screentone block requires neural inpainting
+            neural_boxes.push_back(box);
+        }
+
+        // Check if any masked pixels remain outside block_list
+        if (neural_boxes.empty()) {
+            const auto leftover_boxes = extract_bboxes_from_mask(working_mask, width, height);
+            for (const auto& lb : leftover_boxes) {
+                neural_boxes.push_back(lb);
+            }
+        }
+
+        // Tier 3 Lazy Bypass: if 100% of blocks finished in Tier 1-2, skip GPU/ONNX completely
+        // while leaving any existing Ort::Session idle (no session destroy/recreate thrashing).
+        if (neural_boxes.empty()) {
+            InpaintResult res;
+            res.width = width;
+            res.height = height;
+            res.tiles_processed = 0;
+            res.tile_size = eff_tile_size;
+            res.tier1_blocks = tier1_blocks;
+            res.tier2_blocks = tier2_blocks;
+            res.tier3_blocks = 0;
+            res.gpu_skipped = true;
+            res.tone_match_applied = false;
+            res.execution_provider = "CPUExecutionProvider";
+            res.model_id = requested_model;
+            res.is_koharu_manga = false;
+            res.model_path = "";
+            res.rgb = std::move(canvas);
+            return res;
+        }
+    } else {
+        neural_boxes = !roi_boxes.empty() ? roi_boxes : mask_boxes;
+    }
+
+    // Resolve ONNX weights lazily only when Tier 3 neural inpainting is actually needed
     std::optional<ResolvedAotModel> resolved_aot;
     if (wants_aot || wants_diffusion) {
         resolved_aot = model_manager_.resolve_aot_model();
@@ -953,37 +1959,24 @@ InpaintResult LamaInpainter::inpaint_rgb(
         throw std::runtime_error(
             "Requested Inpainting ONNX weights ('" + requested_model + "') not found in " +
             util::path_to_utf8(model_manager_.models_dir()) +
-            ". Call POST /api/models/import-koharu or GET /api/models/download first.");
+            ". Download or import local models via Settings -> Pipeline first.");
     }
 
-    const int eff_tile_size = clampi(options.tile_size, 256, 1024);
-
-    const std::vector<std::array<int, 4>> mask_boxes =
-        extract_bboxes_from_mask(binary_mask, width, height);
-    const std::vector<std::array<int, 4>>& roi_boxes = !mask_boxes.empty()
-        ? mask_boxes
-        : (options.bboxes.has_value() ? *options.bboxes : mask_boxes);
-
-    std::vector<uint8_t> working_mask = (options.refine_mask && !roi_boxes.empty())
-        ? refine_bubble_mask(rgb_data, binary_mask, roi_boxes, width, height, options.dilate_kernel_size)
-        : binary_mask;
-
-    const size_t rgb_bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 3ULL;
-    std::vector<uint8_t> canvas(rgb_data, rgb_data + rgb_bytes);
+    // Tier 3 uses 256px context windows when 3-tier CPU-first mode is enabled
+    const int neural_tile_size = options.enable_3tier_inpaint ? 256 : eff_tile_size;
 
     ScopeInpainterUnload unload_guard{this, options.auto_unload};
 
-    // Cluster nearby ROIs whose combined padded bounding box fits inside a single
-    // `eff_tile_size x eff_tile_size` (512x512 native) context window.
-    // This cuts LaMa ONNX inference calls by ~3-4x per page with identical 1:1 quality.
+    // Cluster nearby neural ROIs whose combined padded bounding box fits inside a single
+    // `neural_tile_size x neural_tile_size` context window.
     std::vector<std::array<int, 4>> merged_rois;
-    if (width >= eff_tile_size && height >= eff_tile_size && !roi_boxes.empty()) {
+    if (width >= neural_tile_size && height >= neural_tile_size && !neural_boxes.empty()) {
         struct PaddedRoi {
             int x1, y1, x2, y2;
         };
         std::vector<PaddedRoi> padded;
-        padded.reserve(roi_boxes.size());
-        for (const auto& box : roi_boxes) {
+        padded.reserve(neural_boxes.size());
+        for (const auto& box : neural_boxes) {
             const int x1 = clampi(box[0] - options.tile_padding, 0, width);
             const int y1 = clampi(box[1] - options.tile_padding, 0, height);
             const int x2 = clampi(box[2] + options.tile_padding, 0, width);
@@ -1013,7 +2006,7 @@ InpaintResult LamaInpainter::inpaint_rgb(
         for (const auto& r : padded) {
             const int rw = r.x2 - r.x1;
             const int rh = r.y2 - r.y1;
-            if (rw > eff_tile_size || rh > eff_tile_size) {
+            if (rw > neural_tile_size || rh > neural_tile_size) {
                 clusters.push_back(r);
                 continue;
             }
@@ -1021,14 +2014,14 @@ InpaintResult LamaInpainter::inpaint_rgb(
             long long best_waste = std::numeric_limits<long long>::max();
             for (size_t ci = 0; ci < clusters.size(); ++ci) {
                 const auto& c = clusters[ci];
-                if ((c.x2 - c.x1) > eff_tile_size || (c.y2 - c.y1) > eff_tile_size) {
+                if ((c.x2 - c.x1) > neural_tile_size || (c.y2 - c.y1) > neural_tile_size) {
                     continue;
                 }
                 const int ux1 = std::min(c.x1, r.x1);
                 const int uy1 = std::min(c.y1, r.y1);
                 const int ux2 = std::max(c.x2, r.x2);
                 const int uy2 = std::max(c.y2, r.y2);
-                if ((ux2 - ux1) <= eff_tile_size && (uy2 - uy1) <= eff_tile_size) {
+                if ((ux2 - ux1) <= neural_tile_size && (uy2 - uy1) <= neural_tile_size) {
                     const long long union_area = static_cast<long long>(ux2 - ux1) * static_cast<long long>(uy2 - uy1);
                     const long long prev_area = static_cast<long long>(c.x2 - c.x1) * static_cast<long long>(c.y2 - c.y1);
                     const long long waste = union_area - prev_area;
@@ -1055,91 +2048,8 @@ InpaintResult LamaInpainter::inpaint_rgb(
         }
     }
 
-    int tiles_count = 0;
+    tier3_blocks = static_cast<int>(neural_boxes.size());
     std::string provider_used = ModelManager::get_primary_provider(options.force_cpu);
-
-    // Helper: if non-masked background inside the ROI is uniform solid white
-    // (median_luma >= 240 && stddev < 8.0), fill ONLY the masked text-stroke pixels
-    // directly with the sampled bubble background color for 100% crisp borders and zero smears.
-    auto try_solid_white_clean_erase = [&](const std::array<int, 4>& box, int pad) -> bool {
-        const int x1 = clampi(box[0] - pad, 0, width);
-        const int y1 = clampi(box[1] - pad, 0, height);
-        const int x2 = clampi(box[2] + pad, 0, width);
-        const int y2 = clampi(box[3] + pad, 0, height);
-        if (x2 <= x1 || y2 <= y1) return false;
-
-        bool has_fg = false;
-        std::array<int, 256> luma_hist{};
-        std::array<int, 256> r_hist{};
-        std::array<int, 256> g_hist{};
-        std::array<int, 256> b_hist{};
-        int bg_count = 0;
-        double luma_sum = 0.0;
-        double luma_sq_sum = 0.0;
-
-        for (int y = y1; y < y2; ++y) {
-            const uint8_t* mrow = working_mask.data() + static_cast<size_t>(y) * static_cast<size_t>(width);
-            const uint8_t* crow = canvas.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 3ULL;
-            for (int x = x1; x < x2; ++x) {
-                if (mrow[x] > 0) {
-                    has_fg = true;
-                } else {
-                    const uint8_t* px = crow + static_cast<size_t>(x) * 3ULL;
-                    const uint8_t luma = rgb_to_luma(px[0], px[1], px[2]);
-                    ++luma_hist[luma];
-                    ++r_hist[px[0]];
-                    ++g_hist[px[1]];
-                    ++b_hist[px[2]];
-                    ++bg_count;
-                    luma_sum += static_cast<double>(luma);
-                    luma_sq_sum += static_cast<double>(luma) * static_cast<double>(luma);
-                }
-            }
-        }
-        if (!has_fg) return true;
-        if (bg_count < 16) return false;
-
-        auto hist_median = [bg_count](const std::array<int, 256>& h) -> uint8_t {
-            int acc = 0;
-            const int target = bg_count / 2;
-            for (int i = 0; i < 256; ++i) {
-                acc += h[static_cast<size_t>(i)];
-                if (acc >= target) return static_cast<uint8_t>(i);
-            }
-            return 255;
-        };
-
-        const uint8_t median_luma = hist_median(luma_hist);
-        const double mean = luma_sum / static_cast<double>(bg_count);
-        const double var = std::max(0.0, (luma_sq_sum / static_cast<double>(bg_count)) - mean * mean);
-        const double stddev = std::sqrt(var);
-        int white_bg_count = 0;
-        for (int i = 235; i < 256; ++i) {
-            white_bg_count += luma_hist[static_cast<size_t>(i)];
-        }
-        const double white_ratio = static_cast<double>(white_bg_count) / static_cast<double>(bg_count);
-        if (median_luma < 235 || (stddev >= 10.0 && white_ratio < 0.80)) {
-            return false;
-        }
-
-        const uint8_t bg_r = hist_median(r_hist);
-        const uint8_t bg_g = hist_median(g_hist);
-        const uint8_t bg_b = hist_median(b_hist);
-
-        for (int y = y1; y < y2; ++y) {
-            uint8_t* mrow = working_mask.data() + static_cast<size_t>(y) * static_cast<size_t>(width);
-            uint8_t* crow = canvas.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 3ULL;
-            for (int x = x1; x < x2; ++x) {
-                if (mrow[x] > 0) {
-                    crow[x * 3 + 0] = bg_r;
-                    crow[x * 3 + 1] = bg_g;
-                    crow[x * 3 + 2] = bg_b;
-                    mrow[x] = 0;
-                }
-            }
-        }
-        return true;
-    };
 
     // Helper for AOT or Diffusion ROI inpainting (strictly compositing ONLY working_mask > 0 pixels)
     auto run_custom_roi = [&](const std::array<int, 4>& box, int pad) -> bool {
@@ -1177,7 +2087,6 @@ InpaintResult LamaInpainter::inpaint_rgb(
         }
 
         // 1. If FLUX.2 Klein or RORem Mixed is selected, probe local diffusion HTTP adapter
-        //    (e.g. ComfyUI/A1111/sd-server on inpaint_api_url or 127.0.0.1:7860) on the tight ROI crop
         if (wants_diffusion) {
             for (const std::string& raw_ep : {options.inpaint_api_url, std::string("http://127.0.0.1:7860")}) {
                 std::string host = "127.0.0.1";
@@ -1193,7 +2102,7 @@ InpaintResult LamaInpainter::inpaint_rgb(
                 }
                 try {
                     httplib::Client cli(host, port);
-                    cli.set_connection_timeout(0, 350000);  // 350ms fast local probe
+                    cli.set_connection_timeout(0, 350000);
                     cli.set_read_timeout(30, 0);
                     const auto img_png = encode_rgb_png(roi_rgb, roi_w, roi_h);
                     const auto mask_png = TextDetector::encode_mask_png(roi_mask, roi_w, roi_h);
@@ -1210,20 +2119,18 @@ InpaintResult LamaInpainter::inpaint_rgb(
                     if (resp && resp->status >= 200 && resp->status < 300) {
                         const auto body = nlohmann::json::parse(resp->body, nullptr, false);
                         if (body.is_object() && body.contains("images") && body["images"].is_array() && !body["images"].empty()) {
-                            // Unload diffusion VRAM immediately so LM Studio never OOMs on 8 GB VRAM
                             cli.Post("/sdapi/v1/unload-checkpoint", "{}", "application/json");
                             cli.Post("/free", R"({"unload_models":true,"free_memory":true})", "application/json");
                         }
                     }
                 } catch (...) {
-                    // Fall through to local GPU AOT/LaMa ONNX
                 }
             }
         }
 
         // 2. Run AOT Inpainting ONNX ([1, 4, 512, 512] -> [1, 3, 512, 512]) when available
         if ((wants_aot || wants_diffusion) && resolved_aot.has_value()) {
-            const int win_size = clampi(eff_tile_size, 256, 1024);
+            const int win_size = clampi(neural_tile_size, 256, 1024);
             if (roi_w <= win_size && roi_h <= win_size && width >= win_size && height >= win_size) {
                 const int cx = (x1 + x2) / 2;
                 const int cy = (y1 + y2) / 2;
@@ -1258,6 +2165,12 @@ InpaintResult LamaInpainter::inpaint_rgb(
                     inpainted_tile = resize_rgb_bilinear(inpainted_512.data(), kTileSize, kTileSize, win_size, win_size);
                 }
 
+                if (options.enable_tone_match) {
+                    if (apply_tone_match(tile_rgb.data(), inpainted_tile, tile_mask.data(), win_size, win_size)) {
+                        tone_match_applied = true;
+                    }
+                }
+
                 for (int ty = 0; ty < win_size; ++ty) {
                     const uint8_t* mrow = tile_mask.data() + static_cast<size_t>(ty) * static_cast<size_t>(win_size);
                     const uint8_t* srow = inpainted_tile.data() + static_cast<size_t>(ty) * static_cast<size_t>(win_size) * 3ULL;
@@ -1276,9 +2189,14 @@ InpaintResult LamaInpainter::inpaint_rgb(
             const auto resized_rgb = resize_rgb_bilinear(roi_rgb.data(), roi_w, roi_h, kTileSize, kTileSize);
             const auto resized_mask = resize_mask_nearest(roi_mask.data(), roi_w, roi_h, kTileSize, kTileSize);
             const auto inpainted_512 = run_aot_tile_512(resized_rgb.data(), resized_mask.data(), *resolved_aot, options.force_cpu);
-            const auto restored = resize_rgb_bilinear(inpainted_512.data(), kTileSize, kTileSize, roi_w, roi_h);
+            std::vector<uint8_t> restored = resize_rgb_bilinear(inpainted_512.data(), kTileSize, kTileSize, roi_w, roi_h);
 
-            // Strictly composite ONLY masked text-stroke pixels back onto canvas
+            if (options.enable_tone_match) {
+                if (apply_tone_match(roi_rgb.data(), restored, roi_mask.data(), roi_w, roi_h)) {
+                    tone_match_applied = true;
+                }
+            }
+
             for (int ry = 0; ry < roi_h; ++ry) {
                 const uint8_t* mrow = roi_mask.data() + static_cast<size_t>(ry) * static_cast<size_t>(roi_w);
                 const uint8_t* srow = restored.data() + static_cast<size_t>(ry) * static_cast<size_t>(roi_w) * 3ULL;
@@ -1295,22 +2213,15 @@ InpaintResult LamaInpainter::inpaint_rgb(
         }
 
         if (resolved.has_value()) {
-            return inpaint_roi(canvas, width, height, working_mask, box, pad, eff_tile_size, *resolved, options.force_cpu);
+            return inpaint_roi(
+                canvas, width, height, working_mask, box, pad, neural_tile_size,
+                *resolved, options.force_cpu, options.enable_tone_match, &tone_match_applied);
         }
         return false;
     };
 
-    // Pass 0: For every tight text-stroke ROI in mask_boxes, if the unmasked interior
-    // background is uniform solid white, erase ONLY the masked text strokes to clean white.
-    for (const auto& box : mask_boxes) {
-        try_solid_white_clean_erase(box, 2);
-    }
-
     if (!merged_rois.empty()) {
         for (const auto& box : merged_rois) {
-            if (try_solid_white_clean_erase(box, 0)) {
-                continue;
-            }
             if (wants_aot || wants_diffusion) {
                 if (run_custom_roi(box, 0)) ++tiles_count;
             } else if (resolved.has_value() && inpaint_roi(
@@ -1320,17 +2231,16 @@ InpaintResult LamaInpainter::inpaint_rgb(
                     working_mask,
                     box,
                     /*padding=*/0,
-                    eff_tile_size,
+                    neural_tile_size,
                     *resolved,
-                    options.force_cpu)) {
+                    options.force_cpu,
+                    options.enable_tone_match,
+                    &tone_match_applied)) {
                 ++tiles_count;
             }
         }
     } else {
-        for (const auto& box : roi_boxes) {
-            if (try_solid_white_clean_erase(box, 8)) {
-                continue;
-            }
+        for (const auto& box : neural_boxes) {
             if (wants_aot || wants_diffusion) {
                 if (run_custom_roi(box, options.tile_padding)) ++tiles_count;
             } else if (resolved.has_value() && inpaint_roi(
@@ -1340,20 +2250,26 @@ InpaintResult LamaInpainter::inpaint_rgb(
                     working_mask,
                     box,
                     options.tile_padding,
-                    eff_tile_size,
+                    neural_tile_size,
                     *resolved,
-                    options.force_cpu)) {
+                    options.force_cpu,
+                    options.enable_tone_match,
+                    &tone_match_applied)) {
                 ++tiles_count;
             }
         }
     }
-    if (cached_aot_session_.has_value()) {
+
+    if (tiles_count == 0) {
+        // No neural inference actually executed -> do not thrash any existing Ort::Session
+        unload_guard.enabled = false;
+    } else if (cached_aot_session_.has_value()) {
         provider_used = cached_aot_session_->active_provider;
     } else if (cached_session_.has_value()) {
         provider_used = cached_session_->active_provider;
     }
-    if (wants_diffusion) {
-        // Release generative/inpainting VRAM immediately before Stage 4 calls LM Studio
+
+    if (wants_diffusion && tiles_count > 0) {
         unload();
     }
 
@@ -1361,8 +2277,13 @@ InpaintResult LamaInpainter::inpaint_rgb(
     res.width = width;
     res.height = height;
     res.tiles_processed = tiles_count;
-    res.tile_size = eff_tile_size;
-    res.execution_provider = provider_used;
+    res.tile_size = neural_tile_size;
+    res.tier1_blocks = tier1_blocks;
+    res.tier2_blocks = tier2_blocks;
+    res.tier3_blocks = (tiles_count > 0) ? tier3_blocks : 0;
+    res.gpu_skipped = (tiles_count == 0);
+    res.tone_match_applied = tone_match_applied;
+    res.execution_provider = (tiles_count == 0) ? std::string("CPUExecutionProvider") : provider_used;
     res.model_id = (wants_aot || wants_diffusion)
         ? requested_model
         : (resolved.has_value() ? resolved->model_id() : requested_model);

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,11 @@ struct PanelDetection {
     BBox bbox_norm;
 };
 
+struct BubbleOutlineInfo {
+    std::array<uint8_t, 3> color{255, 255, 255};
+    int width = 0;
+};
+
 struct BubbleDetection {
     int id = 0;
     int reading_order = 0;
@@ -111,6 +117,12 @@ struct BubbleDetection {
     BBox safe_bbox;
     InstanceMask mask;
     std::string crop_file;
+    // Optional v2.5 CV geometry & typography metadata
+    std::vector<Point2f> room_polygon;
+    std::optional<float> angle_deg;
+    std::optional<float> estimated_font_size;
+    std::optional<std::array<uint8_t, 3>> text_color;
+    std::optional<BubbleOutlineInfo> outline;
 };
 
 struct DetectorConfig {
@@ -139,6 +151,8 @@ struct DetectorConfig {
     BackendType backend = BackendType::Auto;
     std::string model_path;
     bool force_cpu = false;
+    bool enable_cv_style_detect = true;
+    bool enable_waist_cut = true;
 };
 
 struct RuntimeMeta {

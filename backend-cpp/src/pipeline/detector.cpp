@@ -1,4 +1,7 @@
 #include "detector.hpp"
+#include "../detector/cv_geometry.hpp"
+#include "../detector/cv_refinement.hpp"
+#include "../detector/cv_typography.hpp"
 #include "../utils.hpp"
 
 #ifdef _MSC_VER
@@ -241,7 +244,7 @@ json DetectedBubble::to_json() const {
     for (const auto& pt : polygon) {
         poly.push_back(json::array({pt[0], pt[1]}));
     }
-    return {
+    json j = {
         {"id", id},
         {"order", order},
         {"bbox", {bbox[0], bbox[1], bbox[2], bbox[3]}},
@@ -252,6 +255,39 @@ json DetectedBubble::to_json() const {
         {"text_direction", text_direction},
         {"category", category},
     };
+    if (!room_polygon.empty()) {
+        json rpoly = json::array();
+        for (const auto& pt : room_polygon) {
+            rpoly.push_back(json::array({round_4(pt[0]), round_4(pt[1])}));
+        }
+        j["room_polygon"] = std::move(rpoly);
+    }
+    if (angle_deg.has_value()) {
+        j["angle_deg"] = round_4(static_cast<double>(*angle_deg));
+    }
+    if (estimated_font_size.has_value()) {
+        j["estimated_font_size"] = round_4(static_cast<double>(*estimated_font_size));
+    }
+    if (text_color.has_value()) {
+        j["text_color"] = json::array({
+            static_cast<int>((*text_color)[0]),
+            static_cast<int>((*text_color)[1]),
+            static_cast<int>((*text_color)[2])
+        });
+    }
+    if (outline.has_value()) {
+        j["outline"] = {
+            {"color", json::array({
+                static_cast<int>(outline->color[0]),
+                static_cast<int>(outline->color[1]),
+                static_cast<int>(outline->color[2])
+            })},
+            {"width", outline->width}
+        };
+    } else if (angle_deg.has_value()) {
+        j["outline"] = nullptr;
+    }
+    return j;
 }
 
 json LayoutRegion::to_json() const {
@@ -1177,7 +1213,8 @@ DetectionResult TextDetector::run_rfdetr(
         try {
             outputs = run_inference(handle);
             provider_used = handle.active_provider;
-        } catch (const Ort::Exception&) {
+        } catch (const Ort::Exception& ex) {
+            std::fprintf(stderr, "[Vellum][RF-DETR] %s inference failed: %s\n", handle.active_provider.c_str(), ex.what());
             if (handle.active_provider == "CPUExecutionProvider") {
                 throw;
             }
@@ -1193,7 +1230,7 @@ DetectionResult TextDetector::run_rfdetr(
     const auto labels_shape = outputs[1].GetTensorTypeAndShapeInfo().GetShape();
     const auto masks_shape = outputs[2].GetTensorTypeAndShapeInfo().GetShape();
     if (dets_shape.size() != 3 || labels_shape.size() != 3 || masks_shape.size() != 4) {
-        throw std::runtime_error("Unexpected tensor rank from Koharu RF-DETR ONNX model.");
+        throw std::runtime_error("Unexpected tensor rank from RF-DETR ONNX model.");
     }
 
     const int num_queries = static_cast<int>(dets_shape[1]);
@@ -1229,11 +1266,7 @@ DetectionResult TextDetector::run_rfdetr(
         all_candidates.end(),
         [](const ScoredCandidate& a, const ScoredCandidate& b) { return a.score > b.score; });
 
-    std::vector<std::array<float, 4>> boxes_xyxy;
-    std::vector<float> scores;
-    std::vector<int> query_indices;
-    std::vector<int> class_ids;
-
+    std::vector<vellum::detector::RawTextCandidate> raw_text_candidates;
     std::vector<std::array<float, 4>> bubble_boxes_xyxy;
     std::vector<float> bubble_scores;
 
@@ -1262,10 +1295,15 @@ DetectionResult TextDetector::run_rfdetr(
         if (cand.class_id == 0 || cand.class_id == 1) {
             const float thresh = (cand.class_id == 0) ? text_conf_t : sfx_conf_t;
             if (cand.score < thresh) continue;
-            boxes_xyxy.push_back(xyxy);
-            scores.push_back(cand.score);
-            query_indices.push_back(cand.query_idx);
-            class_ids.push_back(cand.class_id);
+            raw_text_candidates.push_back(vellum::detector::RawTextCandidate{
+                cand.query_idx,
+                cand.class_id,
+                cand.score,
+                xyxy[0],
+                xyxy[1],
+                xyxy[2],
+                xyxy[3]
+            });
         } else if (cand.class_id == 2) {
             if (cand.score < bubble_conf_t) continue;
             bubble_boxes_xyxy.push_back(xyxy);
@@ -1275,6 +1313,23 @@ DetectionResult TextDetector::run_rfdetr(
             panel_boxes_xyxy.push_back(xyxy);
             panel_scores.push_back(cand.score);
         }
+    }
+
+    // Enforce `one_label_per_query`: `text` (0) beats `onomatopoeia` (1) on the same query.
+    const auto dedup_candidates = vellum::detector::enforceOneLabelPerQuery(raw_text_candidates);
+    std::vector<std::array<float, 4>> boxes_xyxy;
+    std::vector<float> scores;
+    std::vector<int> query_indices;
+    std::vector<int> class_ids;
+    boxes_xyxy.reserve(dedup_candidates.size());
+    scores.reserve(dedup_candidates.size());
+    query_indices.reserve(dedup_candidates.size());
+    class_ids.reserve(dedup_candidates.size());
+    for (const auto& c : dedup_candidates) {
+        boxes_xyxy.push_back({c.x1, c.y1, c.x2, c.y2});
+        scores.push_back(c.score);
+        query_indices.push_back(c.query_idx);
+        class_ids.push_back(c.class_id);
     }
 
     const bool is_rtl = resolve_is_rtl(options.source_language, options.reading_order);
@@ -1314,129 +1369,187 @@ DetectionResult TextDetector::run_rfdetr(
 
     const auto keep_indices = nms_xyxy(boxes_xyxy, scores, nms_t);
 
-    std::vector<RawBox> raw_boxes;
-    raw_boxes.reserve(keep_indices.size());
+    // Sample per-block RF-DETR instance masks in native page pixel coordinates
+    const float scale_mx = static_cast<float>(mask_w) / static_cast<float>(orig_w);
+    const float scale_my = static_cast<float>(mask_h) / static_cast<float>(orig_h);
+    const size_t mask_plane = static_cast<size_t>(mask_h) * static_cast<size_t>(mask_w);
+    const int mask_search_pad = std::max(24, options.box_padding * 2);
+
+    std::vector<vellum::detector::RefinementBlock> ref_blocks;
+    ref_blocks.reserve(keep_indices.size());
+    int next_orig_idx = 0;
+
     for (size_t k : keep_indices) {
         const auto& b = boxes_xyxy[k];
-        const int bx1 = clampi(static_cast<int>(std::lround(b[0])) - options.box_padding, 0, orig_w);
-        const int by1 = clampi(static_cast<int>(std::lround(b[1])) - options.box_padding, 0, orig_h);
-        const int bx2 = clampi(static_cast<int>(std::lround(b[2])) + options.box_padding, 0, orig_w);
-        const int by2 = clampi(static_cast<int>(std::lround(b[3])) + options.box_padding, 0, orig_h);
+        const int bx1 = clampi(static_cast<int>(std::lround(b[0])), 0, orig_w);
+        const int by1 = clampi(static_cast<int>(std::lround(b[1])), 0, orig_h);
+        const int bx2 = clampi(static_cast<int>(std::lround(b[2])), 0, orig_w);
+        const int by2 = clampi(static_cast<int>(std::lround(b[3])), 0, orig_h);
+        if ((bx2 - bx1) < 6 || (by2 - by1) < 6) {
+            continue;
+        }
+
+        vellum::detector::RefinementBlock blk;
+        blk.original_index = next_orig_idx++;
+        blk.query_idx = query_indices[k];
+        blk.class_id = class_ids[k];
+        blk.score = scores[k];
+        blk.bbox = vellum::detector::RectI{bx1, by1, bx2, by2};
+        blk.is_vertical = (by2 - by1) > static_cast<int>(std::lround(static_cast<double>(bx2 - bx1) * 1.2));
+
+        const int q = blk.query_idx;
+        if (q >= 0 && q < num_queries) {
+            const float* q_mask = masks_ptr + static_cast<size_t>(q) * mask_plane;
+            const int line = std::max(1, std::min(bx2 - bx1, by2 - by1));
+            const int pad_x = std::max(mask_search_pad, blk.is_vertical ? mask_search_pad : line);
+            const int pad_y = std::max(mask_search_pad, blk.is_vertical ? line : mask_search_pad);
+            blk.raw_mask_rect = blk.bbox.expanded(pad_x, pad_y, orig_w, orig_h);
+            const int rw = blk.raw_mask_rect.width();
+            const int rh = blk.raw_mask_rect.height();
+            blk.raw_mask.assign(static_cast<size_t>(rw) * static_cast<size_t>(rh), 0);
+
+            for (int ry = 0; ry < rh; ++ry) {
+                const int gy = blk.raw_mask_rect.y1 + ry;
+                const float sy = (static_cast<float>(gy) + 0.5f) * scale_my - 0.5f;
+                uint8_t* dst_row = blk.raw_mask.data() + static_cast<size_t>(ry) * static_cast<size_t>(rw);
+                for (int rx = 0; rx < rw; ++rx) {
+                    const int gx = blk.raw_mask_rect.x1 + rx;
+                    const float sx = (static_cast<float>(gx) + 0.5f) * scale_mx - 0.5f;
+                    if (sample_bilinear_f32(q_mask, mask_w, mask_h, sx, sy) >= mask_logit_t) {
+                        dst_row[rx] = 255;
+                    }
+                }
+            }
+        }
+
+        ref_blocks.push_back(std::move(blk));
+    }
+
+    // Consolidate overlapping SFX blocks (shared glyph overlap >= 0.50) and run
+    // Smallest-Box-Wins + 5-Stage Otsu & Plain-Paper glyph mask refinement.
+    vellum::detector::RefinementConfig ref_cfg;
+    vellum::detector::mergeOverlappingSfxBlocks(ref_blocks, ref_cfg.sfx_merge_overlap);
+    std::vector<uint8_t> binary_mask = vellum::detector::refineTextMasks(
+        rgb_data, orig_w, orig_h, ref_blocks, ref_cfg);
+
+    std::vector<RawBox> raw_boxes;
+    raw_boxes.reserve(ref_blocks.size());
+    for (const auto& blk : ref_blocks) {
+        vellum::detector::RectI out_box = blk.bbox;
+        if (!blk.refined_mask_rect.empty()) {
+            out_box = out_box.united(blk.refined_mask_rect);
+        }
+        const int bx1 = clampi(out_box.x1 - options.box_padding, 0, orig_w);
+        const int by1 = clampi(out_box.y1 - options.box_padding, 0, orig_h);
+        const int bx2 = clampi(out_box.x2 + options.box_padding, 0, orig_w);
+        const int by2 = clampi(out_box.y2 + options.box_padding, 0, orig_h);
         if ((bx2 - bx1) < 8 || (by2 - by1) < 8) {
             continue;
         }
 
-        const bool is_vertical = (by2 - by1) > static_cast<int>(std::lround(static_cast<double>(bx2 - bx1) * 1.2));
         RawBox rb;
         rb.bbox = {bx1, by1, bx2, by2};
-        rb.score = scores[k];
-        rb.direction = is_vertical ? "vertical" : "horizontal";
-        rb.category = (class_ids[k] == 1) ? "onomatopoeia" : "text";
-        rb.source_query_index = query_indices[k];
+        rb.score = blk.score;
+        rb.direction = blk.is_vertical ? "vertical" : "horizontal";
+        rb.category = (blk.class_id == 1) ? "onomatopoeia" : "text";
+        rb.source_query_index = blk.query_idx;
         raw_boxes.push_back(std::move(rb));
     }
 
-    std::vector<int> sorted_queries;
     auto bubbles = sort_reading_order(
         raw_boxes,
         options.source_language,
         orig_h,
-        &sorted_queries,
+        nullptr,
         options.reading_order,
         &panels);
 
-    // Assemble binary `(orig_h, orig_w)` uint8 text segmentation mask from kept instance mask logits
-    std::vector<uint8_t> binary_mask(static_cast<size_t>(orig_w) * static_cast<size_t>(orig_h), 0);
-    const float scale_mx = static_cast<float>(mask_w) / static_cast<float>(orig_w);
-    const float scale_my = static_cast<float>(mask_h) / static_cast<float>(orig_h);
-    const size_t mask_plane = static_cast<size_t>(mask_h) * static_cast<size_t>(mask_w);
-    const int roi_pad = std::max(8, options.box_padding);
-    const int mask_search_pad = std::max(24, options.box_padding * 2);
-
-    for (size_t i = 0; i < bubbles.size(); ++i) {
-        const int q = sorted_queries[i];
-        if (q < 0 || q >= num_queries) continue;
-        const float* q_mask = masks_ptr + static_cast<size_t>(q) * mask_plane;
-
-        auto& bb = bubbles[i].bbox;
-        const int rx1 = clampi(bb[0] - mask_search_pad, 0, orig_w);
-        const int ry1 = clampi(bb[1] - mask_search_pad, 0, orig_h);
-        const int rx2 = clampi(bb[2] + mask_search_pad, 0, orig_w);
-        const int ry2 = clampi(bb[3] + mask_search_pad, 0, orig_h);
-
-        size_t active_in_box = 0;
-        int m_min_x = orig_w;
-        int m_min_y = orig_h;
-        int m_max_x = -1;
-        int m_max_y = -1;
-        for (int y = ry1; y < ry2; ++y) {
-            const float sy = (static_cast<float>(y) + 0.5f) * scale_my - 0.5f;
-            uint8_t* dst_row = binary_mask.data() + static_cast<size_t>(y) * static_cast<size_t>(orig_w);
-            for (int x = rx1; x < rx2; ++x) {
-                const float sx = (static_cast<float>(x) + 0.5f) * scale_mx - 0.5f;
-                if (sample_bilinear_f32(q_mask, mask_w, mask_h, sx, sy) >= mask_logit_t) {
-                    dst_row[x] = 255;
-                    ++active_in_box;
-                    if (x < m_min_x) m_min_x = x;
-                    if (x > m_max_x) m_max_x = x;
-                    if (y < m_min_y) m_min_y = y;
-                    if (y > m_max_y) m_max_y = y;
-                }
-            }
-        }
-
-        // Union the regressed bbox with the instance segmentation mask extent so tight RF-DETR
-        // box edges never clip short top/bottom lines (e.g. centered short first lines in bubbles).
-        if (active_in_box > 0 && m_max_x >= m_min_x && m_max_y >= m_min_y) {
-            const int mask_pad = std::max(4, options.box_padding);
-            bb[0] = std::min(bb[0], clampi(m_min_x - mask_pad, 0, orig_w));
-            bb[1] = std::min(bb[1], clampi(m_min_y - mask_pad, 0, orig_h));
-            bb[2] = std::max(bb[2], clampi(m_max_x + 1 + mask_pad, 0, orig_w));
-            bb[3] = std::max(bb[3], clampi(m_max_y + 1 + mask_pad, 0, orig_h));
-            bubbles[i].polygon = {{
-                {bb[0], bb[1]},
-                {bb[2], bb[1]},
-                {bb[2], bb[3]},
-                {bb[0], bb[3]},
-            }};
-        }
-
-        // Safety fallback for tiny text boxes that may fall below 288x288 mask resolution
-        if (active_in_box == 0) {
-            for (int y = bb[1]; y < bb[3]; ++y) {
-                uint8_t* dst_row = binary_mask.data() + static_cast<size_t>(y) * static_cast<size_t>(orig_w);
-                for (int x = bb[0]; x < bb[2]; ++x) {
-                    dst_row[x] = 255;
-                }
-            }
-        }
-    }
-
-    if (options.dilate_kernel_size > 1) {
-        dilate_binary_mask_ellipse(binary_mask, orig_w, orig_h, options.dilate_kernel_size);
-    }
-
-    if (options.restrict_mask_to_bboxes && !bubbles.empty()) {
-        std::vector<uint8_t> roi_mask(binary_mask.size(), 0);
-        for (const auto& b : bubbles) {
-            const int rx1 = clampi(b.bbox[0] - roi_pad, 0, orig_w);
-            const int ry1 = clampi(b.bbox[1] - roi_pad, 0, orig_h);
-            const int rx2 = clampi(b.bbox[2] + roi_pad, 0, orig_w);
-            const int ry2 = clampi(b.bbox[3] + roi_pad, 0, orig_h);
-            for (int y = ry1; y < ry2; ++y) {
-                std::memset(
-                    roi_mask.data() + static_cast<size_t>(y) * static_cast<size_t>(orig_w) + static_cast<size_t>(rx1),
-                    255,
-                    static_cast<size_t>(rx2 - rx1));
-            }
-        }
-        for (size_t i = 0; i < binary_mask.size(); ++i) {
-            binary_mask[i] &= roi_mask[i];
-        }
-    }
-
     populate_bubble_and_safe_bboxes(
         bubbles, rgb_data, orig_w, orig_h, &speech_bubbles, &panels, &binary_mask);
+
+    // Phase A.2 & A.3: Panel-first reading order (with classic CV panel fallback),
+    // conjoined balloon waist-cutting / watershed room_polygon, and 0-VRAM CV typography.
+    if (!bubbles.empty()) {
+        std::vector<vellum::detector::RectI> panel_rects;
+        if (!panels.empty()) {
+            panel_rects.reserve(panels.size());
+            for (const auto& p : panels) {
+                panel_rects.push_back(vellum::detector::RectI{p.bbox[0], p.bbox[1], p.bbox[2], p.bbox[3]});
+            }
+        } else {
+            panel_rects = vellum::detector::detectPanelsClassicCV(rgb_data, orig_w, orig_h);
+        }
+
+        std::vector<vellum::detector::RectI> text_rects;
+        text_rects.reserve(bubbles.size());
+        for (const auto& b : bubbles) {
+            text_rects.push_back(vellum::detector::RectI{b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]});
+        }
+        const auto perm = vellum::detector::sortReadingOrderPanelFirst(text_rects, panel_rects, is_rtl);
+        if (perm.size() == bubbles.size()) {
+            std::vector<DetectedBubble> reordered;
+            reordered.reserve(bubbles.size());
+            int ord = 1;
+            for (size_t idx : perm) {
+                DetectedBubble b = std::move(bubbles[idx]);
+                char id_buf[32]{};
+                std::snprintf(id_buf, sizeof(id_buf), "bubble_%03d", ord);
+                b.id = id_buf;
+                b.order = ord++;
+                reordered.push_back(std::move(b));
+            }
+            bubbles = std::move(reordered);
+        }
+
+        // Conjoined balloon waist-cutting + watershed room_polygon (<= 32 vertices)
+        std::vector<vellum::detector::RoomSeedBlock> seeds;
+        seeds.reserve(bubbles.size());
+        for (size_t i = 0; i < bubbles.size(); ++i) {
+            vellum::detector::RoomSeedBlock s;
+            s.block_index = static_cast<int>(i);
+            s.bbox = vellum::detector::RectI{
+                bubbles[i].bbox[0], bubbles[i].bbox[1], bubbles[i].bbox[2], bubbles[i].bbox[3]
+            };
+            seeds.push_back(std::move(s));
+        }
+
+        std::vector<vellum::detector::RectI> bubble_rects;
+        bubble_rects.reserve(speech_bubbles.size());
+        for (const auto& sb : speech_bubbles) {
+            bubble_rects.push_back(vellum::detector::RectI{sb.bbox[0], sb.bbox[1], sb.bbox[2], sb.bbox[3]});
+        }
+
+        const auto room_polys = vellum::detector::computePageRoomPolygons(
+            rgb_data, orig_w, orig_h, seeds, bubble_rects, &binary_mask, options.enable_waist_cut);
+        for (size_t i = 0; i < bubbles.size() && i < room_polys.size(); ++i) {
+            bubbles[i].room_polygon.reserve(room_polys[i].size());
+            for (const auto& pt : room_polys[i]) {
+                bubbles[i].room_polygon.push_back({pt.x, pt.y});
+            }
+        }
+
+        // 0-VRAM CV typography metadata (gated by enable_cv_style_detect)
+        if (options.enable_cv_style_detect) {
+            const vellum::detector::RectI page_rect{0, 0, orig_w, orig_h};
+            for (auto& b : bubbles) {
+                const vellum::detector::RectI tb{b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]};
+                const bool is_vert = (b.text_direction == "vertical");
+                const bool is_sfx = (b.category == "onomatopoeia");
+                const auto style = vellum::detector::analyzeBlockTypographyFromBox(
+                    rgb_data, orig_w, orig_h, tb, is_vert, is_sfx, &page_rect, &binary_mask);
+                if (style.valid) {
+                    b.angle_deg = style.angle_deg;
+                    b.estimated_font_size = style.estimated_font_size;
+                    b.text_color = style.text_color;
+                    if (style.outline.has_value()) {
+                        b.outline = DetectedOutline{style.outline->color, style.outline->width};
+                    } else {
+                        b.outline = std::nullopt;
+                    }
+                }
+            }
+        }
+    }
 
     DetectionResult result;
     result.width = orig_w;
@@ -1536,7 +1649,8 @@ DetectionResult TextDetector::run_comic_text_detector(
         try {
             outputs = run_inference(handle);
             provider_used = handle.active_provider;
-        } catch (const Ort::Exception&) {
+        } catch (const Ort::Exception& ex) {
+            std::fprintf(stderr, "[Vellum][RF-DETR] %s inference failed: %s\n", handle.active_provider.c_str(), ex.what());
             if (handle.active_provider == "CPUExecutionProvider") {
                 throw;
             }
@@ -1660,6 +1774,76 @@ DetectionResult TextDetector::run_comic_text_detector(
 
     populate_bubble_and_safe_bboxes(
         bubbles, rgb_data, orig_w, orig_h, nullptr, nullptr, &binary_mask);
+
+    // Classic CV panel fallback + panel-first reading order + room_polygon + typography for CTD
+    if (!bubbles.empty()) {
+        const auto fallback_panels = vellum::detector::detectPanelsClassicCV(rgb_data, orig_w, orig_h);
+        std::vector<vellum::detector::RectI> text_rects;
+        text_rects.reserve(bubbles.size());
+        for (const auto& b : bubbles) {
+            text_rects.push_back(vellum::detector::RectI{b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]});
+        }
+        const auto perm = vellum::detector::sortReadingOrderPanelFirst(text_rects, fallback_panels, is_rtl);
+        if (perm.size() == bubbles.size()) {
+            std::vector<DetectedBubble> reordered;
+            reordered.reserve(bubbles.size());
+            int ord = 1;
+            for (size_t idx : perm) {
+                DetectedBubble b = std::move(bubbles[idx]);
+                char id_buf[32]{};
+                std::snprintf(id_buf, sizeof(id_buf), "bubble_%03d", ord);
+                b.id = id_buf;
+                b.order = ord++;
+                reordered.push_back(std::move(b));
+            }
+            bubbles = std::move(reordered);
+        }
+
+        std::vector<vellum::detector::RoomSeedBlock> seeds;
+        std::vector<vellum::detector::RectI> bubble_rects;
+        seeds.reserve(bubbles.size());
+        bubble_rects.reserve(bubbles.size());
+        for (size_t i = 0; i < bubbles.size(); ++i) {
+            vellum::detector::RoomSeedBlock s;
+            s.block_index = static_cast<int>(i);
+            s.bbox = vellum::detector::RectI{
+                bubbles[i].bbox[0], bubbles[i].bbox[1], bubbles[i].bbox[2], bubbles[i].bbox[3]
+            };
+            seeds.push_back(std::move(s));
+            bubble_rects.push_back(vellum::detector::RectI{
+                bubbles[i].bubble_bbox[0], bubbles[i].bubble_bbox[1],
+                bubbles[i].bubble_bbox[2], bubbles[i].bubble_bbox[3]
+            });
+        }
+        const auto room_polys = vellum::detector::computePageRoomPolygons(
+            rgb_data, orig_w, orig_h, seeds, bubble_rects, &binary_mask, options.enable_waist_cut);
+        for (size_t i = 0; i < bubbles.size() && i < room_polys.size(); ++i) {
+            bubbles[i].room_polygon.reserve(room_polys[i].size());
+            for (const auto& pt : room_polys[i]) {
+                bubbles[i].room_polygon.push_back({pt.x, pt.y});
+            }
+        }
+
+        if (options.enable_cv_style_detect) {
+            const vellum::detector::RectI page_rect{0, 0, orig_w, orig_h};
+            for (auto& b : bubbles) {
+                const vellum::detector::RectI tb{b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]};
+                const bool is_vert = (b.text_direction == "vertical");
+                const auto style = vellum::detector::analyzeBlockTypographyFromBox(
+                    rgb_data, orig_w, orig_h, tb, is_vert, false, &page_rect, &binary_mask);
+                if (style.valid) {
+                    b.angle_deg = style.angle_deg;
+                    b.estimated_font_size = style.estimated_font_size;
+                    b.text_color = style.text_color;
+                    if (style.outline.has_value()) {
+                        b.outline = DetectedOutline{style.outline->color, style.outline->width};
+                    } else {
+                        b.outline = std::nullopt;
+                    }
+                }
+            }
+        }
+    }
 
     DetectionResult result;
     result.width = orig_w;
