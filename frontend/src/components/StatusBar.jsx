@@ -1,9 +1,10 @@
 import React from 'react';
-import { Cpu, Crosshair, Loader2, Maximize2, Server } from 'lucide-react';
+import { AlertTriangle, Cpu, Crosshair, Loader2, Maximize2, Server } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import useEditorStore from '../store/useEditorStore.js';
 
 const PROVIDER_LABELS = {
+  none: 'Manual (No-LLM)',
   lmstudio: 'LM Studio',
   ollama: 'Ollama',
   openai: 'OpenAI',
@@ -71,6 +72,7 @@ export default function StatusBar({
     detectorModel,
     lmStudio,
     activeProviderSummary,
+    hardware,
     pipelineProvider,
     pipelineModel,
     pipelineBaseUrl,
@@ -91,6 +93,7 @@ export default function StatusBar({
         s.runtimeStatus.detectorModel || s.pipelineConfig.detectionModel,
       lmStudio: s.runtimeStatus.lmStudio,
       activeProviderSummary: s.runtimeStatus.activeProviderSummary,
+      hardware: s.runtimeStatus.hardware,
       pipelineProvider: s.pipelineConfig.provider,
       pipelineModel: s.pipelineConfig.model,
       pipelineBaseUrl: s.pipelineConfig.baseUrl,
@@ -102,7 +105,9 @@ export default function StatusBar({
   const zoomPercent = Math.round((zoom || 1) * 100);
   const hasCursor =
     typeof cursorX === 'number' && typeof cursorY === 'number';
-  const providerMeta = formatExecutionProvider(executionProvider);
+  const resolvedHardwareProvider =
+    hardware?.execution_provider || executionProvider;
+  const providerMeta = formatExecutionProvider(resolvedHardwareProvider);
   const normExecMode =
     executionMode === 'cpu' || executionMode === 'cpu_only'
       ? 'cpu_only'
@@ -111,21 +116,30 @@ export default function StatusBar({
       : 'hybrid';
   const hybridStatusLabel =
     normExecMode === 'cpu_only'
-      ? 'CPU Only'
+      ? 'CPU'
+      : providerMeta.short !== '-'
+      ? providerMeta.short
       : normExecMode === 'force_gpu'
-      ? providerMeta.isGpu
-        ? `All GPU · ${providerMeta.short}`
-        : 'Force GPU'
-      : 'Hybrid GPU+CPU';
-  const hybridIsGpu = normExecMode !== 'cpu_only' && (providerMeta.isGpu || normExecMode === 'hybrid');
+      ? 'GPU'
+      : 'Hybrid';
+  const hybridIsGpu = normExecMode !== 'cpu_only' && providerMeta.isGpu;
+
+  const isDirectMlRfDetrWarning =
+    normExecMode !== 'cpu_only' &&
+    (resolvedHardwareProvider === 'DmlExecutionProvider' ||
+      String(hardware?.backend || '').toLowerCase().includes('directml')) &&
+    String(detectorModel || '').toLowerCase().includes('rfdetr');
 
   const activeProviderId =
-    activeProviderSummary?.provider || pipelineProvider || 'lmstudio';
+    pipelineProvider || activeProviderSummary?.provider || 'none';
   const providerDisplayName =
     PROVIDER_LABELS[activeProviderId] || activeProviderId;
 
+  const isNoLlm = activeProviderId === 'none';
   const isLocalLmStudio = activeProviderId === 'lmstudio';
-  const isLlmConnected = isLocalLmStudio
+  const isLlmConnected = isNoLlm
+    ? true
+    : isLocalLmStudio
     ? Boolean(lmStudio?.connected)
     : Boolean(activeProviderSummary?.model || pipelineModel);
 
@@ -137,7 +151,9 @@ export default function StatusBar({
     pipelineModel ||
     '';
 
-  const shortModelLabel = isLlmConnected
+  const shortModelLabel = isNoLlm
+    ? 'Detect+Inpaint'
+    : isLlmConnected
     ? formatShortModelName(fullModelName)
     : 'Offline';
 
@@ -146,13 +162,15 @@ export default function StatusBar({
     pipelineBaseUrl ||
     (isLocalLmStudio ? 'http://localhost:1234/v1' : 'Not configured');
 
-  const llmTooltip = isLlmConnected
+  const llmTooltip = isNoLlm
+    ? 'Manual / No-LLM Mode: Detect + Inpaint only'
+    : isLlmConnected
     ? `LLM Provider: ${providerDisplayName}\nEndpoint: ${llmEndpoint}\nActive Model: ${fullModelName || 'Default'}\nClick to refresh status`
     : `LLM Provider: ${providerDisplayName} (Offline)\nEndpoint: ${llmEndpoint}\n${lmStudio?.error || 'Click to retry connection'}`;
 
   return (
     <footer
-      className="h-6 min-h-[24px] max-h-[24px] shrink-0 border-t border-studio-border bg-studio-panel px-2.5 flex items-center justify-between gap-3 text-[11px] leading-none text-studio-text-secondary select-none z-30"
+      className="h-[var(--studio-status-h)] min-h-[var(--studio-status-h)] max-h-[var(--studio-status-h)] shrink-0 border-t border-studio-border bg-studio-panel px-[var(--studio-pad-x)] flex items-center justify-between gap-3 text-[length:var(--studio-font-size)] leading-none text-studio-text-secondary select-none z-30 transition-[height]"
       role="status"
       aria-label="Vellum Status Bar"
     >
@@ -253,16 +271,17 @@ export default function StatusBar({
 
       {/* Right: ONNX GPU/CPU Provider + Active Detector + Active LLM Model */}
       <div className="flex items-center gap-2.5 shrink-0">
-        {/* Hardware Execution Provider (Smart Hybrid GPU+CPU / All GPU / CPU Only) */}
+        {/* Hardware Execution Provider Badge (CUDA / DirectML / CPU) */}
         <div
+          data-testid="statusbar-hardware-badge"
           className="inline-flex items-center gap-1.5 font-mono text-[11px]"
-          title={`Execution Mode: ${hybridStatusLabel}\nDetection: ${detectorProvider || executionProvider || 'GPU'}\nOCR: ${ocrProvider || 'CPUExecutionProvider'}\nInpainting: ${inpainterProvider || executionProvider || 'GPU'}\nActive Detector: ${detectorModel || 'Auto'}`}
+          title={`Active Engine: ${hybridStatusLabel}${hardware?.gpu_name ? ` (${hardware.gpu_name})` : ''}\nDetection: ${detectorProvider || resolvedHardwareProvider || 'CPU'}\nOCR: ${ocrProvider || 'CPUExecutionProvider'}\nInpainting: ${inpainterProvider || resolvedHardwareProvider || 'CPU'}\nActive Detector: ${detectorModel || 'Auto'}`}
         >
           <span
             className={`h-1.5 w-1.5 rounded-full shrink-0 ${
               hybridIsGpu
                 ? 'bg-studio-accent'
-                : executionProvider
+                : resolvedHardwareProvider
                 ? 'bg-studio-text-muted'
                 : 'bg-studio-border-strong'
             }`}
@@ -285,6 +304,16 @@ export default function StatusBar({
               </span>
             </>
           )}
+          {isDirectMlRfDetrWarning && (
+            <span
+              data-testid="statusbar-directml-rfdetr-warning"
+              className="inline-flex items-center gap-1 rounded-studio-sm border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-400"
+              title="RF-DETR Seg 2XL on DirectML can be slow. Recommend YOLO11m-Seg for DirectML or the CUDA build for RF-DETR."
+            >
+              <AlertTriangle className="h-2.5 w-2.5 shrink-0" />
+              <span className="hidden lg:inline">Use YOLO11m on DirectML</span>
+            </span>
+          )}
         </div>
 
         <span className="h-3 w-px bg-studio-border shrink-0" aria-hidden="true" />
@@ -299,7 +328,11 @@ export default function StatusBar({
         >
           <span
             className={`h-1.5 w-1.5 rounded-full shrink-0 ${
-              isLlmConnected ? 'bg-studio-success' : 'bg-studio-danger'
+              isNoLlm
+                ? 'bg-studio-text-muted'
+                : isLlmConnected
+                ? 'bg-studio-success'
+                : 'bg-studio-danger'
             }`}
           />
           <Server className="h-3 w-3 text-studio-text-muted shrink-0 hidden sm:inline" />
@@ -309,7 +342,9 @@ export default function StatusBar({
           <span className="text-studio-border-strong hidden sm:inline">·</span>
           <span
             className={`font-mono truncate ${
-              isLlmConnected
+              isNoLlm
+                ? 'text-studio-text-secondary'
+                : isLlmConnected
                 ? 'text-studio-text font-medium'
                 : 'text-studio-danger'
             }`}

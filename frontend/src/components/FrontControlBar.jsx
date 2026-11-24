@@ -9,7 +9,7 @@ import {
   Square,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
-import useEditorStore from '../store/useEditorStore.js';
+import useEditorStore, { DEFAULT_PROVIDER_PRESETS } from '../store/useEditorStore.js';
 import { formatShortModelName } from './StatusBar.jsx';
 
 const SOURCE_LANGUAGES = [
@@ -59,6 +59,9 @@ export default function FrontControlBar({
     pagesCount,
     selectedPagesCount,
     hasActivePage,
+    availableProviderPresets,
+    providerModelsCache,
+    setActiveProvider,
     setActiveModel,
     setPipelineScope,
     togglePipelineStage,
@@ -80,6 +83,9 @@ export default function FrontControlBar({
       pagesCount: s.pages.length,
       selectedPagesCount: s.selectedPageIds.length,
       hasActivePage: Boolean(s.activePageId),
+      availableProviderPresets: s.availableProviderPresets,
+      providerModelsCache: s.providerModelsCache,
+      setActiveProvider: s.setActiveProvider,
       setActiveModel: s.setActiveModel,
       setPipelineScope: s.setPipelineScope,
       togglePipelineStage: s.togglePipelineStage,
@@ -88,6 +94,15 @@ export default function FrontControlBar({
       setTranslationTone: s.setTranslationTone,
     }))
   );
+
+  const activeProviderId = provider || 'none';
+  const providerList = useMemo(() => {
+    const presets =
+      Array.isArray(availableProviderPresets) && availableProviderPresets.length > 0
+        ? availableProviderPresets
+        : DEFAULT_PROVIDER_PRESETS;
+    return presets;
+  }, [availableProviderPresets]);
 
   // Deduplicated model dropdown options from live server + active config
   const modelOptions = useMemo(() => {
@@ -103,22 +118,31 @@ export default function FrontControlBar({
 
     addCandidate(model);
     addCandidate(activeProviderSummary?.model);
-    addCandidate(lmStudio?.activeModel);
-    addCandidate(lmStudio?.resolvedModelId);
-    if (Array.isArray(lmStudio?.availableModels)) {
-      lmStudio.availableModels.forEach((entry) => {
-        if (typeof entry === 'string') {
-          addCandidate(entry);
-        } else if (entry && typeof entry.id === 'string') {
-          addCandidate(entry.id);
-        }
-      });
+    const cached = providerModelsCache?.[activeProviderId];
+    if (Array.isArray(cached?.models)) {
+      cached.models.forEach(addCandidate);
+    }
+    if (activeProviderId === 'lmstudio') {
+      addCandidate(lmStudio?.activeModel);
+      addCandidate(lmStudio?.resolvedModelId);
+      if (Array.isArray(lmStudio?.availableModels)) {
+        lmStudio.availableModels.forEach((entry) => {
+          if (typeof entry === 'string') {
+            addCandidate(entry);
+          } else if (entry && typeof entry.id === 'string') {
+            addCandidate(entry.id);
+          }
+        });
+      }
     }
     return list;
-  }, [model, activeProviderSummary, lmStudio]);
+  }, [model, activeProviderSummary, providerModelsCache, activeProviderId, lmStudio]);
 
-  const isLocalLmStudio = (provider || 'lmstudio') === 'lmstudio';
-  const isModelConnected = isLocalLmStudio
+  const isLocalLmStudio = activeProviderId === 'lmstudio';
+  const isNoLlm = activeProviderId === 'none';
+  const isModelConnected = isNoLlm
+    ? true
+    : isLocalLmStudio
     ? Boolean(lmStudio?.connected)
     : Boolean(model);
 
@@ -157,35 +181,65 @@ export default function FrontControlBar({
     <div
       role="toolbar"
       aria-label="Pipeline Control Bar"
-      className="h-9 min-h-[36px] max-h-[36px] shrink-0 border-b border-studio-border bg-studio-panel px-2.5 flex items-center justify-between gap-2 z-30 select-none overflow-x-auto"
+      className="h-[var(--studio-controlbar-h)] min-h-[var(--studio-controlbar-h)] max-h-[var(--studio-controlbar-h)] shrink-0 border-b border-studio-border bg-studio-panel px-[var(--studio-pad-x)] flex items-center justify-between gap-[var(--studio-gap)] z-30 select-none overflow-x-auto transition-[height]"
     >
-      {/* Left: Active Model Selector + Scope Selector + Stage Pill Toggles */}
+      {/* Left: 1-Click Provider Switcher + Active Model Selector + Scope Selector + Stage Pill Toggles */}
       <div className="flex items-center gap-2 min-w-0 shrink-0">
-        {/* Active Model Selector */}
+        {/* 1-Click Provider Switcher (preserves saved keys/URLs per provider) */}
         <div
           className="inline-flex items-center gap-1.5 h-6 rounded-studio border border-studio-border bg-studio-surface px-2 shrink-0"
-          title={`Active LLM Model: ${model || 'None'} (${isModelConnected ? 'Connected' : 'Offline'})`}
+          title="1-Click LLM Provider Switcher (saved keys & URLs are preserved)"
         >
           <span
             className={`h-1.5 w-1.5 rounded-full shrink-0 ${
-              isModelConnected ? 'bg-studio-success' : 'bg-studio-danger'
+              isNoLlm
+                ? 'bg-studio-text-muted'
+                : isModelConnected
+                ? 'bg-studio-success'
+                : 'bg-studio-danger'
             }`}
           />
-          <Cpu className="h-3 w-3 text-studio-text-muted shrink-0" />
           <select
-            aria-label="Active Model"
-            value={model || modelOptions[0] || ''}
-            onChange={(e) => setActiveModel(e.target.value)}
+            aria-label="Active Provider"
+            data-testid="front-control-provider-select"
+            value={activeProviderId}
+            onChange={(e) => setActiveProvider(e.target.value)}
             disabled={isProcessing}
-            className="bg-transparent text-[11px] font-medium text-studio-text focus:outline-none cursor-pointer disabled:opacity-50 max-w-[140px] lg:max-w-[180px] truncate"
+            className="bg-transparent text-[11px] font-semibold text-studio-text focus:outline-none cursor-pointer disabled:opacity-50 max-w-[125px] truncate"
           >
-            {modelOptions.map((m) => (
-              <option key={m} value={m}>
-                {formatShortModelName(m)}
+            {providerList.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.id === 'none' ? 'No-LLM (Manual)' : p.name}
               </option>
             ))}
           </select>
         </div>
+
+        {/* Active Model Selector */}
+        {!isNoLlm && (
+          <div
+            className="inline-flex items-center gap-1.5 h-6 rounded-studio border border-studio-border bg-studio-surface px-2 shrink-0"
+            title={`Active LLM Model: ${model || 'None'} (${isModelConnected ? 'Connected' : 'Offline'})`}
+          >
+            <Cpu className="h-3 w-3 text-studio-text-muted shrink-0" />
+            <select
+              aria-label="Active Model"
+              value={model || modelOptions[0] || ''}
+              onChange={(e) => setActiveModel(e.target.value)}
+              disabled={isProcessing}
+              className="bg-transparent text-[11px] font-medium text-studio-text focus:outline-none cursor-pointer disabled:opacity-50 max-w-[140px] lg:max-w-[180px] truncate"
+            >
+              {modelOptions.length === 0 && (
+                <option value="">Select model…</option>
+              )}
+              {modelOptions.map((m) => (
+                <option key={m} value={m}>
+                  {formatShortModelName(m)}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
 
         <span className="h-4 w-px bg-studio-border shrink-0" aria-hidden="true" />
 

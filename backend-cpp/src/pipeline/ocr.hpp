@@ -34,6 +34,8 @@ struct OcrBubbleInput {
     std::vector<std::array<int, 2>> polygon;
     float confidence = 1.0f;
     std::string text_direction = "horizontal";  // "horizontal" | "vertical"
+    std::array<int, 4> glyph_mask_rect{0, 0, 0, 0};  // Optional local glyph mask bounds [x1, y1, x2, y2]
+    std::vector<uint8_t> glyph_mask;                  // Optional local binary glyph mask (0 or 255)
 };
 
 struct OcrBubbleOutput {
@@ -56,6 +58,11 @@ struct OcrOptions {
     std::string lmstudio_api_key = "";
     bool auto_unload = true;
     bool force_cpu = false;
+    // Optional full-page binary text-stroke/glyph mask (width * height, 0 or 255)
+    // used for neighbor-mask blanking prior to OCR cropping.
+    const std::vector<uint8_t>* page_glyph_mask = nullptr;
+    int page_glyph_mask_w = 0;
+    int page_glyph_mask_h = 0;
 };
 
 struct OcrStageResult {
@@ -64,6 +71,7 @@ struct OcrStageResult {
     std::string ocr_model;        // resolved canonical ID: "manga-ocr" | "rapidocr-ppocrv4" | "paddleocr-vl-gguf"
     std::string requested_model;  // requested option: "auto" | "manga-ocr" | "rapidocr-ppocrv4" | "paddleocr-vl-gguf"
     std::string execution_provider = "CPUExecutionProvider";
+    int neighbor_blanked_blocks = 0;
     std::vector<OcrBubbleOutput> blocks;
 };
 
@@ -148,7 +156,8 @@ private:
         int img_w,
         int img_h,
         const std::array<int, 4>& bbox,
-        bool erase_border_ink = false);
+        bool erase_border_ink = false,
+        std::array<int, 4>* out_crop_rect = nullptr);
     static void erase_border_touching_ink(RgbImage& crop);
     static RgbImage pad_rgb_white(
         const RgbImage& src,

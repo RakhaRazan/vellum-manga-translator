@@ -1,4 +1,7 @@
 #include "yolo_seg_backend.hpp"
+#include "cv_geometry.hpp"
+#include "cv_refinement.hpp"
+#include "cv_typography.hpp"
 #include "geometry_postproc.hpp"
 #include "../pipeline/ort_provider.hpp"
 
@@ -11,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
@@ -408,10 +412,27 @@ PageDetectionResult Yolo11SegBackend::detectPage(
         out_names.push_back(s.c_str());
     }
 
-    auto outputs = session_->Run(
-        Ort::RunOptions{nullptr},
-        in_names, &input_tensor, 1,
-        out_names.data(), out_names.size());
+    std::vector<Ort::Value> outputs;
+    try {
+        outputs = session_->Run(
+            Ort::RunOptions{nullptr},
+            in_names, &input_tensor, 1,
+            out_names.data(), out_names.size());
+    } catch (const Ort::Exception& ex) {
+        std::fprintf(stderr, "[Vellum][YOLO11m-Seg] %s inference failed: %s\n", active_provider_.c_str(), ex.what());
+        if (active_provider_ == "CPUExecutionProvider") {
+            throw;
+        }
+        DetectorConfig cpu_cfg = config;
+        cpu_cfg.force_cpu = true;
+        if (!load(cpu_cfg) || !session_) {
+            throw;
+        }
+        outputs = session_->Run(
+            Ort::RunOptions{nullptr},
+            in_names, &input_tensor, 1,
+            out_names.data(), out_names.size());
+    }
 
     const auto t_infer = std::chrono::steady_clock::now();
 
@@ -638,6 +659,100 @@ PageDetectionResult Yolo11SegBackend::detectPage(
     }
 
     runGeometryPostproc(result, config);
+
+    // Wire full 0-VRAM v2.5 CV stack (5-stage Otsu glyph refinement, waist-cut watershed
+    // room polygons <= 32 vertices, and typography/color/outline metadata) into YOLO11m-Seg.
+    if (!result.detections.empty()) {
+        std::vector<RefinementBlock> ref_blocks;
+        ref_blocks.reserve(result.detections.size());
+        std::vector<RoomSeedBlock> seeds;
+        seeds.reserve(result.detections.size());
+        std::vector<RectI> bubble_rects;
+        bubble_rects.reserve(result.detections.size());
+
+        const bool is_rtl = (config.reading_direction == ReadingDirection::RTL);
+        for (size_t i = 0; i < result.detections.size(); ++i) {
+            const auto& d = result.detections[i];
+            const BBox& core = d.safe_bbox.is_valid() ? d.safe_bbox : d.bbox;
+            const RectI core_rect = RectI{
+                static_cast<int>(std::floor(core.x1)),
+                static_cast<int>(std::floor(core.y1)),
+                static_cast<int>(std::ceil(core.x2)),
+                static_cast<int>(std::ceil(core.y2))
+            }.clamped(width, height);
+            const RectI full_rect = RectI{
+                static_cast<int>(std::floor(d.bbox.x1)),
+                static_cast<int>(std::floor(d.bbox.y1)),
+                static_cast<int>(std::ceil(d.bbox.x2)),
+                static_cast<int>(std::ceil(d.bbox.y2))
+            }.clamped(width, height);
+
+            RefinementBlock rb;
+            rb.original_index = static_cast<int>(i);
+            rb.class_id = (d.class_id == ClassId::SfxIgnore) ? 1 : 0;
+            rb.score = d.confidence;
+            rb.bbox = core_rect;
+            rb.is_vertical = is_rtl && (core_rect.height() >= core_rect.width());
+            if (!d.mask.empty()) {
+                rb.raw_mask_rect = RectI{
+                    d.mask.offset_x,
+                    d.mask.offset_y,
+                    d.mask.offset_x + d.mask.width,
+                    d.mask.offset_y + d.mask.height
+                }.clamped(width, height);
+                rb.raw_mask = d.mask.data;
+            }
+            ref_blocks.push_back(std::move(rb));
+
+            RoomSeedBlock seed;
+            seed.block_index = static_cast<int>(i);
+            seed.bbox = core_rect;
+            seeds.push_back(std::move(seed));
+
+            if (!full_rect.empty()) {
+                bubble_rects.push_back(full_rect);
+            }
+        }
+
+        // 1. 5-Stage Otsu + Plain-Paper Glyph Mask Refinement (zero bubble-border bleed)
+        const std::vector<uint8_t> refined_page_mask =
+            refineTextMasks(rgbData, width, height, ref_blocks);
+
+        // 2. Conjoined Balloon Waist-Cutting + Watershed Room Polygons (<= 32 vertices)
+        const auto room_polys = computePageRoomPolygons(
+            rgbData, width, height, seeds, bubble_rects, &refined_page_mask, config.enable_waist_cut);
+        for (size_t i = 0; i < result.detections.size() && i < room_polys.size(); ++i) {
+            result.detections[i].room_polygon = room_polys[i];
+        }
+
+        // 3. 0-VRAM CV Typography & Colorimetry (tilt, font size, fill color, outline)
+        // Pass nullptr for optional_mask so Otsu extracts interior text strokes strictly
+        // inside `safe_bbox` (avoiding YOLO11m-Seg's full-bubble wall mask skewing A_max).
+        if (config.enable_cv_style_detect) {
+            for (size_t i = 0; i < result.detections.size(); ++i) {
+                auto& d = result.detections[i];
+                RectI tb = ref_blocks[i].bbox;
+                // Inset by 2px when box is large enough so stray bubble border pixels are excluded
+                if (tb.width() >= 20 && tb.height() >= 20) {
+                    tb = RectI{tb.x1 + 2, tb.y1 + 2, tb.x2 - 2, tb.y2 - 2}.clamped(width, height);
+                }
+                const bool is_vert = is_rtl && (tb.height() > static_cast<int>(tb.width() * 1.15));
+                const bool is_sfx = (d.class_id == ClassId::SfxIgnore);
+                const auto style = analyzeBlockTypographyFromBox(
+                    rgbData, width, height, tb, is_vert, is_sfx, nullptr, nullptr);
+                if (style.valid) {
+                    d.angle_deg = style.angle_deg;
+                    d.estimated_font_size = style.estimated_font_size;
+                    d.text_color = style.text_color;
+                    if (style.outline.has_value()) {
+                        d.outline = BubbleOutlineInfo{style.outline->color, style.outline->width};
+                    } else {
+                        d.outline = std::nullopt;
+                    }
+                }
+            }
+        }
+    }
 
     const auto t_end = std::chrono::steady_clock::now();
     result.runtime_meta.inference_ms =

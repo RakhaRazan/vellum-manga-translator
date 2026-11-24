@@ -24,18 +24,26 @@
 
 namespace mangaflow::pipeline {
 
-constexpr uint64_t kDefaultCudaMemLimitMb = 3584ULL;  // 3.5 GB default cap
+constexpr uint64_t kDefaultCudaMemLimitMb = 0ULL;       // 0 = unlimited dynamic VRAM (WDDM Shared GPU Memory)
+constexpr uint64_t kTightVramThresholdMb = 2560ULL;   // < 2.5 GB free physical VRAM triggers single-model unloading
 
 struct HardwareCapabilities {
-    std::string backend = "cpu";  // "cuda" | "directml" | "cpu"
+    std::string backend = "cpu";            // "cuda" | "directml" | "cpu"
+    std::string active_backend = "cpu";     // "cuda" | "directml" | "cpu"
+    std::string preferred_backend = "auto"; // "auto" | "cuda" | "directml" | "cpu"
     std::string execution_provider = "CPUExecutionProvider";
     std::string gpu_name;
     uint64_t vram_mb = 0;
+    uint64_t free_vram_mb = 0;
     uint64_t total_ram_mb = 0;
     uint64_t available_ram_mb = 0;
     uint32_t memory_load_percent = 0;
     uint32_t logical_cpus = 1;
     bool cuda_driver_present = false;
+    bool cuda_available = false;
+    bool directml_available = false;
+    bool cpu_available = true;
+    std::string cuda_unavailable_reason;
     bool low_memory_mode = false;
     uint64_t cuda_mem_limit_mb = kDefaultCudaMemLimitMb;
     std::vector<std::string> available_providers;
@@ -49,10 +57,22 @@ struct HardwareCapabilities {
 // Safe Win32 probe for `nvcuda.dll` in System32. Never throws.
 bool probe_nvcuda_dll() noexcept;
 
-// Configurable CUDA VRAM cap (defaults to 3.5 GB or `VELLUM_CUDA_MEM_LIMIT_MB`).
+// Probe whether CUDAExecutionProvider + nvcuda.dll + CUDA/cuDNN runtime DLLs are usable.
+bool probe_cuda_backend_available(std::string* reason_out = nullptr) noexcept;
+
+// Runtime-configurable preferred execution backend ("auto" | "cuda" | "directml" | "cpu").
+std::string normalize_preferred_backend(const std::string& raw);
+std::string get_preferred_backend();
+void set_preferred_backend(const std::string& backend);
+
+// Configurable CUDA VRAM cap (0 = unlimited dynamic WDDM allocation; override via `VELLUM_CUDA_MEM_LIMIT_MB`).
 uint64_t get_cuda_mem_limit_mb() noexcept;
 size_t get_cuda_mem_limit_bytes() noexcept;
 void set_cuda_mem_limit_mb(uint64_t limit_mb) noexcept;
+
+// Live DXGI 1.4 query for free local GPU VRAM (in MB). Returns 0 if no hardware GPU is found.
+uint64_t query_free_vram_mb() noexcept;
+bool is_vram_tight(uint64_t threshold_mb = kTightVramThresholdMb) noexcept;
 
 // Ordered execution providers safe for this host (`CUDA` only if `nvcuda.dll` is present).
 std::vector<std::string> get_safe_available_providers();

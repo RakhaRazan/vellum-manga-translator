@@ -33,6 +33,7 @@
 #include "detector/geometry_postproc.hpp"
 #include "exporter.hpp"
 #include "font_manager.hpp"
+#include "psd_writer.hpp"
 #include "pipeline/detector.hpp"
 #include "pipeline/inpainter.hpp"
 #include "pipeline/model_manager.hpp"
@@ -722,13 +723,17 @@ struct AppContext {
     std::chrono::steady_clock::time_point idle_unload_deadline{};
     std::thread unload_watchdog_thread;
 
-    void unload_all_sessions() {
-        std::lock_guard<std::mutex> lock(inference_mutex);
+    void unload_all_sessions_unlocked() {
         if (detector) detector->unload();
         if (detector_v2) detector_v2->unload();
         if (ocr_engine) ocr_engine->unload();
         if (inpainter) inpainter->unload();
         pipeline::ModelManager::trim_process_heap();
+    }
+
+    void unload_all_sessions() {
+        std::lock_guard<std::mutex> lock(inference_mutex);
+        unload_all_sessions_unlocked();
     }
 
     void cancel_pending_unload() {
@@ -892,6 +897,8 @@ void populate_detection_options_from_settings(
     opts.box_padding = settings.value("bbox_padding", 6);
     opts.reading_order = settings.value("reading_order", std::string("auto"));
     opts.auto_unload = settings.value("auto_unload_vram", true);
+    opts.enable_cv_style_detect = settings.value("enable_cv_style_detect", true);
+    opts.enable_waist_cut = settings.value("enable_waist_cut", true);
     const std::string det_exec_mode = settings.value("execution_mode", std::string("hybrid"));
     opts.force_cpu = (det_exec_mode == "cpu_only" || det_exec_mode == "cpu");
 }
@@ -944,6 +951,8 @@ void populate_inpaint_options_from_settings(
     opts.tile_size = settings.value("lama_tile_size", 512);
     opts.refine_mask = settings.value("refine_mask", true);
     opts.auto_unload = settings.value("auto_unload_vram", true);
+    opts.enable_3tier_inpaint = settings.value("enable_3tier_inpaint", true);
+    opts.enable_tone_match = settings.value("enable_tone_match", true);
     const std::string inp_exec_mode = settings.value("execution_mode", std::string("hybrid"));
     opts.force_cpu = (inp_exec_mode == "cpu_only" || inp_exec_mode == "cpu");
 }
@@ -1107,12 +1116,73 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
     server.Get("/api/system/hardware", [&ctx](const httplib::Request&, httplib::Response& res) {
         const json current_settings = ctx.settings_manager.load();
         const std::string exec_mode = current_settings.value("execution_mode", std::string("hybrid"));
+        const std::string pref_backend = current_settings.value("preferred_backend", std::string("auto"));
+        pipeline::set_preferred_backend(pref_backend);
         const bool cpu_only = (exec_mode == "cpu_only" || exec_mode == "cpu");
         const auto caps = pipeline::detect_hardware_capabilities(cpu_only);
         json payload = pipeline::hardware_capabilities_to_json(caps);
         payload["execution_mode"] = exec_mode;
         payload["onnxruntime_version"] = ctx.ort_version;
         send_json(res, payload);
+    });
+
+    server.Post("/api/system/backend", [&ctx](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            send_json(res, {{"detail", "Invalid JSON object in backend request body."}}, 400);
+            return;
+        }
+        try {
+            json patch = json::object();
+            if (body.contains("preferred_backend") && !body["preferred_backend"].is_null()) {
+                patch["preferred_backend"] = pipeline::normalize_preferred_backend(
+                    body["preferred_backend"].get<std::string>());
+            } else if (body.contains("backend") && !body["backend"].is_null()) {
+                patch["preferred_backend"] = pipeline::normalize_preferred_backend(
+                    body["backend"].get<std::string>());
+            }
+            if (body.contains("execution_mode") && !body["execution_mode"].is_null()) {
+                patch["execution_mode"] = body["execution_mode"];
+            }
+            const json updated = ctx.settings_manager.update(patch);
+            const std::string exec_mode = updated.value("execution_mode", std::string("hybrid"));
+            const std::string pref_backend = updated.value("preferred_backend", std::string("auto"));
+            pipeline::set_preferred_backend(pref_backend);
+
+            // Cleanly unload all cached ONNX sessions so the next run initializes on the new backend
+            ctx.cancel_pending_unload();
+            ctx.unload_all_sessions();
+
+            const bool cpu_only = (exec_mode == "cpu_only" || exec_mode == "cpu");
+            const auto caps = pipeline::detect_hardware_capabilities(cpu_only);
+            const bool has_dml_in_proc =
+                std::find(caps.available_providers.begin(), caps.available_providers.end(), "DmlExecutionProvider") !=
+                caps.available_providers.end();
+            const bool has_cuda_in_proc =
+                std::find(caps.available_providers.begin(), caps.available_providers.end(), "CUDAExecutionProvider") !=
+                caps.available_providers.end();
+            const bool requires_relaunch =
+                (pref_backend == "directml" && !has_dml_in_proc && caps.directml_available) ||
+                (pref_backend == "cuda" && !has_cuda_in_proc && caps.cuda_available) ||
+                (pref_backend == "auto" && !has_cuda_in_proc && caps.cuda_available && caps.cuda_driver_present);
+
+            json payload = pipeline::hardware_capabilities_to_json(caps);
+            payload["execution_mode"] = exec_mode;
+            payload["onnxruntime_version"] = ctx.ort_version;
+            payload["requires_relaunch"] = requires_relaunch;
+            payload["ok"] = true;
+            send_json(res, payload);
+        } catch (const std::exception& ex) {
+            send_json(res, {{"detail", ex.what()}}, 400);
+        }
+    });
+
+    server.Post("/api/system/relaunch", [&ctx](const httplib::Request&, httplib::Response& res) {
+        send_json(res, {{"ok", true}, {"relaunching", true}});
+        std::thread([]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            ExitProcess(42);
+        }).detach();
     });
 
     server.Get("/api/models/status", [&ctx](const httplib::Request&, httplib::Response& res) {
@@ -1213,7 +1283,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 (import_res.value("status", std::string("")) == "cache_not_found") ? 404 : 200;
             send_json(res, import_res, status_code);
         } catch (const std::exception& ex) {
-            send_json(res, {{"detail", std::string("Koharu model import failed: ") + ex.what()}}, 500);
+            send_json(res, {{"detail", std::string("Local model import failed: ") + ex.what()}}, 500);
         }
     });
 
@@ -1402,8 +1472,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                     res,
                     {{"detail",
                       "Requested detector ONNX weights ('" + det_selector +
-                          "') are missing. Call POST /api/models/import-koharu (for local Koharu cache) "
-                          "or GET /api/models/download first."}},
+                          "') are missing. Download or import local models via Settings -> Pipeline first."}},
                     503);
                 return;
             }
@@ -1441,6 +1510,8 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             v2_cfg.keep_session_alive = !opts.auto_unload;
             v2_cfg.export_dir = export_dir;
             v2_cfg.enable_adaptive_tiling = current_settings.value("enable_adaptive_tiling", true);
+            v2_cfg.enable_cv_style_detect = current_settings.value("enable_cv_style_detect", true);
+            v2_cfg.enable_waist_cut = current_settings.value("enable_waist_cut", true);
             v2_cfg.sfx_suppress_iou = static_cast<float>(current_settings.value("sfx_suppress_iou", 0.60));
             if (current_settings.contains("whisper_threshold") && current_settings["whisper_threshold"].is_number()) {
                 v2_cfg.class_thresholds[static_cast<size_t>(vellum::detector::ClassId::WhisperBubble)] =
@@ -1478,6 +1549,10 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             vellum::detector::PageDetectionResult v2_res;
             {
                 std::lock_guard<std::mutex> lock(ctx.inference_mutex);
+                if (pipeline::is_vram_tight()) {
+                    if (ctx.ocr_engine) ctx.ocr_engine->unload();
+                    if (ctx.inpainter) ctx.inpainter->unload();
+                }
                 if (!ctx.detector_v2 || ctx.detector_v2_backend != target_backend) {
                     if (ctx.detector_v2) {
                         ctx.detector_v2->unload();
@@ -1541,7 +1616,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                         ? "vertical"
                         : "horizontal";
 
-                bubbles_json.push_back({
+                json bubble_obj = {
                     {"id", id_str},
                     {"order", d.reading_order},
                     {"reading_order", d.reading_order},
@@ -1556,7 +1631,38 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                     {"class_name", d.class_name},
                     {"panel_id", d.panel_id},
                     {"is_cross_panel", d.is_cross_panel},
-                });
+                };
+                if (!d.room_polygon.empty()) {
+                    json rpoly = json::array();
+                    for (const auto& pt : d.room_polygon) {
+                        rpoly.push_back({pt.x, pt.y});
+                    }
+                    bubble_obj["room_polygon"] = std::move(rpoly);
+                }
+                if (d.angle_deg.has_value()) {
+                    bubble_obj["angle_deg"] = *d.angle_deg;
+                }
+                if (d.estimated_font_size.has_value()) {
+                    bubble_obj["estimated_font_size"] = *d.estimated_font_size;
+                }
+                if (d.text_color.has_value()) {
+                    bubble_obj["text_color"] = {
+                        static_cast<int>((*d.text_color)[0]),
+                        static_cast<int>((*d.text_color)[1]),
+                        static_cast<int>((*d.text_color)[2]),
+                    };
+                }
+                if (d.outline.has_value()) {
+                    bubble_obj["outline"] = {
+                        {"color", {
+                            static_cast<int>(d.outline->color[0]),
+                            static_cast<int>(d.outline->color[1]),
+                            static_cast<int>(d.outline->color[2]),
+                        }},
+                        {"width", d.outline->width},
+                    };
+                }
+                bubbles_json.push_back(std::move(bubble_obj));
                 ordered_ids.push_back(id_str);
 
                 if (vellum::detector::is_dialogue_class(d.class_id)) {
@@ -1707,8 +1813,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 send_json(
                     res,
                     {{"detail",
-                      "Japanese manga-ocr ONNX weights are missing. Call POST /api/models/import-koharu "
-                      "or GET /api/models/download first."}},
+                      "Japanese manga-ocr ONNX weights are missing. Download or import local models via Settings -> Pipeline first."}},
                     503);
                 return;
             }
@@ -1745,6 +1850,11 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             pipeline::OcrStageResult ocr_res;
             {
                 std::lock_guard<std::mutex> lock(ctx.inference_mutex);
+                if (pipeline::is_vram_tight()) {
+                    if (ctx.detector) ctx.detector->unload();
+                    if (ctx.detector_v2) ctx.detector_v2->unload();
+                    if (ctx.inpainter) ctx.inpainter->unload();
+                }
                 ocr_res = ctx.ocr_engine->recognize_from_bytes(
                     reinterpret_cast<const uint8_t*>(upload.content.data()),
                     upload.content.size(),
@@ -1773,6 +1883,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 {"ocr_model", ocr_res.ocr_model},
                 {"requested_ocr_model", ocr_res.requested_model},
                 {"execution_provider", ocr_res.execution_provider},
+                {"neighbor_blanked_blocks", ocr_res.neighbor_blanked_blocks},
                 {"count", ocr_res.blocks.size()},
                 {"texts", std::move(texts_json)},
                 {"blocks", blocks_json},
@@ -1834,6 +1945,14 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                     }
                 }
             }
+            if (req.form.has_field("enable_3tier_inpaint")) {
+                opts.enable_3tier_inpaint = parse_bool_param(
+                    req.form.get_field("enable_3tier_inpaint"), opts.enable_3tier_inpaint);
+            }
+            if (req.form.has_field("enable_tone_match")) {
+                opts.enable_tone_match = parse_bool_param(
+                    req.form.get_field("enable_tone_match"), opts.enable_tone_match);
+            }
         } catch (const std::invalid_argument& ex) {
             send_json(res, {{"detail", ex.what()}}, 400);
             return;
@@ -1845,12 +1964,12 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 : (opts.inpainting_model == "flux-2-klein" || opts.inpainting_model == "rorem-mixed")
                 ? (ctx.model_manager->resolve_aot_model().has_value() || ctx.model_manager->resolve_lama_model().has_value())
                 : ctx.model_manager->resolve_lama_model(opts.inpainting_model, opts.allow_model_fallback).has_value();
-        if (!has_inpaint_weights) {
+        if (!opts.enable_3tier_inpaint && !has_inpaint_weights) {
             send_json(
                 res,
                 {{"detail",
                   "Requested Inpainting ONNX weights ('" + opts.inpainting_model +
-                      "') are missing. Call POST /api/models/import-koharu or GET /api/models/download first."}},
+                      "') are missing. Download or import local models via Settings -> Pipeline first."}},
                 503);
             return;
         }
@@ -1987,6 +2106,11 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             pipeline::InpaintResult inpaint_res;
             {
                 std::lock_guard<std::mutex> lock(ctx.inference_mutex);
+                if (pipeline::is_vram_tight()) {
+                    if (ctx.detector) ctx.detector->unload();
+                    if (ctx.detector_v2) ctx.detector_v2->unload();
+                    if (ctx.ocr_engine) ctx.ocr_engine->unload();
+                }
                 inpaint_res = ctx.inpainter->inpaint_rgb(rgb_image.data(), orig_w, orig_h, working_mask, opts);
             }
             if (want_auto_unload) {
@@ -2014,6 +2138,11 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 {"tile_size", inpaint_res.tile_size},
                 {"is_koharu_manga", inpaint_res.is_koharu_manga},
                 {"tiles_inpainted", inpaint_res.tiles_processed},
+                {"tier1_blocks", inpaint_res.tier1_blocks},
+                {"tier2_blocks", inpaint_res.tier2_blocks},
+                {"tier3_blocks", inpaint_res.tier3_blocks},
+                {"gpu_skipped", inpaint_res.gpu_skipped},
+                {"tone_match_applied", inpaint_res.tone_match_applied},
                 {"cleaned_image_id", cleaned_id},
                 {"cleaned_image_url", cleaned_url},
                 {"inpainted_image_url", cleaned_url},
@@ -2028,6 +2157,297 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
     };
     server.Post("/api/stage/inpaint", handle_stage_inpaint);
     server.Post("/api/pipeline/inpaint", handle_stage_inpaint);
+
+    // -------------------------------------------------------------------------
+    // Manual Spot-Remove Endpoint (`POST /api/inpaint/region`)
+    // Accepts `{ page_id / image, mask_rect, mask_png_base64 }`, runs 3-Tier +
+    // Tone Match on that region, and composites with a 4 px Euclidean feather
+    // (Felzenszwalb DT) returning the updated cleaned image URL.
+    // -------------------------------------------------------------------------
+
+    server.Post("/api/inpaint/region", [&ctx](const httplib::Request& req, httplib::Response& res) {
+        if (req.body.empty()) {
+            send_json(res, {{"detail", "Empty JSON request body for /api/inpaint/region."}}, 400);
+            return;
+        }
+        const json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            send_json(res, {{"detail", "Request body must be a valid JSON object."}}, 400);
+            return;
+        }
+
+        // 1. Resolve source image from `image`, `image_url`, `cleaned_image_url`, `image_id`, or `page_id`
+        std::string img_ref;
+        for (const char* key : {"image", "image_url", "cleaned_image_url", "inpainted_image_url", "image_id", "page_id"}) {
+            if (body.contains(key) && body[key].is_string()) {
+                const std::string v = util::trim_ascii(body[key].get<std::string>());
+                if (!v.empty()) {
+                    img_ref = v;
+                    break;
+                }
+            }
+        }
+        if (img_ref.empty()) {
+            send_json(res, {{"detail", "Provide 'page_id' or 'image' (cached image ID, URL, or base64 data URI)."}}, 400);
+            return;
+        }
+
+        int orig_w = 0;
+        int orig_h = 0;
+        std::vector<uint8_t> rgb_image;
+        try {
+            const std::vector<uint8_t> img_bytes = decode_export_image_reference(img_ref, 1);
+            rgb_image = pipeline::LamaInpainter::decode_rgb_from_bytes(
+                img_bytes.data(), img_bytes.size(), orig_w, orig_h);
+        } catch (const std::exception& ex) {
+            send_json(res, {{"detail", std::string("Failed to resolve source image: ") + ex.what()}}, 400);
+            return;
+        }
+
+        // 2. Parse optional `mask_rect` (`[x1, y1, x2, y2]` or `{x, y, width/w, height/h}` or `{x1, y1, x2, y2}`)
+        std::optional<std::array<int, 4>> mask_rect;
+        if (body.contains("mask_rect") && !body["mask_rect"].is_null()) {
+            const auto& mr = body["mask_rect"];
+            if (mr.is_array() && mr.size() >= 4) {
+                int x1 = static_cast<int>(std::llround(mr[0].get<double>()));
+                int y1 = static_cast<int>(std::llround(mr[1].get<double>()));
+                int x2 = static_cast<int>(std::llround(mr[2].get<double>()));
+                int y2 = static_cast<int>(std::llround(mr[3].get<double>()));
+                if (x2 < x1) std::swap(x1, x2);
+                if (y2 < y1) std::swap(y1, y2);
+                x1 = std::max(0, std::min(orig_w, x1));
+                y1 = std::max(0, std::min(orig_h, y1));
+                x2 = std::max(0, std::min(orig_w, x2));
+                y2 = std::max(0, std::min(orig_h, y2));
+                if (x2 > x1 && y2 > y1) {
+                    mask_rect = std::array<int, 4>{x1, y1, x2, y2};
+                }
+            } else if (mr.is_object()) {
+                int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+                if (mr.contains("x1") && mr.contains("y1") && mr.contains("x2") && mr.contains("y2")) {
+                    x1 = static_cast<int>(std::llround(mr["x1"].get<double>()));
+                    y1 = static_cast<int>(std::llround(mr["y1"].get<double>()));
+                    x2 = static_cast<int>(std::llround(mr["x2"].get<double>()));
+                    y2 = static_cast<int>(std::llround(mr["y2"].get<double>()));
+                } else if (mr.contains("x") && mr.contains("y") &&
+                           (mr.contains("width") || mr.contains("w")) &&
+                           (mr.contains("height") || mr.contains("h"))) {
+                    x1 = static_cast<int>(std::llround(mr["x"].get<double>()));
+                    y1 = static_cast<int>(std::llround(mr["y"].get<double>()));
+                    const int rw = static_cast<int>(std::llround(
+                        (mr.contains("width") ? mr["width"] : mr["w"]).get<double>()));
+                    const int rh = static_cast<int>(std::llround(
+                        (mr.contains("height") ? mr["height"] : mr["h"]).get<double>()));
+                    x2 = x1 + std::max(0, rw);
+                    y2 = y1 + std::max(0, rh);
+                } else {
+                    send_json(res, {{"detail", "Invalid 'mask_rect' object format."}}, 400);
+                    return;
+                }
+                if (x2 < x1) std::swap(x1, x2);
+                if (y2 < y1) std::swap(y1, y2);
+                x1 = std::max(0, std::min(orig_w, x1));
+                y1 = std::max(0, std::min(orig_h, y1));
+                x2 = std::max(0, std::min(orig_w, x2));
+                y2 = std::max(0, std::min(orig_h, y2));
+                if (x2 > x1 && y2 > y1) {
+                    mask_rect = std::array<int, 4>{x1, y1, x2, y2};
+                }
+            } else {
+                send_json(res, {{"detail", "'mask_rect' must be a 4-element array or object."}}, 400);
+                return;
+            }
+        }
+
+        // 3. Parse optional `mask_png_base64` (supports both white-on-black grayscale and RGBA brush PNGs)
+        std::vector<uint8_t> region_mask(static_cast<size_t>(orig_w) * static_cast<size_t>(orig_h), 0);
+        bool has_mask_png = false;
+        if (body.contains("mask_png_base64") && body["mask_png_base64"].is_string()) {
+            std::string b64 = util::trim_ascii(body["mask_png_base64"].get<std::string>());
+            if (!b64.empty()) {
+                if (b64.size() >= 5 && util::to_lower_ascii(b64.substr(0, 5)) == "data:") {
+                    const size_t comma = b64.find(',');
+                    if (comma != std::string::npos) {
+                        b64 = b64.substr(comma + 1);
+                    }
+                }
+                const auto decoded = util::base64_decode(b64);
+                if (!decoded.has_value() || decoded->empty()) {
+                    send_json(res, {{"detail", "Failed to decode 'mask_png_base64': invalid Base64 data."}}, 400);
+                    return;
+                }
+                int mw = 0, mh = 0, mcomp = 0;
+                unsigned char* rgba = stbi_load_from_memory(
+                    decoded->data(), static_cast<int>(decoded->size()), &mw, &mh, &mcomp, 4);
+                if (!rgba || mw <= 0 || mh <= 0) {
+                    if (rgba) stbi_image_free(rgba);
+                    send_json(res, {{"detail", "Failed to decode PNG from 'mask_png_base64'."}}, 400);
+                    return;
+                }
+
+                // Detect whether mask uses alpha channel (transparent brush overlay) or luminance
+                bool has_transparency = false;
+                const size_t mtotal = static_cast<size_t>(mw) * static_cast<size_t>(mh);
+                if (mcomp == 2 || mcomp == 4) {
+                    for (size_t i = 0; i < mtotal; ++i) {
+                        if (rgba[i * 4 + 3] < 250) {
+                            has_transparency = true;
+                            break;
+                        }
+                    }
+                }
+                std::vector<uint8_t> decoded_bin(mtotal, 0);
+                for (size_t i = 0; i < mtotal; ++i) {
+                    const uint8_t r = rgba[i * 4 + 0];
+                    const uint8_t g = rgba[i * 4 + 1];
+                    const uint8_t b = rgba[i * 4 + 2];
+                    const uint8_t a = rgba[i * 4 + 3];
+                    if (has_transparency) {
+                        decoded_bin[i] = (a > 127) ? 255 : 0;
+                    } else {
+                        const int luma = (77 * r + 150 * g + 29 * b) >> 8;
+                        decoded_bin[i] = (luma > 127) ? 255 : 0;
+                    }
+                }
+                stbi_image_free(rgba);
+
+                if (mw == orig_w && mh == orig_h) {
+                    region_mask = std::move(decoded_bin);
+                    if (mask_rect.has_value()) {
+                        pipeline::LamaInpainter::restrict_mask_to_bboxes(
+                            region_mask, {*mask_rect}, orig_w, orig_h, 0);
+                    }
+                } else if (mask_rect.has_value()) {
+                    const int rx1 = (*mask_rect)[0];
+                    const int ry1 = (*mask_rect)[1];
+                    const int rw = (*mask_rect)[2] - rx1;
+                    const int rh = (*mask_rect)[3] - ry1;
+                    const float sx_ratio = static_cast<float>(mw) / static_cast<float>(rw);
+                    const float sy_ratio = static_cast<float>(mh) / static_cast<float>(rh);
+                    for (int ry = 0; ry < rh; ++ry) {
+                        const int sy = std::max(0, std::min(mh - 1, static_cast<int>(std::floor((ry + 0.5f) * sy_ratio))));
+                        uint8_t* drow = region_mask.data() + static_cast<size_t>(ry1 + ry) * static_cast<size_t>(orig_w) + static_cast<size_t>(rx1);
+                        const uint8_t* srow = decoded_bin.data() + static_cast<size_t>(sy) * static_cast<size_t>(mw);
+                        for (int rx = 0; rx < rw; ++rx) {
+                            const int sx = std::max(0, std::min(mw - 1, static_cast<int>(std::floor((rx + 0.5f) * sx_ratio))));
+                            drow[rx] = srow[sx];
+                        }
+                    }
+                } else {
+                    const float sx_ratio = static_cast<float>(mw) / static_cast<float>(orig_w);
+                    const float sy_ratio = static_cast<float>(mh) / static_cast<float>(orig_h);
+                    for (int y = 0; y < orig_h; ++y) {
+                        const int sy = std::max(0, std::min(mh - 1, static_cast<int>(std::floor((y + 0.5f) * sy_ratio))));
+                        uint8_t* drow = region_mask.data() + static_cast<size_t>(y) * static_cast<size_t>(orig_w);
+                        const uint8_t* srow = decoded_bin.data() + static_cast<size_t>(sy) * static_cast<size_t>(mw);
+                        for (int x = 0; x < orig_w; ++x) {
+                            const int sx = std::max(0, std::min(mw - 1, static_cast<int>(std::floor((x + 0.5f) * sx_ratio))));
+                            drow[x] = srow[sx];
+                        }
+                    }
+                }
+                has_mask_png = true;
+            }
+        }
+
+        if (!has_mask_png) {
+            if (!mask_rect.has_value()) {
+                send_json(res, {{"detail", "Provide 'mask_rect' and/or 'mask_png_base64'."}}, 400);
+                return;
+            }
+            region_mask = pipeline::LamaInpainter::synthesize_mask_from_bboxes({*mask_rect}, orig_w, orig_h);
+        }
+
+        // Compute tight active ROI bounds of `region_mask`
+        int min_x = orig_w, min_y = orig_h, max_x = -1, max_y = -1;
+        for (int y = 0; y < orig_h; ++y) {
+            const uint8_t* mrow = region_mask.data() + static_cast<size_t>(y) * static_cast<size_t>(orig_w);
+            for (int x = 0; x < orig_w; ++x) {
+                if (mrow[x] > 0) {
+                    if (x < min_x) min_x = x;
+                    if (x > max_x) max_x = x;
+                    if (y < min_y) min_y = y;
+                    if (y > max_y) max_y = y;
+                }
+            }
+        }
+        if (max_x < min_x || max_y < min_y) {
+            send_json(res, {{"detail", "Provided region mask contains no active pixels."}}, 400);
+            return;
+        }
+        const std::array<int, 4> active_roi{min_x, min_y, max_x + 1, max_y + 1};
+
+        // 4. Configure 3-Tier + Tone Match options
+        const json current_settings = ctx.settings_manager.load();
+        pipeline::InpaintOptions opts;
+        populate_inpaint_options_from_settings(opts, current_settings);
+        opts.bboxes = std::vector<std::array<int, 4>>{active_roi};
+        opts.refine_mask = false;  // Respect exact manual brush / spot-remove mask
+        try {
+            if (body.contains("inpainting_model") && body["inpainting_model"].is_string()) {
+                const std::string im = util::trim_ascii(body["inpainting_model"].get<std::string>());
+                if (!im.empty()) {
+                    opts.inpainting_model = SettingsManager::normalize_inpainting_model(im);
+                }
+            }
+            if (body.contains("enable_3tier_inpaint") && body["enable_3tier_inpaint"].is_boolean()) {
+                opts.enable_3tier_inpaint = body["enable_3tier_inpaint"].get<bool>();
+            }
+            if (body.contains("enable_tone_match") && body["enable_tone_match"].is_boolean()) {
+                opts.enable_tone_match = body["enable_tone_match"].get<bool>();
+            }
+        } catch (const std::invalid_argument& ex) {
+            send_json(res, {{"detail", ex.what()}}, 400);
+            return;
+        }
+
+        const bool include_base64 = body.value("include_base64", false);
+        constexpr float kFeatherPx = 4.0f;
+
+        try {
+            ctx.cancel_pending_unload();
+            pipeline::InpaintResult inpaint_res;
+            {
+                std::lock_guard<std::mutex> lock(ctx.inference_mutex);
+                inpaint_res = ctx.inpainter->inpaint_rgb(rgb_image.data(), orig_w, orig_h, region_mask, opts);
+            }
+
+            // 5. Composite with a 4 px Euclidean feather (Felzenszwalb DT)
+            std::vector<uint8_t> composited = rgb_image;
+            pipeline::LamaInpainter::composite_feathered_region(
+                composited, inpaint_res.rgb, region_mask, orig_w, orig_h, active_roi, kFeatherPx);
+
+            const auto png_bytes = pipeline::LamaInpainter::encode_rgb_png(composited, orig_w, orig_h);
+            const auto [cleaned_id, cleaned_url] = save_inpainted_png_to_cache(png_bytes);
+            const std::string image_payload = include_base64
+                ? ("data:image/png;base64," +
+                   pipeline::TextDetector::base64_encode(png_bytes.data(), png_bytes.size()))
+                : cleaned_url;
+
+            send_json(res, {
+                {"dimensions", {{"width", orig_w}, {"height", orig_h}}},
+                {"mask_rect", json::array({active_roi[0], active_roi[1], active_roi[2], active_roi[3]})},
+                {"feather_px", kFeatherPx},
+                {"execution_provider", inpaint_res.execution_provider},
+                {"inpainting_model", inpaint_res.model_id},
+                {"tiles_inpainted", inpaint_res.tiles_processed},
+                {"tier1_blocks", inpaint_res.tier1_blocks},
+                {"tier2_blocks", inpaint_res.tier2_blocks},
+                {"tier3_blocks", inpaint_res.tier3_blocks},
+                {"gpu_skipped", inpaint_res.gpu_skipped},
+                {"tone_match_applied", inpaint_res.tone_match_applied},
+                {"cleaned_image_id", cleaned_id},
+                {"cleaned_image_url", cleaned_url},
+                {"inpainted_image_url", cleaned_url},
+                {"cleaned_image", image_payload},
+                {"inpainted_image", image_payload},
+            });
+        } catch (const std::invalid_argument& ex) {
+            send_json(res, {{"detail", ex.what()}}, 400);
+        } catch (const std::exception& ex) {
+            send_json(res, {{"detail", std::string("Region inpainting failed: ") + ex.what()}}, 500);
+        }
+    });
 
     // -------------------------------------------------------------------------
     // Stage 4: Context-Aware Multi-Provider Translation (`POST /api/stage/translate`)
@@ -2183,6 +2603,24 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             req_opts.target_lang = tgt_lang;
             req_opts.page_image_data_uri = page_image_data_uri;
             req_opts.use_vision = translator.config().use_vision;
+            if (req.is_multipart_form_data()) {
+                if (req.form.has_field("project_id")) {
+                    req_opts.project_id = util::trim_ascii(req.form.get_field("project_id"));
+                }
+                if (req.form.has_field("use_history")) {
+                    req_opts.use_history = parse_bool_param(req.form.get_field("use_history"), true);
+                }
+            } else {
+                const json req_body = json::parse(req.body, nullptr, false);
+                if (!req_body.is_discarded() && req_body.is_object()) {
+                    if (req_body.contains("project_id") && req_body["project_id"].is_string()) {
+                        req_opts.project_id = util::trim_ascii(req_body["project_id"].get<std::string>());
+                    }
+                    if (req_body.contains("use_history") && req_body["use_history"].is_boolean()) {
+                        req_opts.use_history = req_body["use_history"].get<bool>();
+                    }
+                }
+            }
 
             const auto translation_res = translator.translate_blocks(dialogue_inputs, req_opts);
             json translated_blocks = build_translated_blocks_json(
@@ -2194,9 +2632,12 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             }
 
             send_json(res, {
+                {"status", translation_res.status},
                 {"provider", translation_res.provider},
                 {"model", translation_res.model},
                 {"vision_used", translation_res.vision_used},
+                {"echo_retried", translation_res.echo_retried},
+                {"history_compacted", translation_res.history_compacted},
                 {"reasoning_effort", translation_res.reasoning_effort},
                 {"source_lang", src_lang},
                 {"target_lang", tgt_lang},
@@ -2323,6 +2764,12 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             req_opts.target_lang = tgt_lang;
             req_opts.page_image_data_uri = page_image_data_uri;
             req_opts.use_vision = translator.config().use_vision;
+            if (body.contains("project_id") && body["project_id"].is_string()) {
+                req_opts.project_id = util::trim_ascii(body["project_id"].get<std::string>());
+            }
+            if (body.contains("use_history") && body["use_history"].is_boolean()) {
+                req_opts.use_history = body["use_history"].get<bool>();
+            }
 
             const auto translation_res = translator.translate_blocks(dialogue_inputs, req_opts);
             json retranslated_blocks = build_translated_blocks_json(
@@ -2334,9 +2781,12 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             }
 
             send_json(res, {
+                {"status", translation_res.status},
                 {"provider", translation_res.provider},
                 {"model", translation_res.model},
                 {"vision_used", translation_res.vision_used},
+                {"echo_retried", translation_res.echo_retried},
+                {"history_compacted", translation_res.history_compacted},
                 {"reasoning_effort", translation_res.reasoning_effort},
                 {"source_lang", src_lang},
                 {"target_lang", tgt_lang},
@@ -2562,7 +3012,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
         } else {
             const auto legacy_det = ctx.model_manager->resolve_detector_model(det_selector, det_opts.allow_model_fallback);
             if (!legacy_det.has_value()) {
-                send_json(res, {{"detail", "Requested detector ONNX weights ('" + det_selector + "') are missing. Call POST /api/models/import-koharu or GET /api/models/download first."}}, 503);
+                send_json(res, {{"detail", "Requested detector ONNX weights ('" + det_selector + "') are missing. Download or import local models via Settings -> Pipeline first."}}, 503);
                 return;
             }
             target_det_backend = (legacy_det->backend == pipeline::DetectorBackend::KoharuRfDetr)
@@ -2572,7 +3022,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
         }
         if (effective_ocr_model == "manga-ocr") {
             if (!ctx.model_manager->resolve_manga_ocr_models().has_value()) {
-                send_json(res, {{"detail", "Japanese manga-ocr ONNX weights are missing. Call POST /api/models/import-koharu or GET /api/models/download first."}}, 503);
+                send_json(res, {{"detail", "Japanese manga-ocr ONNX weights are missing. Download or import local models via Settings -> Pipeline first."}}, 503);
                 return;
             }
         } else if (effective_ocr_model == "baberu-ocr") {
@@ -2608,7 +3058,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 ? (ctx.model_manager->resolve_aot_model().has_value() || ctx.model_manager->resolve_lama_model().has_value())
                 : ctx.model_manager->resolve_lama_model(inpaint_opts.inpainting_model, inpaint_opts.allow_model_fallback).has_value();
         if (!has_page_inpaint_weights) {
-            send_json(res, {{"detail", "Requested Inpainting ONNX weights ('" + inpaint_opts.inpainting_model + "') are missing. Call POST /api/models/import-koharu or GET /api/models/download first."}}, 503);
+            send_json(res, {{"detail", "Requested Inpainting ONNX weights ('" + inpaint_opts.inpainting_model + "') are missing. Download or import local models via Settings -> Pipeline first."}}, 503);
             return;
         }
 
@@ -2640,6 +3090,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
         std::vector<uint8_t> page_mask;
         std::unordered_map<std::string, std::array<int, 4>> bubble_box_by_id;
         std::unordered_map<std::string, std::array<int, 4>> safe_box_by_id;
+        std::unordered_map<std::string, size_t> det_index_by_id;
         pipeline::OcrStageResult ocr_result;
         pipeline::InpaintResult inpaint_result;
         std::string mask_id;
@@ -2687,6 +3138,8 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 v2_cfg.force_cpu = det_opts.force_cpu;
                 v2_cfg.keep_session_alive = !det_opts.auto_unload;
                 v2_cfg.enable_adaptive_tiling = current_settings.value("enable_adaptive_tiling", true);
+                v2_cfg.enable_cv_style_detect = current_settings.value("enable_cv_style_detect", true);
+                v2_cfg.enable_waist_cut = current_settings.value("enable_waist_cut", true);
                 v2_cfg.sfx_suppress_iou = static_cast<float>(current_settings.value("sfx_suppress_iou", 0.60));
                 if (current_settings.contains("whisper_threshold") && current_settings["whisper_threshold"].is_number()) {
                     v2_cfg.class_thresholds[static_cast<size_t>(vellum::detector::ClassId::WhisperBubble)] =
@@ -2747,11 +3200,13 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 std::vector<std::array<int, 4>> detected_bboxes;
                 detected_bboxes.reserve(v2_det_result.detections.size());
 
-                for (const auto& d : v2_det_result.detections) {
+                for (size_t di = 0; di < v2_det_result.detections.size(); ++di) {
+                    const auto& d = v2_det_result.detections[di];
                     if (d.class_id == vellum::detector::ClassId::SfxIgnore) {
                         continue;
                     }
                     const std::string bid = "b_" + std::to_string(d.id);
+                    det_index_by_id[bid] = di;
                     const int x1 = static_cast<int>(std::lround(d.bbox.x1));
                     const int y1 = static_cast<int>(std::lround(d.bbox.y1));
                     const int x2 = static_cast<int>(std::lround(d.bbox.x2));
@@ -2785,6 +3240,9 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                     ocr_inputs.push_back(std::move(item));
                 }
 
+                ocr_opts.page_glyph_mask = &page_mask;
+                ocr_opts.page_glyph_mask_w = orig_w;
+                ocr_opts.page_glyph_mask_h = orig_h;
                 ocr_result = ctx.ocr_engine->recognize_rgb(
                     rgb_image.data(), orig_w, orig_h, ocr_inputs, ocr_opts);
 
@@ -2923,7 +3381,7 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 poly_json = bbox_to_polygon_json(b.bbox);
             }
 
-            processed_blocks.push_back({
+            json block_obj = {
                 {"id", b.id},
                 {"order", b.order},
                 {"bbox", json::array({b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]})},
@@ -2939,7 +3397,42 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
                 {"confidence", b.confidence},
                 {"text_direction", b.text_direction},
                 {"style", build_default_style_json(fsize, "#000000", "center")},
-            });
+            };
+            if (const auto dit = det_index_by_id.find(b.id);
+                dit != det_index_by_id.end() && dit->second < v2_det_result.detections.size()) {
+                const auto& d = v2_det_result.detections[dit->second];
+                if (!d.room_polygon.empty()) {
+                    json rpoly = json::array();
+                    for (const auto& pt : d.room_polygon) {
+                        rpoly.push_back({pt.x, pt.y});
+                    }
+                    block_obj["room_polygon"] = std::move(rpoly);
+                }
+                if (d.angle_deg.has_value()) {
+                    block_obj["angle_deg"] = *d.angle_deg;
+                }
+                if (d.estimated_font_size.has_value()) {
+                    block_obj["estimated_font_size"] = *d.estimated_font_size;
+                }
+                if (d.text_color.has_value()) {
+                    block_obj["text_color"] = {
+                        static_cast<int>((*d.text_color)[0]),
+                        static_cast<int>((*d.text_color)[1]),
+                        static_cast<int>((*d.text_color)[2]),
+                    };
+                }
+                if (d.outline.has_value()) {
+                    block_obj["outline"] = {
+                        {"color", {
+                            static_cast<int>(d.outline->color[0]),
+                            static_cast<int>(d.outline->color[1]),
+                            static_cast<int>(d.outline->color[2]),
+                        }},
+                        {"width", d.outline->width},
+                    };
+                }
+            }
+            processed_blocks.push_back(std::move(block_obj));
         }
 
         const nlohmann::json v2_schema = vellum::detector::toSchemaV2Json(v2_det_result);
@@ -3005,6 +3498,9 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             {"detector_model", v2_det_result.runtime_meta.model_name},
             {"tiles_detected", v2_det_result.runtime_meta.tiles_processed},
             {"provider", translation_res.provider},
+            {"translation_status", translation_res.status},
+            {"echo_retried", translation_res.echo_retried},
+            {"history_compacted", translation_res.history_compacted},
             {"model", translation_res.model},
             {"vision_used", translation_res.vision_used},
             {"reasoning_effort", translation_res.reasoning_effort},
@@ -3012,6 +3508,11 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             {"ocr_model", ocr_result.ocr_model},
             {"inpainting_model", inpaint_result.model_id},
             {"tiles_inpainted", inpaint_result.tiles_processed},
+            {"tier1_blocks", inpaint_result.tier1_blocks},
+            {"tier2_blocks", inpaint_result.tier2_blocks},
+            {"tier3_blocks", inpaint_result.tier3_blocks},
+            {"gpu_skipped", inpaint_result.gpu_skipped},
+            {"tone_match_applied", inpaint_result.tone_match_applied},
             {"cleaned_image_id", cleaned_image_id},
             {"cleaned_image_url", cleaned_image_url},
             {"inpainted_image_url", cleaned_image_url},
@@ -3035,37 +3536,30 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
     server.Get("/api/providers", [&ctx](const httplib::Request&, httplib::Response& res) {
         const json current = ctx.settings_manager.load();
         send_json(res, {
-            {"active_provider", current.value("provider", std::string("lmstudio"))},
+            {"active_provider", current.value("active_provider", current.value("provider", std::string("none")))},
             {"providers", SettingsManager::list_provider_presets()},
             {"supported_reasoning_efforts", SettingsManager::list_reasoning_efforts()},
             {"target_languages", SettingsManager::list_target_languages()},
         });
     });
 
-    server.Post("/api/providers/test", [&ctx](const httplib::Request& req, httplib::Response& res) {
-        json body = json::object();
-        if (!util::trim_ascii(req.body).empty()) {
-            body = json::parse(req.body, nullptr, false);
-            if (body.is_discarded() || !body.is_object()) {
-                send_json(res, {{"detail", "Invalid JSON object in /api/providers/test request body."}}, 400);
-                return;
-            }
-        }
-
+    auto resolve_provider_request_profile = [&ctx](
+        const json& body,
+        std::string& prov_id,
+        std::string& base_url,
+        std::string& api_key,
+        std::string& preferred_model,
+        double& timeout_sec) {
         const json settings = ctx.settings_manager.load();
-        std::string prov_id;
-        try {
-            if (body.contains("provider") && body["provider"].is_string() &&
-                !util::trim_ascii(body["provider"].get<std::string>()).empty()) {
-                prov_id = pipeline::ComicTranslator::normalize_provider_id(
-                    body["provider"].get<std::string>());
-            } else {
-                prov_id = pipeline::ComicTranslator::normalize_provider_id(
-                    settings.value("provider", std::string("lmstudio")));
-            }
-        } catch (const std::invalid_argument& ex) {
-            send_json(res, {{"detail", ex.what()}}, 400);
-            return;
+        const std::string active_provider = pipeline::ComicTranslator::normalize_provider_id(
+            settings.value("active_provider", settings.value("provider", std::string("none"))));
+
+        if (body.contains("provider") && body["provider"].is_string() &&
+            !util::trim_ascii(body["provider"].get<std::string>()).empty()) {
+            prov_id = pipeline::ComicTranslator::normalize_provider_id(
+                body["provider"].get<std::string>());
+        } else {
+            prov_id = active_provider;
         }
 
         const auto& preset = pipeline::ComicTranslator::get_provider_spec(prov_id);
@@ -3075,9 +3569,6 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             saved_profile = &settings["providers"][prov_id];
         }
 
-        const std::string active_provider = settings.value("provider", std::string("lmstudio"));
-
-        std::string base_url;
         if (body.contains("base_url") && body["base_url"].is_string() &&
             !util::trim_ascii(body["base_url"].get<std::string>()).empty()) {
             base_url = util::trim_ascii(body["base_url"].get<std::string>());
@@ -3093,20 +3584,22 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             base_url = preset.default_base_url;
         }
 
-        std::string api_key;
-        if (body.contains("api_key") && body["api_key"].is_string()) {
+        // API key is decrypted in memory only by SettingsManager/ComicTranslator; never logged
+        if (body.contains("api_key") && body["api_key"].is_string() &&
+            !util::trim_ascii(body["api_key"].get<std::string>()).empty()) {
             api_key = util::trim_ascii(body["api_key"].get<std::string>());
         } else if (prov_id == active_provider &&
-                   settings.contains("api_key") && settings["api_key"].is_string()) {
+                   settings.contains("api_key") && settings["api_key"].is_string() &&
+                   !util::trim_ascii(settings["api_key"].get<std::string>()).empty()) {
             api_key = util::trim_ascii(settings["api_key"].get<std::string>());
         } else if (saved_profile && saved_profile->contains("api_key") &&
-                   (*saved_profile)["api_key"].is_string()) {
+                   (*saved_profile)["api_key"].is_string() &&
+                   !util::trim_ascii((*saved_profile)["api_key"].get<std::string>()).empty()) {
             api_key = util::trim_ascii((*saved_profile)["api_key"].get<std::string>());
         } else {
             api_key = preset.default_api_key;
         }
 
-        std::string preferred_model;
         if (body.contains("model") && body["model"].is_string() &&
             !util::trim_ascii(body["model"].get<std::string>()).empty()) {
             preferred_model = util::trim_ascii(body["model"].get<std::string>());
@@ -3122,15 +3615,124 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             preferred_model = preset.default_model;
         }
 
-        double timeout_sec = 10.0;
+        timeout_sec = 10.0;
         if (body.contains("timeout") && body["timeout"].is_number()) {
             timeout_sec = std::max(1.0, std::min(60.0, body["timeout"].get<double>()));
+        }
+    };
+
+    server.Post("/api/providers/test", [resolve_provider_request_profile](const httplib::Request& req, httplib::Response& res) {
+        json body = json::object();
+        if (!util::trim_ascii(req.body).empty()) {
+            body = json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                send_json(res, {{"detail", "Invalid JSON object in /api/providers/test request body."}}, 400);
+                return;
+            }
+        }
+
+        std::string prov_id, base_url, api_key, preferred_model;
+        double timeout_sec = 10.0;
+        try {
+            resolve_provider_request_profile(body, prov_id, base_url, api_key, preferred_model, timeout_sec);
+        } catch (const std::invalid_argument& ex) {
+            send_json(res, {{"detail", ex.what()}}, 400);
+            return;
         }
 
         const auto test_res = pipeline::ComicTranslator::test_provider_connection(
             prov_id, base_url, api_key, preferred_model, timeout_sec);
         send_json(res, test_res.to_json());
     });
+
+    auto handle_provider_models = [resolve_provider_request_profile](const httplib::Request& req, httplib::Response& res) {
+        json body = json::object();
+        if (!util::trim_ascii(req.body).empty()) {
+            body = json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                send_json(res, {{"detail", "Invalid JSON object in /api/providers/models request body."}}, 400);
+                return;
+            }
+        }
+        if (req.has_param("provider") && !body.contains("provider")) {
+            body["provider"] = req.get_param_value("provider");
+        }
+        if (req.has_param("base_url") && !body.contains("base_url")) {
+            body["base_url"] = req.get_param_value("base_url");
+        }
+
+        std::string prov_id, base_url, api_key, preferred_model;
+        double timeout_sec = 10.0;
+        try {
+            resolve_provider_request_profile(body, prov_id, base_url, api_key, preferred_model, timeout_sec);
+        } catch (const std::invalid_argument& ex) {
+            send_json(res, {{"detail", ex.what()}}, 400);
+            return;
+        }
+
+        const auto& spec = pipeline::ComicTranslator::get_provider_spec(prov_id);
+        const std::string resolved_url = pipeline::ComicTranslator::normalize_provider_base_url(prov_id, base_url);
+
+        if (prov_id == "none") {
+            send_json(res, {
+                {"ok", false},
+                {"status", "provider_not_configured"},
+                {"provider", "none"},
+                {"provider_name", spec.name},
+                {"endpoint", ""},
+                {"models", json::array()},
+                {"vision_models", json::array()},
+                {"model_count", 0},
+                {"latency_ms", 0},
+                {"message", "No translation provider configured (active_provider is 'none')."},
+            });
+            return;
+        }
+
+        const bool include_embeddings = body.value("include_embeddings", false);
+        const auto t0 = std::chrono::steady_clock::now();
+        try {
+            const auto models = pipeline::ComicTranslator::list_provider_models(
+                prov_id, resolved_url, api_key, timeout_sec, include_embeddings);
+            std::vector<std::string> vision_models;
+            for (const auto& m : models) {
+                if (pipeline::ComicTranslator::is_likely_vision_model(m, prov_id)) {
+                    vision_models.push_back(m);
+                }
+            }
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0);
+            send_json(res, {
+                {"ok", true},
+                {"status", "ok"},
+                {"provider", prov_id},
+                {"provider_name", spec.name},
+                {"endpoint", resolved_url},
+                {"models", models},
+                {"available_models", models},
+                {"vision_models", vision_models},
+                {"model_count", models.size()},
+                {"latency_ms", static_cast<int>(elapsed.count())},
+            });
+        } catch (const pipeline::ProviderConnectionError& ex) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0);
+            send_json(res, {
+                {"ok", false},
+                {"status", "error"},
+                {"provider", prov_id},
+                {"provider_name", spec.name},
+                {"endpoint", resolved_url},
+                {"models", json::array()},
+                {"vision_models", json::array()},
+                {"model_count", 0},
+                {"latency_ms", static_cast<int>(elapsed.count())},
+                {"error", ex.what()},
+            });
+        }
+    };
+    server.Post("/api/providers/models", handle_provider_models);
+    server.Get("/api/providers/models", handle_provider_models);
 
     server.Get("/api/languages", [](const httplib::Request&, httplib::Response& res) {
         send_json(res, {
@@ -3155,12 +3757,16 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             return;
         }
         try {
+            const json prev = ctx.settings_manager.load();
             const json updated = ctx.settings_manager.update(patch);
-            if (updated.value("auto_unload_vram", true)) {
-                std::lock_guard<std::mutex> lock(ctx.inference_mutex);
-                if (ctx.detector) ctx.detector->unload();
-                if (ctx.ocr_engine) ctx.ocr_engine->unload();
-                if (ctx.inpainter) ctx.inpainter->unload();
+            const bool backend_changed =
+                updated.value("preferred_backend", std::string("auto")) !=
+                    prev.value("preferred_backend", std::string("auto")) ||
+                updated.value("execution_mode", std::string("hybrid")) !=
+                    prev.value("execution_mode", std::string("hybrid"));
+            if (backend_changed || updated.value("auto_unload_vram", true)) {
+                ctx.cancel_pending_unload();
+                ctx.unload_all_sessions();
             }
             send_json(res, ctx.settings_manager.format_api_response(updated));
         } catch (const std::invalid_argument& ex) {
@@ -3763,6 +4369,328 @@ void register_routes(httplib::Server& server, AppContext& ctx) {
             send_json(res, {{"detail", ex.what()}}, 400);
         } catch (const std::exception& ex) {
             send_json(res, {{"detail", std::string("PDF export failed: ") + ex.what()}}, 500);
+        }
+    });
+
+    server.Post("/api/export/psd", [](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto decode_rgba = [](const std::vector<uint8_t>& raw, int& w, int& h, const std::string& label) -> std::vector<uint8_t> {
+                int ch = 0;
+                unsigned char* px = stbi_load_from_memory(
+                    raw.data(), static_cast<int>(raw.size()), &w, &h, &ch, 4);
+                if (!px || w <= 0 || h <= 0) {
+                    throw ComicExportError("Failed to decode image for PSD (" + label + ").");
+                }
+                std::vector<uint8_t> out(px, px + static_cast<size_t>(w) * static_cast<size_t>(h) * 4U);
+                stbi_image_free(px);
+                return out;
+            };
+
+            auto decode_gray = [](const std::vector<uint8_t>& raw, int& w, int& h) -> std::vector<uint8_t> {
+                int ch = 0;
+                unsigned char* px = stbi_load_from_memory(
+                    raw.data(), static_cast<int>(raw.size()), &w, &h, &ch, 1);
+                if (!px || w <= 0 || h <= 0) {
+                    return {};
+                }
+                std::vector<uint8_t> out(px, px + static_cast<size_t>(w) * static_cast<size_t>(h));
+                stbi_image_free(px);
+                return out;
+            };
+
+            auto pick_str = [](const json& obj, std::initializer_list<const char*> keys) -> std::string {
+                for (const char* k : keys) {
+                    if (obj.contains(k) && obj[k].is_string()) {
+                        const std::string v = util::trim_ascii(obj[k].get<std::string>());
+                        if (!v.empty()) return v;
+                    }
+                }
+                return {};
+            };
+
+            if (req.body.empty()) {
+                throw ComicExportError("Empty PSD export request body.");
+            }
+            const json body = json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                throw ComicExportError("Invalid JSON request body for /api/export/psd.");
+            }
+
+            const json* raw_pages = nullptr;
+            if (body.contains("pages") && body["pages"].is_array() && !body["pages"].empty()) {
+                raw_pages = &body["pages"];
+            }
+            if (!raw_pages) {
+                throw ComicExportError("Provide a non-empty 'pages' array for /api/export/psd.");
+            }
+
+            std::optional<std::string> export_name;
+            if (const std::string fn = pick_str(body, {"filename", "title"}); !fn.empty()) {
+                export_name = fn;
+            }
+            const bool editable_text_layers =
+                body.contains("editable_text_layers") && body["editable_text_layers"].is_boolean()
+                    ? body["editable_text_layers"].get<bool>()
+                    : false;
+
+            std::vector<std::pair<std::string, std::vector<uint8_t>>> page_psds;
+            page_psds.reserve(raw_pages->size());
+            const size_t pad_width = std::max<size_t>(3, std::to_string(raw_pages->size()).size());
+
+            for (size_t i = 0; i < raw_pages->size(); ++i) {
+                const int page_num = static_cast<int>(i + 1);
+                const auto& p = (*raw_pages)[i];
+                if (!p.is_object()) {
+                    throw ComicExportError("Page " + std::to_string(page_num) + " must be a JSON object.");
+                }
+
+                const std::string orig_ref = pick_str(p, {"original_image", "original", "image", "image_url"});
+                if (orig_ref.empty()) {
+                    throw ComicExportError("Page " + std::to_string(page_num) + " is missing 'original_image'.");
+                }
+                const auto orig_bytes = decode_export_image_reference(orig_ref, page_num);
+                int doc_w = 0, doc_h = 0;
+                const auto orig_rgba = decode_rgba(orig_bytes, doc_w, doc_h, "original_image");
+
+                std::vector<vellum::psd::PsdLayer> layers;
+
+                // Layer 0: Background (original raw page image, opaque RGB)
+                {
+                    vellum::psd::PsdLayer bg;
+                    bg.name = "Background";
+                    bg.left = 0;
+                    bg.top = 0;
+                    bg.width = doc_w;
+                    bg.height = doc_h;
+                    bg.has_alpha = false;
+                    bg.pixels.resize(static_cast<size_t>(doc_w) * static_cast<size_t>(doc_h) * 3U);
+                    for (size_t px = 0; px < static_cast<size_t>(doc_w) * static_cast<size_t>(doc_h); ++px) {
+                        bg.pixels[px * 3 + 0] = orig_rgba[px * 4 + 0];
+                        bg.pixels[px * 3 + 1] = orig_rgba[px * 4 + 1];
+                        bg.pixels[px * 3 + 2] = orig_rgba[px * 4 + 2];
+                    }
+                    layers.push_back(std::move(bg));
+                }
+
+                // Layer 1: Cleanup (non-destructive diff patch + transparency)
+                {
+                    const std::string clean_ref = pick_str(p, {"cleaned_image", "inpainted_image", "cleaned"});
+                    if (!clean_ref.empty() && clean_ref != orig_ref) {
+                        const auto clean_bytes = decode_export_image_reference(clean_ref, page_num);
+                        int cw = 0, ch = 0;
+                        const auto clean_rgba = decode_rgba(clean_bytes, cw, ch, "cleaned_image");
+
+                        std::vector<uint8_t> mask_gray;
+                        const std::string mask_ref = pick_str(p, {"mask_image", "mask_url", "mask"});
+                        if (!mask_ref.empty()) {
+                            try {
+                                const auto mask_bytes = decode_export_image_reference(mask_ref, page_num);
+                                int mw = 0, mh = 0;
+                                auto decoded_mask = decode_gray(mask_bytes, mw, mh);
+                                if (mw == doc_w && mh == doc_h) {
+                                    mask_gray = std::move(decoded_mask);
+                                }
+                            } catch (...) {
+                                // Ignore optional mask decode errors; fall back to pixel diff
+                            }
+                        }
+
+                        if (cw == doc_w && ch == doc_h) {
+                            layers.push_back(vellum::psd::build_cleanup_diff_layer(
+                                orig_rgba.data(),
+                                clean_rgba.data(),
+                                doc_w,
+                                doc_h,
+                                mask_gray.empty() ? nullptr : mask_gray.data(),
+                                2,
+                                "Cleanup"));
+                        } else {
+                            vellum::psd::PsdLayer clean_layer;
+                            clean_layer.name = "Cleanup";
+                            clean_layer.left = 0;
+                            clean_layer.top = 0;
+                            clean_layer.width = cw;
+                            clean_layer.height = ch;
+                            clean_layer.has_alpha = true;
+                            clean_layer.pixels = clean_rgba;
+                            layers.push_back(std::move(clean_layer));
+                        }
+                    } else {
+                        vellum::psd::PsdLayer empty_clean;
+                        empty_clean.name = "Cleanup";
+                        empty_clean.has_alpha = true;
+                        layers.push_back(std::move(empty_clean));
+                    }
+                }
+
+                // Layer 2+: Text (per-block layers with exact (x, y) offsets, or full-page Text layer)
+                bool added_text_layer = false;
+                const json* raw_tlayers = nullptr;
+                for (const char* tkey : {"text_layers", "blocks", "bubbles"}) {
+                    if (p.contains(tkey) && p[tkey].is_array() && !p[tkey].empty()) {
+                        raw_tlayers = &p[tkey];
+                        break;
+                    }
+                }
+                if (raw_tlayers != nullptr) {
+                    const auto& tlayers = *raw_tlayers;
+                    for (size_t ti = 0; ti < tlayers.size(); ++ti) {
+                        const auto& tl = tlayers[ti];
+                        if (!tl.is_object()) continue;
+
+                        vellum::psd::PsdLayer layer;
+                        std::string lname = pick_str(tl, {"name", "id"});
+                        if (lname.empty()) {
+                            char nb[32]{};
+                            std::snprintf(nb, sizeof(nb), "Text %02zu", ti + 1);
+                            lname = nb;
+                        }
+                        layer.name = lname;
+                        layer.has_alpha = true;
+
+                        // Extract bounding coordinates from explicit x/y/width/height or fallback `bbox: [x1, y1, x2, y2]`
+                        double bx = 0.0, by = 0.0, bw = 0.0, bh = 0.0;
+                        if (tl.contains("bbox") && tl["bbox"].is_array() && tl["bbox"].size() >= 4 &&
+                            tl["bbox"][0].is_number() && tl["bbox"][1].is_number() &&
+                            tl["bbox"][2].is_number() && tl["bbox"][3].is_number()) {
+                            bx = tl["bbox"][0].get<double>();
+                            by = tl["bbox"][1].get<double>();
+                            bw = std::max(1.0, tl["bbox"][2].get<double>() - bx);
+                            bh = std::max(1.0, tl["bbox"][3].get<double>() - by);
+                        }
+                        const int32_t lx = tl.contains("x") && tl["x"].is_number()
+                            ? static_cast<int32_t>(std::llround(tl["x"].get<double>()))
+                            : static_cast<int32_t>(std::llround(bx));
+                        const int32_t ly = tl.contains("y") && tl["y"].is_number()
+                            ? static_cast<int32_t>(std::llround(tl["y"].get<double>()))
+                            : static_cast<int32_t>(std::llround(by));
+                        if (tl.contains("opacity") && tl["opacity"].is_number()) {
+                            const double op = std::max(0.0, std::min(1.0, tl["opacity"].get<double>()));
+                            layer.opacity = static_cast<uint8_t>(std::llround(op * 255.0));
+                        }
+
+                        const std::string img_ref = pick_str(tl, {"image", "raster_image"});
+                        if (!img_ref.empty()) {
+                            const auto img_bytes = decode_export_image_reference(img_ref, page_num);
+                            int tw = 0, th = 0;
+                            auto trgba = decode_rgba(img_bytes, tw, th, "text_layer");
+                            layer.left = lx;
+                            layer.top = ly;
+                            layer.width = tw;
+                            layer.height = th;
+                            layer.pixels = std::move(trgba);
+                        }
+
+                        if (editable_text_layers) {
+                            const std::string txt = pick_str(tl, {"text", "translated_text", "original_text"});
+                            if (!txt.empty()) {
+                                vellum::psd::TypeLayerSpec spec;
+                                spec.text = txt;
+                                const std::string font = pick_str(tl, {"font_family", "font"});
+                                if (!font.empty()) spec.font_name = font;
+                                if (tl.contains("font_size") && tl["font_size"].is_number()) {
+                                    spec.font_size = std::max(4.0, tl["font_size"].get<double>());
+                                }
+                                if (tl.contains("line_height") && tl["line_height"].is_number()) {
+                                    spec.leading = spec.font_size * std::max(0.5, tl["line_height"].get<double>());
+                                }
+                                const std::string col = pick_str(tl, {"color", "fill"});
+                                if (!col.empty()) {
+                                    spec.fill_color = vellum::psd::parse_hex_color(col, {0, 0, 0});
+                                }
+                                const std::string al = util::to_lower_ascii(pick_str(tl, {"align"}));
+                                if (al == "left") spec.align = vellum::psd::TextAlign::Left;
+                                else if (al == "right") spec.align = vellum::psd::TextAlign::Right;
+                                else spec.align = vellum::psd::TextAlign::Center;
+
+                                spec.faux_bold = tl.contains("bold") && tl["bold"].is_boolean() && tl["bold"].get<bool>();
+                                spec.faux_italic = tl.contains("italic") && tl["italic"].is_boolean() && tl["italic"].get<bool>();
+                                spec.vertical = tl.contains("vertical") && tl["vertical"].is_boolean() && tl["vertical"].get<bool>();
+                                spec.box_x = tl.contains("box_x") && tl["box_x"].is_number()
+                                    ? tl["box_x"].get<double>() : static_cast<double>(lx);
+                                spec.box_y = tl.contains("box_y") && tl["box_y"].is_number()
+                                    ? tl["box_y"].get<double>() : static_cast<double>(ly);
+                                spec.box_width = tl.contains("width") && tl["width"].is_number()
+                                    ? std::max(1.0, tl["width"].get<double>())
+                                    : (bw > 0.0 ? bw : static_cast<double>(std::max<int32_t>(1, layer.width)));
+                                spec.box_height = tl.contains("height") && tl["height"].is_number()
+                                    ? std::max(1.0, tl["height"].get<double>())
+                                    : (bh > 0.0 ? bh : static_cast<double>(std::max<int32_t>(1, layer.height)));
+                                if (tl.contains("rotation") && tl["rotation"].is_number()) {
+                                    spec.rotation_deg = tl["rotation"].get<double>();
+                                }
+                                if (tl.contains("stroke_width") && tl["stroke_width"].is_number() &&
+                                    tl["stroke_width"].get<double>() > 0.0) {
+                                    spec.outline.enabled = true;
+                                    spec.outline.width_px = tl["stroke_width"].get<double>();
+                                    const std::string scol = pick_str(tl, {"stroke_color", "stroke"});
+                                    spec.outline.color = vellum::psd::parse_hex_color(scol, {255, 255, 255});
+                                }
+                                layer.type_spec = std::move(spec);
+                            }
+                        }
+
+                        layers.push_back(std::move(layer));
+                        added_text_layer = true;
+                    }
+                } else if (const std::string text_ref = pick_str(p, {"text_image", "text_layer"}); !text_ref.empty()) {
+                    const auto text_bytes = decode_export_image_reference(text_ref, page_num);
+                    int tw = 0, th = 0;
+                    const auto text_rgba = decode_rgba(text_bytes, tw, th, "text_image");
+                    layers.push_back(vellum::psd::build_cropped_rgba_layer(text_rgba.data(), tw, th, "Text"));
+                    added_text_layer = true;
+                }
+
+                if (!added_text_layer) {
+                    vellum::psd::PsdLayer empty_text;
+                    empty_text.name = "Text";
+                    empty_text.has_alpha = true;
+                    layers.push_back(std::move(empty_text));
+                }
+
+                vellum::psd::PsdDocumentOptions psd_opts;
+                psd_opts.width = doc_w;
+                psd_opts.height = doc_h;
+                psd_opts.channels = 3;
+                psd_opts.dpi = 72.0;
+                psd_opts.editable_text_layers = editable_text_layers;
+
+                auto psd_bytes = vellum::psd::write_psd_bytes(psd_opts, layers);
+
+                std::ostringstream prefix_ss;
+                prefix_ss << std::setw(static_cast<int>(pad_width)) << std::setfill('0') << page_num;
+                const std::string page_fn = pick_str(p, {"filename", "name"});
+                const std::string entry_name = page_fn.empty()
+                    ? (prefix_ss.str() + ".psd")
+                    : (prefix_ss.str() + "_" + sanitize_export_filename(page_fn, "psd", "page"));
+                page_psds.emplace_back(entry_name, std::move(psd_bytes));
+            }
+
+            apply_cors_headers(res);
+            res.set_header("X-Page-Count", std::to_string(page_psds.size()));
+
+            if (page_psds.size() == 1) {
+                const std::string download_name = sanitize_export_filename(export_name, "psd", "translated_page");
+                res.set_header("Content-Disposition", "attachment; filename=\"" + download_name + "\"");
+                res.set_content(
+                    reinterpret_cast<const char*>(page_psds[0].second.data()),
+                    page_psds[0].second.size(),
+                    "image/vnd.adobe.photoshop");
+            } else {
+                const auto zip_bytes = build_zip_from_named_buffers(page_psds);
+                const std::string download_name = sanitize_export_filename(export_name, "zip", "translated_psd_pages");
+                res.set_header("Content-Disposition", "attachment; filename=\"" + download_name + "\"");
+                res.set_content(
+                    reinterpret_cast<const char*>(zip_bytes.data()),
+                    zip_bytes.size(),
+                    "application/zip");
+            }
+        } catch (const vellum::psd::PsdWriteError& ex) {
+            send_json(res, {{"detail", ex.what()}}, 400);
+        } catch (const ComicExportError& ex) {
+            send_json(res, {{"detail", ex.what()}}, 400);
+        } catch (const std::exception& ex) {
+            send_json(res, {{"detail", std::string("PSD export failed: ") + ex.what()}}, 500);
         }
     });
 
@@ -4413,12 +5341,14 @@ int WINAPI WinMain(
     ctx.inpainter = std::make_unique<pipeline::LamaInpainter>(*ctx.model_manager);
     ctx.start_unload_watchdog();
 
-    // Pre-load persistent settings so execution_mode (`MANGA_FORCE_CPU`) is synced at startup
+    // Pre-load persistent settings so execution_mode (`MANGA_FORCE_CPU`) & preferred_backend are synced at startup
     const json initial_settings = ctx.settings_manager.load();
     const std::string init_exec_mode = initial_settings.value("execution_mode", std::string("hybrid"));
     if (init_exec_mode == "cpu_only" || init_exec_mode == "cpu") {
         util::set_env_utf8(L"MANGA_FORCE_CPU", "1");
     }
+    pipeline::set_preferred_backend(
+        initial_settings.value("preferred_backend", std::string("auto")));
 
     httplib::Server server;
     server.set_read_timeout(300, 0);

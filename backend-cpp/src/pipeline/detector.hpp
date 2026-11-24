@@ -24,6 +24,11 @@
 
 namespace mangaflow::pipeline {
 
+struct DetectedOutline {
+    std::array<uint8_t, 3> color{255, 255, 255};
+    int width = 0;
+};
+
 struct DetectedBubble {
     std::string id;
     int order = 0;
@@ -34,6 +39,13 @@ struct DetectedBubble {
     float confidence = 0.0f;
     std::string text_direction = "horizontal";  // "horizontal" | "vertical"
     std::string category = "text";              // "text" | "onomatopoeia"
+
+    // Optional v2.5 CV geometry & typography fields (backward-compatible with v2.0.0 schema)
+    std::vector<std::array<float, 2>> room_polygon;
+    std::optional<float> angle_deg;
+    std::optional<float> estimated_font_size;
+    std::optional<std::array<uint8_t, 3>> text_color;
+    std::optional<DetectedOutline> outline;
 
     nlohmann::json to_json() const;
 };
@@ -76,6 +88,8 @@ struct DetectionOptions {
     bool auto_unload = true;
     bool force_cpu = false;
     bool allow_model_fallback = true;
+    bool enable_cv_style_detect = true;
+    bool enable_waist_cut = true;
     std::string detector_backend = "auto";      // legacy alias: "auto" | "rfdetr" | "ctd"
 };
 

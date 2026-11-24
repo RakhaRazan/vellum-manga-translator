@@ -34,6 +34,8 @@ struct InpaintOptions {
     bool auto_unload = true;
     bool force_cpu = false;
     bool allow_model_fallback = true;
+    bool enable_3tier_inpaint = true;             // 3-Tier CPU-First Inpainting (Tier 1 Flat Median -> Tier 2 Plane+Telea -> Tier 3 Neural 256px)
+    bool enable_tone_match = true;                // Post-neural 4x3 Ridge Affine Color Regression + sigma=24px Gaussian residual diffusion
 };
 
 struct InpaintResult {
@@ -41,6 +43,11 @@ struct InpaintResult {
     int height = 0;
     int tiles_processed = 0;
     int tile_size = 512;
+    int tier1_blocks = 0;
+    int tier2_blocks = 0;
+    int tier3_blocks = 0;
+    bool gpu_skipped = false;
+    bool tone_match_applied = false;
     std::string execution_provider = "CPUExecutionProvider";
     std::string model_id = "lama-manga";
     bool is_koharu_manga = false;
@@ -102,6 +109,17 @@ public:
         int width,
         int height);
 
+    // Composite `src_rgb` onto `dst_rgb` inside `mask > 0` with an exact Euclidean feather
+    // of `feather_px` pixels (via Felzenszwalb-Huttenlocher 2D EDT).
+    static void composite_feathered_region(
+        std::vector<uint8_t>& dst_rgb,
+        const std::vector<uint8_t>& src_rgb,
+        const std::vector<uint8_t>& mask,
+        int width,
+        int height,
+        const std::array<int, 4>& roi,
+        float feather_px = 4.0f);
+
     // Explicitly unload any cached LaMa / AOT ONNX session from RAM/VRAM.
     void unload();
     bool is_loaded() const noexcept { return cached_session_.has_value() || cached_aot_session_.has_value(); }
@@ -133,7 +151,9 @@ private:
         int padding,
         int tile_size,
         const ResolvedLamaModel& resolved,
-        bool force_cpu);
+        bool force_cpu,
+        bool enable_tone_match,
+        bool* tone_match_applied_out = nullptr);
 
     static std::vector<std::array<int, 4>> extract_bboxes_from_mask(
         const std::vector<uint8_t>& mask,

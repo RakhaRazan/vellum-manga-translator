@@ -62,7 +62,7 @@ nlohmann::json toSchemaV2Json(const PageDetectionResult& result) {
             poly_json.push_back(nlohmann::json::array({pt.x, pt.y}));
         }
 
-        detections_json.push_back({
+        nlohmann::json det_obj = {
             {"id", d.id},
             {"reading_order", d.reading_order},
             {"panel_id", d.panel_id},
@@ -83,7 +83,40 @@ nlohmann::json toSchemaV2Json(const PageDetectionResult& result) {
                 {"mask_file", d.mask.mask_file}
             }},
             {"crop_file", d.crop_file}
-        });
+        };
+        if (!d.room_polygon.empty()) {
+            nlohmann::json rpoly = nlohmann::json::array();
+            for (const auto& pt : d.room_polygon) {
+                rpoly.push_back(nlohmann::json::array({pt.x, pt.y}));
+            }
+            det_obj["room_polygon"] = std::move(rpoly);
+        }
+        if (d.angle_deg.has_value()) {
+            det_obj["angle_deg"] = *d.angle_deg;
+        }
+        if (d.estimated_font_size.has_value()) {
+            det_obj["estimated_font_size"] = *d.estimated_font_size;
+        }
+        if (d.text_color.has_value()) {
+            det_obj["text_color"] = nlohmann::json::array({
+                static_cast<int>((*d.text_color)[0]),
+                static_cast<int>((*d.text_color)[1]),
+                static_cast<int>((*d.text_color)[2])
+            });
+        }
+        if (d.outline.has_value()) {
+            det_obj["outline"] = {
+                {"color", nlohmann::json::array({
+                    static_cast<int>(d.outline->color[0]),
+                    static_cast<int>(d.outline->color[1]),
+                    static_cast<int>(d.outline->color[2])
+                })},
+                {"width", d.outline->width}
+            };
+        } else if (d.angle_deg.has_value()) {
+            det_obj["outline"] = nullptr;
+        }
+        detections_json.push_back(std::move(det_obj));
     }
 
     return nlohmann::json{

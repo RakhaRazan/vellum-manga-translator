@@ -116,6 +116,8 @@ struct TranslatorConfig {
 struct TranslateRequestOptions {
     std::string source_lang = "ja";
     std::string target_lang = "id";
+    std::string project_id;  // Optional per-project conversation history key
+    bool use_history = true;
     std::optional<std::string> translation_tone;
     std::optional<std::string> custom_instructions;
     std::optional<std::map<std::string, std::string>> glossary;
@@ -131,11 +133,14 @@ struct TranslateRequestOptions {
 };
 
 struct PageTranslationResult {
+    std::string status = "ok";  // "ok" | "provider_not_configured"
     std::string provider;
     std::string model;
     std::string source_language;
     std::string target_language;
     bool vision_used = false;
+    bool echo_retried = false;
+    bool history_compacted = false;
     std::string reasoning_effort = "off";
     std::map<std::string, std::string> translations;
     std::vector<TranslatedDialogueItem> dialogues;
@@ -255,6 +260,9 @@ public:
     // and unclosed reasoning blocks prior to JSON parsing.
     static std::string strip_thinking_tags(const std::string& raw_content);
 
+    // Clear per-project conversation history (e.g. when starting a new comic project).
+    static void clear_project_conversation(const std::string& project_id);
+
     static std::map<std::string, std::string> extract_and_clean_translations(
         const std::string& raw_content,
         const std::vector<DialogueBlockInput>& input_blocks,
@@ -294,6 +302,11 @@ public:
         const TranslateRequestOptions& options = {});
 
 private:
+    struct ConversationMessage {
+        std::string role;     // "user" | "assistant"
+        std::string content;  // Clean text only (base64 images & <think> stripped)
+    };
+
     std::pair<std::string, bool> call_openai_chat_completion(
         const std::string& model_id,
         const std::string& system_prompt,
@@ -304,7 +317,8 @@ private:
         int max_tokens,
         std::optional<double> frequency_penalty,
         const std::string& reasoning_effort,
-        const std::optional<std::string>& page_image_data_uri) const;
+        const std::optional<std::string>& page_image_data_uri,
+        const std::vector<ConversationMessage>& history = {}) const;
 
     std::pair<std::string, bool> call_anthropic_messages(
         const std::string& model_id,
@@ -315,7 +329,13 @@ private:
         std::optional<int> top_k,
         int max_tokens,
         const std::string& reasoning_effort,
-        const std::optional<std::string>& page_image_data_uri) const;
+        const std::optional<std::string>& page_image_data_uri,
+        const std::vector<ConversationMessage>& history = {}) const;
+
+    std::string compact_conversation_history(
+        const std::string& model_id,
+        const std::string& existing_summary,
+        const std::vector<ConversationMessage>& older_turns) const;
 
     TranslatorConfig config_;
     const ProviderSpec* spec_ = nullptr;

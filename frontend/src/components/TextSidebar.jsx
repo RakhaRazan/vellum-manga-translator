@@ -512,6 +512,14 @@ export default function TextSidebar({
       : selectedBlock?.style?.all_caps !== undefined
       ? Boolean(selectedBlock.style.all_caps)
       : Boolean(typesetting?.allCaps);
+  const currentRotation =
+    typeof selectedBlock?.rotation === 'number' && Number.isFinite(selectedBlock.rotation)
+      ? selectedBlock.rotation
+      : typesetting?.autoTiltText &&
+        typeof selectedBlock?.angle_deg === 'number' &&
+        Number.isFinite(selectedBlock.angle_deg)
+      ? selectedBlock.angle_deg
+      : 0;
 
   const isSelectedLayerOcrBusy =
     busyLayerAction?.blockId === selectedBlock?.id &&
@@ -1150,6 +1158,40 @@ export default function TextSidebar({
               }
               className="flex-1 accent-[var(--color-accent)] cursor-pointer"
             />
+          </div>
+
+          {/* Rotation Slider + Quick 0° Reset */}
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] font-mono text-studio-text-muted shrink-0 w-16 tabular-nums">
+              Rot {Math.round(currentRotation)}°
+            </span>
+            <input
+              type="range"
+              aria-label="Rotation Angle"
+              min={-45}
+              max={45}
+              step={1}
+              value={Math.max(-45, Math.min(45, Math.round(currentRotation)))}
+              onChange={(e) =>
+                onUpdateBlock(
+                  selectedBlock.id,
+                  { rotation: Number(e.target.value) },
+                  { coalesceKey: `rotation:${selectedBlock.id}` }
+                )
+              }
+              className="flex-1 accent-[var(--color-accent)] cursor-pointer"
+            />
+            <button
+              type="button"
+              onClick={() =>
+                onUpdateBlock(selectedBlock.id, { rotation: 0 })
+              }
+              disabled={Math.abs(currentRotation) < 0.01}
+              title="Reset text rotation to 0°"
+              className="px-1.5 h-5 rounded-studio-sm border border-studio-border bg-studio-surface hover:bg-studio-hover text-[10px] font-mono text-studio-text-secondary hover:text-studio-text disabled:opacity-35 disabled:pointer-events-none cursor-pointer transition-colors"
+            >
+              0°
+            </button>
           </div>
 
           {/* Text Color & Outline Stroke Section */}

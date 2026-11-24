@@ -111,4 +111,8 @@ void build_pdf_to_file(
     const std::vector<DiskExportPageEntry>& pages,
     const std::filesystem::path& output_path);
 
+// Package arbitrary named binary buffers (e.g. multi-page `.psd` files) into a `.zip` archive
+std::vector<uint8_t> build_zip_from_named_buffers(
+    const std::vector<std::pair<std::string, std::vector<uint8_t>>>& entries);
+
 }  // namespace mangaflow

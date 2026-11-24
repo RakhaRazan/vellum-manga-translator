@@ -2,14 +2,18 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================================
-REM Vellum - Standalone C++17 Desktop Release Builder (Phase 11.1)
+REM Vellum v2.5 Studio Core - Dual-Core C++17 Release Builder (CUDA + DirectML)
 REM
-REM 1. Builds production React v2 UI (`frontend/dist`) via `npm run build`
-REM 2. Configures & compiles `backend-cpp` in Release mode (MSVC /O2 /GL /LTCG)
-REM 3. Stages `Vellum.exe`, ONNX Runtime DLLs, and `frontend/dist` into
-REM    `Manga/Vellum_Runtime/` and installs the root one-click launcher
-REM    `Manga/Vellum.exe`
-REM 4. Packages `release/Vellum-Windows-x64.zip` for GitHub Releases
+REM Usage:
+REM   packaging\build_cpp_release.bat [AUTO|DUAL|CUDA|DML]
+REM
+REM   AUTO / DUAL : Builds BOTH CUDA core (Vellum_Runtime\Vellum_Core.exe)
+REM                 AND lightweight DirectML core (Vellum_Runtime\dml\Vellum_Core_DML.exe)
+REM                 sharing Vellum_Runtime\frontend\dist and Vellum_Runtime\fonts,
+REM                 plus root Dual-Core Vellum.exe launcher.
+REM                 -> release\Vellum-v2.5-Windows-x64-Universal.zip
+REM   CUDA        : Builds CUDA core only
+REM   DML         : Builds DirectML core only
 REM ============================================================================
 
 pushd "%~dp0.." >nul 2>&1
@@ -20,23 +24,57 @@ if errorlevel 1 (
 set "ROOT_DIR=%CD%"
 popd >nul 2>&1
 
+set "VARIANT_ARG=%~1"
+if not defined VARIANT_ARG set "VARIANT_ARG=AUTO"
+
+set "BUILD_DML=0"
+set "BUILD_CUDA=0"
+
+if /I "%VARIANT_ARG%"=="CUDA" set "BUILD_CUDA=1"
+if /I "%VARIANT_ARG%"=="DML" set "BUILD_DML=1"
+if /I "%VARIANT_ARG%"=="UNIVERSAL" (
+    set "BUILD_CUDA=1"
+    set "BUILD_DML=1"
+)
+if /I "%VARIANT_ARG%"=="ALL" (
+    set "BUILD_CUDA=1"
+    set "BUILD_DML=1"
+)
+if /I "%VARIANT_ARG%"=="BOTH" (
+    set "BUILD_CUDA=1"
+    set "BUILD_DML=1"
+)
+if /I "%VARIANT_ARG%"=="DUAL" (
+    set "BUILD_CUDA=1"
+    set "BUILD_DML=1"
+)
+if /I "%VARIANT_ARG%"=="AUTO" (
+    set "BUILD_CUDA=1"
+    set "BUILD_DML=1"
+)
+
+if "%BUILD_DML%"=="0" if "%BUILD_CUDA%"=="0" (
+    echo [ERROR] Unknown variant '%VARIANT_ARG%'. Use AUTO, DUAL, CUDA, or DML.
+    exit /b 1
+)
+
 set "FRONTEND_DIR=%ROOT_DIR%\frontend"
 set "FRONTEND_DIST=%FRONTEND_DIR%\dist"
 set "CPP_DIR=%ROOT_DIR%\backend-cpp"
-set "CPP_RELEASE_BIN=%CPP_DIR%\build\Release"
 set "STAGE_DIR=%ROOT_DIR%\Vellum_Runtime"
 set "ROOT_LAUNCHER=%ROOT_DIR%\Vellum.exe"
 set "RELEASE_DIR=%ROOT_DIR%\release"
-set "ZIP_PATH=%RELEASE_DIR%\Vellum-Windows-x64.zip"
+set "ZIP_NAME=Vellum-v2.5-Windows-x64-Universal.zip"
+if /I "%VARIANT_ARG%"=="CUDA" set "ZIP_NAME=Vellum-v2.5-Windows-x64-CUDA.zip"
+if /I "%VARIANT_ARG%"=="DML" set "ZIP_NAME=Vellum-v2.5-Windows-x64-DirectML.zip"
+set "ZIP_PATH=%RELEASE_DIR%\%ZIP_NAME%"
 
 echo ============================================================================
-echo   Vellum - Standalone C++17 Desktop Release Builder
+echo   Vellum v2.5 Studio Core - Dual-Core Release Builder
 echo ============================================================================
-echo   Project Root   : %ROOT_DIR%
-echo   C++ Backend    : %CPP_DIR%
-echo   Bundle Folder  : %STAGE_DIR%
-echo   Root Launcher  : %ROOT_LAUNCHER%
-echo   Release Zip    : %ZIP_PATH%
+echo   Project Root    : %ROOT_DIR%
+echo   Target Mode     : %VARIANT_ARG% (CUDA=%BUILD_CUDA%, DirectML=%BUILD_DML%)
+echo   Release Dir     : %RELEASE_DIR%
 echo ============================================================================
 echo.
 
@@ -58,7 +96,6 @@ if errorlevel 1 (
 where npm.cmd >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Node.js / npm was not found on PATH.
-    echo         Please install Node.js or add it to PATH and retry.
     exit /b 1
 )
 
@@ -95,14 +132,13 @@ if errorlevel 1 (
 where cmake.exe >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] cmake.exe was not found on PATH or inside Visual Studio Build Tools.
-    echo         Please install CMake or Visual Studio C++ CMake Tools and retry.
     exit /b 1
 )
 
 REM ----------------------------------------------------------------------------
-REM Step 1/4: Build React Frontend (`frontend/dist`)
+REM Step 1: Build React Frontend (frontend\dist)
 REM ----------------------------------------------------------------------------
-echo [1/4] Building production React frontend (`npm run build`) ...
+echo [1/4] Building production React frontend ...
 pushd "%FRONTEND_DIR%"
 call npm run build
 set "STEP_ERR=!ERRORLEVEL!"
@@ -118,90 +154,74 @@ if not exist "%FRONTEND_DIST%\index.html" (
 echo       Frontend dist ready : %FRONTEND_DIST%
 echo.
 
+if not exist "%RELEASE_DIR%" mkdir "%RELEASE_DIR%"
+
 REM ----------------------------------------------------------------------------
-REM Step 2/4: Configure & Compile `backend-cpp` in Release mode (/O2 /GL /LTCG)
+REM Step 2: Compile Selected C++ Cores
 REM ----------------------------------------------------------------------------
-if not defined VELLUM_ORT_BACKEND (
-    set "VELLUM_ORT_BACKEND=AUTO"
-)
-echo [2/4] Configuring and compiling backend-cpp (Release, MSVC /O2 /GL /LTCG, ORT=%VELLUM_ORT_BACKEND%) ...
-pushd "%CPP_DIR%"
-if exist "build\CMakeCache.txt" (
-    cmake -B build -DCMAKE_BUILD_TYPE=Release -DMANGAFLOW_ORT_BACKEND=%VELLUM_ORT_BACKEND%
-    if errorlevel 1 (
-        echo [INFO] Stale CMakeCache detected. Re-configuring cleanly with -A x64 ...
-        del /f /q "build\CMakeCache.txt" 2>nul
-        cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DMANGAFLOW_ORT_BACKEND=%VELLUM_ORT_BACKEND%
+set "CUDA_BIN_DIR=%CPP_DIR%\build-cuda\Release"
+set "DML_BIN_DIR=%CPP_DIR%\build-dml\Release"
+set "LAUNCHER_BIN="
+
+if "%BUILD_CUDA%"=="1" (
+    echo [2A/4] Ensuring NVIDIA CUDA 12 + cuDNN 9 redistributable DLLs are cached ...
+    if not exist "%CPP_DIR%\build_deps\cuda_runtime\bin\cudnn64_9.dll" (
+        python "%ROOT_DIR%\packaging\fetch_cuda_dlls.py"
+        if errorlevel 1 (
+            echo [ERROR] Failed to fetch NVIDIA CUDA 12 / cuDNN 9 runtime DLLs.
+            exit /b 1
+        )
+    ) else (
+        echo       CUDA 12 + cuDNN 9 DLLs ready : %CPP_DIR%\build_deps\cuda_runtime\bin
     )
-) else (
-    cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DMANGAFLOW_ORT_BACKEND=%VELLUM_ORT_BACKEND%
-)
-set "STEP_ERR=!ERRORLEVEL!"
-if not "!STEP_ERR!"=="0" (
-    popd
-    echo [ERROR] CMake configure failed with exit code !STEP_ERR!.
-    exit /b !STEP_ERR!
+    echo.
+    call :CompileCore CUDA "build-cuda"
+    if errorlevel 1 exit /b 1
+    set "LAUNCHER_BIN=%CUDA_BIN_DIR%\Vellum-Launcher.exe"
 )
 
-cmake --build build --config Release --parallel
-set "STEP_ERR=!ERRORLEVEL!"
-popd
-if not "!STEP_ERR!"=="0" (
-    echo [ERROR] CMake Release build failed with exit code !STEP_ERR!.
-    exit /b !STEP_ERR!
+if "%BUILD_DML%"=="1" (
+    call :CompileCore DML "build-dml"
+    if errorlevel 1 exit /b 1
+    if not defined LAUNCHER_BIN set "LAUNCHER_BIN=%DML_BIN_DIR%\Vellum-Launcher.exe"
 )
-
-if not exist "%CPP_RELEASE_BIN%\Vellum.exe" (
-    echo [ERROR] Expected native binary not found: "%CPP_RELEASE_BIN%\Vellum.exe"
-    exit /b 1
-)
-if not exist "%CPP_RELEASE_BIN%\Vellum-Launcher.exe" (
-    echo [ERROR] Expected native launcher not found: "%CPP_RELEASE_BIN%\Vellum-Launcher.exe"
-    exit /b 1
-)
-if not exist "%CPP_RELEASE_BIN%\onnxruntime.dll" (
-    echo [ERROR] Expected ONNX Runtime DLL not found: "%CPP_RELEASE_BIN%\onnxruntime.dll"
-    exit /b 1
-)
-echo       Compiled C++17 Release binaries ready : %CPP_RELEASE_BIN%
-echo.
 
 REM ----------------------------------------------------------------------------
-REM Step 3/4: Stage `Manga/Vellum_Runtime/` and Root Launcher `Manga/Vellum.exe`
+REM Step 3: Stage Unified Dual-Core Vellum_Runtime + Root Launcher
 REM ----------------------------------------------------------------------------
-echo [3/4] Staging standalone bundle (`Vellum_Runtime/`) and root launcher (`Vellum.exe`) ...
+echo [3/4] Staging unified Vellum_Runtime directory ...
 if exist "%STAGE_DIR%" (
     rmdir /s /q "%STAGE_DIR%" >nul 2>&1
     if exist "%STAGE_DIR%" (
-        echo [ERROR] Could not clean "%STAGE_DIR%". Please close any running Vellum.exe and retry.
+        echo [ERROR] Could not clean "%STAGE_DIR%". Close any running Vellum.exe and retry.
         exit /b 1
     )
 )
 
 mkdir "%STAGE_DIR%"
-if errorlevel 1 (
-    echo [ERROR] Failed to create staging directory "%STAGE_DIR%".
-    exit /b 1
-)
+if errorlevel 1 exit /b 1
 mkdir "%STAGE_DIR%\frontend\dist"
-if errorlevel 1 (
-    echo [ERROR] Failed to create frontend staging directory "%STAGE_DIR%\frontend\dist".
-    exit /b 1
+if errorlevel 1 exit /b 1
+
+if "%BUILD_CUDA%"=="1" (
+    copy /y "%CUDA_BIN_DIR%\Vellum.exe" "%STAGE_DIR%\Vellum_Core.exe" >nul
+    if errorlevel 1 exit /b 1
+    copy /y "%CUDA_BIN_DIR%\*.dll" "%STAGE_DIR%\" >nul
+    if errorlevel 1 exit /b 1
+    if exist "%CPP_DIR%\build_deps\cuda_runtime\bin\*.dll" (
+        copy /y "%CPP_DIR%\build_deps\cuda_runtime\bin\*.dll" "%STAGE_DIR%\" >nul
+        if errorlevel 1 exit /b 1
+    )
 )
 
-copy /y "%CPP_RELEASE_BIN%\Vellum.exe" "%STAGE_DIR%\Vellum.exe" >nul
-if errorlevel 1 (
-    echo [ERROR] Failed to copy Vellum.exe into "%STAGE_DIR%".
-    exit /b 1
+if "%BUILD_DML%"=="1" (
+    mkdir "%STAGE_DIR%\dml"
+    if errorlevel 1 exit /b 1
+    copy /y "%DML_BIN_DIR%\Vellum.exe" "%STAGE_DIR%\dml\Vellum_Core_DML.exe" >nul
+    if errorlevel 1 exit /b 1
+    copy /y "%DML_BIN_DIR%\*.dll" "%STAGE_DIR%\dml\" >nul
+    if errorlevel 1 exit /b 1
 )
-
-copy /y "%CPP_RELEASE_BIN%\*.dll" "%STAGE_DIR%\" >nul
-if errorlevel 1 (
-    echo [ERROR] Failed to copy ONNX Runtime DLLs into "%STAGE_DIR%".
-    exit /b 1
-)
-
-REM Never copy local settings.json into release staging (may contain user keys/paths)
 
 if exist "%ROOT_DIR%\fonts" (
     mkdir "%STAGE_DIR%\fonts" >nul 2>&1
@@ -209,97 +229,109 @@ if exist "%ROOT_DIR%\fonts" (
 )
 
 xcopy "%FRONTEND_DIST%\*" "%STAGE_DIR%\frontend\dist\" /e /i /y /q >nul
-if errorlevel 1 (
-    echo [ERROR] Failed to copy frontend/dist into "%STAGE_DIR%\frontend\dist".
-    exit /b 1
-)
+if errorlevel 1 exit /b 1
 
-copy /y "%CPP_RELEASE_BIN%\Vellum-Launcher.exe" "%ROOT_LAUNCHER%" >nul
-if errorlevel 1 (
-    echo [ERROR] Failed to install root one-click launcher "%ROOT_LAUNCHER%".
-    echo         Please close any running Vellum.exe and retry.
+if not exist "%LAUNCHER_BIN%" (
+    echo [ERROR] Missing compiled launcher binary: "%LAUNCHER_BIN%"
     exit /b 1
 )
-
-if not exist "%STAGE_DIR%\Vellum.exe" (
-    echo [ERROR] Staging verification failed: missing "%STAGE_DIR%\Vellum.exe"
-    exit /b 1
-)
-if not exist "%STAGE_DIR%\onnxruntime.dll" (
-    echo [ERROR] Staging verification failed: missing "%STAGE_DIR%\onnxruntime.dll"
-    exit /b 1
-)
-if not exist "%STAGE_DIR%\frontend\dist\index.html" (
-    echo [ERROR] Staging verification failed: missing "%STAGE_DIR%\frontend\dist\index.html"
-    exit /b 1
-)
-if not exist "%ROOT_LAUNCHER%" (
-    echo [ERROR] Staging verification failed: missing "%ROOT_LAUNCHER%"
-    exit /b 1
-)
-echo       Staged standalone bundle : %STAGE_DIR%
-echo       Installed root launcher  : %ROOT_LAUNCHER%
-echo.
+copy /y "%LAUNCHER_BIN%" "%ROOT_LAUNCHER%" >nul
+if errorlevel 1 exit /b 1
 
 REM ----------------------------------------------------------------------------
-REM Step 4/4: Pre-Package Secret Guard & Release Archive Packaging
+REM Step 4: Pre-Release Secret Guard & Portable Archive
 REM ----------------------------------------------------------------------------
-echo [4/4] Running pre-package secret guard and packaging (`release/Vellum-Windows-x64.zip`) ...
+echo [4/4] Running Pre-Release Secret Guard and packaging %ZIP_NAME% ...
 if exist "%STAGE_DIR%\settings.json" (
-    echo [ERROR] Pre-package secret guard aborted: settings.json must never be staged in "%STAGE_DIR%".
+    echo [ERROR] Pre-Release Secret Guard aborted: settings.json found in "%STAGE_DIR%".
     exit /b 1
 )
+
 set "MF_STAGE_DIR=%STAGE_DIR%"
+set "MF_ZIP_PATH=%ZIP_PATH%"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$stage = $env:MF_STAGE_DIR;" ^
-    "$badFiles = Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.Name -ieq 'settings.json' };" ^
-    "if ($badFiles) { Write-Error ('ABORT: settings.json found in release stage: ' + $badFiles[0].FullName); exit 1 };" ^
-    "$pattern = '(?i)(C:\\FILE|(?<![A-Za-z0-9_])sk-(?:or-|ant-|proj-|[A-Za-z0-9]{12,})|AIza[0-9A-Za-z_-]{10,})';" ^
+    "$badFiles = Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.Name -ieq 'settings.json' -or $_.Name -ieq 'KOHARU_CLEANROOM_SPEC.md' };" ^
+    "if ($badFiles) { Write-Error ('ABORT: Prohibited file found in release stage: ' + $badFiles[0].FullName); exit 1 };" ^
+    "$badDirs = Get-ChildItem -LiteralPath $stage -Recurse -Directory | Where-Object { @('cache','projects_cache','models') -contains $_.Name.ToLowerInvariant() -or $_.Name -like '*.WebView2' };" ^
+    "if ($badDirs) { Write-Error ('ABORT: Prohibited directory found in release stage: ' + $badDirs[0].FullName); exit 1 };" ^
+    "$pattern = '(?i)(C:\\Users\\[^\\]+|C:/Users/[^/]+|C:\\FILE|C:/FILE|\bsk-(?:or-|ant-|proj-|[A-Za-z0-9]{12,})|AIza[0-9A-Za-z_-]{10,}|ghp_[A-Za-z0-9]{20,}|hauhaucs|Faithful & Uncensored|:1235\b)';" ^
     "$scanExts = @('.json','.js','.jsx','.css','.html','.txt','.md','.bat','.ps1','.cfg','.ini','.yaml','.yml');" ^
     "foreach ($f in (Get-ChildItem -LiteralPath $stage -Recurse -File)) {" ^
     "  if ($scanExts -contains $f.Extension.ToLowerInvariant()) {" ^
     "    $hits = Select-String -LiteralPath $f.FullName -Pattern $pattern -AllMatches;" ^
-    "    if ($hits) { Write-Error ('ABORT: Secret or personal path pattern detected in ' + $f.FullName + ' line ' + $hits[0].LineNumber); exit 1 }" ^
+    "    if ($hits) { Write-Error ('ABORT: Secret or personal pattern detected in ' + $f.FullName + ' line ' + $hits[0].LineNumber); exit 1 }" ^
     "  }" ^
     "}"
 if errorlevel 1 (
-    echo [ERROR] Pre-package secret guard failed. Release archive was NOT created.
+    echo [ERROR] Pre-Release Secret Guard failed for %ZIP_NAME%.
     exit /b 1
 )
 
-if not exist "%RELEASE_DIR%" mkdir "%RELEASE_DIR%"
 if exist "%ZIP_PATH%" del /f /q "%ZIP_PATH%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path $env:MF_STAGE_DIR -DestinationPath $env:MF_ZIP_PATH -CompressionLevel Fastest -Force"
+if errorlevel 1 exit /b 1
+if not exist "%ZIP_PATH%" exit /b 1
 
-set "MF_ROOT_LAUNCHER=%ROOT_LAUNCHER%"
-set "MF_ZIP_PATH=%ZIP_PATH%"
-
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path $env:MF_STAGE_DIR -DestinationPath $env:MF_ZIP_PATH -CompressionLevel Optimal -Force"
-if errorlevel 1 (
-    echo [ERROR] Failed to create release zip archive "%ZIP_PATH%".
-    exit /b 1
-)
-if not exist "%ZIP_PATH%" (
-    echo [ERROR] Expected release archive not found: "%ZIP_PATH%"
-    exit /b 1
-)
-
-echo.
-echo ============================================================================
-echo   [SUCCESS] Vellum C++17 Standalone Release Ready.
-echo ============================================================================
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$exe = Get-Item -LiteralPath (Join-Path $env:MF_STAGE_DIR 'Vellum.exe');" ^
-    "$launcher = Get-Item -LiteralPath $env:MF_ROOT_LAUNCHER;" ^
     "$zip = Get-Item -LiteralPath $env:MF_ZIP_PATH;" ^
-    "$dllBytes = (Get-ChildItem -LiteralPath $env:MF_STAGE_DIR -Filter '*.dll' | Measure-Object -Property Length -Sum).Sum;" ^
     "$stageBytes = (Get-ChildItem -LiteralPath $env:MF_STAGE_DIR -Recurse -File | Measure-Object -Property Length -Sum).Sum;" ^
-    "Write-Host ('  Root Launcher     : {0} ({1:N1} KB)' -f $launcher.FullName, ($launcher.Length / 1KB));" ^
-    "Write-Host ('  Native Binary     : {0} ({1:N2} MB)' -f $exe.FullName, ($exe.Length / 1MB));" ^
-    "Write-Host ('  ONNX Runtime DLLs : {0:N2} MB' -f ($dllBytes / 1MB));" ^
-    "Write-Host ('  Bundle Folder     : {0} ({1:N2} MB total)' -f $env:MF_STAGE_DIR, ($stageBytes / 1MB));" ^
-    "Write-Host ('  GitHub Release Zip: {0} ({1:N2} MB)' -f $zip.FullName, ($zip.Length / 1MB));"
-echo ============================================================================
-echo.
+    "$dmlDir = Join-Path $env:MF_STAGE_DIR 'dml';" ^
+    "$dmlBytes = if (Test-Path $dmlDir) { (Get-ChildItem -LiteralPath $dmlDir -Recurse -File | Measure-Object -Property Length -Sum).Sum } else { 0 };" ^
+    "Write-Host ('  [DUAL-CORE] Stage: {0:N2} MB | DirectML Core: {1:N2} MB | Zip: {2} ({3:N2} MB)' -f ($stageBytes / 1MB), ($dmlBytes / 1MB), $zip.Name, ($zip.Length / 1MB));"
 
+echo.
+echo ============================================================================
+echo   [SUCCESS] Vellum v2.5 Studio Core Dual-Core Release Build Complete.
+echo ============================================================================
 endlocal
+exit /b 0
+
+REM ============================================================================
+REM Subroutine: CompileCore <ORT_BACKEND> <BUILD_SUBDIR>
+REM ============================================================================
+:CompileCore
+set "ORT_BACKEND=%~1"
+set "BUILD_SUBDIR=%~2"
+set "BUILD_DIR=%CPP_DIR%\%BUILD_SUBDIR%"
+set "BIN_DIR=%BUILD_DIR%\Release"
+
+echo [2/4] Configuring and compiling %ORT_BACKEND% core in %BUILD_SUBDIR% ...
+pushd "%CPP_DIR%"
+cmake -B "%BUILD_SUBDIR%" -A x64 -DCMAKE_BUILD_TYPE=Release -DVELLUM_ORT_BACKEND=%ORT_BACKEND%
+if errorlevel 1 (
+    popd
+    echo [ERROR] CMake configure failed for %ORT_BACKEND%.
+    exit /b 1
+)
+
+cmake --build "%BUILD_SUBDIR%" --config Release --target MangaFlowAI MangaFlowCppLauncher test_psd_writer --parallel
+set "STEP_ERR=!ERRORLEVEL!"
+popd
+if not "!STEP_ERR!"=="0" (
+    echo [ERROR] CMake Release build failed for %ORT_BACKEND% with exit code !STEP_ERR!.
+    exit /b !STEP_ERR!
+)
+
+if exist "%BIN_DIR%\test_psd_writer.exe" (
+    echo       Running PSD writer unit tests: test_psd_writer.exe ...
+    "%BIN_DIR%\test_psd_writer.exe"
+    if errorlevel 1 (
+        echo [ERROR] test_psd_writer.exe failed! Aborting release packaging.
+        exit /b 1
+    )
+)
+
+if not exist "%BIN_DIR%\Vellum.exe" (
+    echo [ERROR] Missing "%BIN_DIR%\Vellum.exe"
+    exit /b 1
+)
+if not exist "%BIN_DIR%\Vellum-Launcher.exe" (
+    echo [ERROR] Missing "%BIN_DIR%\Vellum-Launcher.exe"
+    exit /b 1
+)
+if not exist "%BIN_DIR%\onnxruntime.dll" (
+    echo [ERROR] Missing "%BIN_DIR%\onnxruntime.dll"
+    exit /b 1
+)
 exit /b 0

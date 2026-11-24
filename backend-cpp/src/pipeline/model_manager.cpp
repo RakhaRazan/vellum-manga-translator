@@ -747,6 +747,9 @@ OrtSessionHandle ModelManager::create_ort_session(const fs::path& model_path, bo
             handle.session = std::make_unique<Ort::Session>(env, model_path.c_str(), opts);
             handle.active_provider = provider;
             return handle;
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr, "[Vellum][ORT] Provider %s failed: %s\n", provider.c_str(), ex.what());
+            // Fall through to next provider (ultimately CPUExecutionProvider)
         } catch (...) {
             // Fall through to next provider (ultimately CPUExecutionProvider)
         }
@@ -1058,7 +1061,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
 
         detection_models.push_back({
             {"id", "koharu-layout-rfdetr-seg-2xl"},
-            {"name", "Koharu Layout RF-DETR Seg 2XL (High-Context • Heavy CPU/CUDA)"},
+            {"name", "RF-DETR Seg 2XL (High-Context)"},
             {"description", "High-precision 1152px manga layout & text segmentation (text, SFX, bubble, panel)"},
             {"installed", installed},
             {"source", source},
@@ -1110,12 +1113,12 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
     for (const auto& [id, name, desc, filename] : {
              std::tuple<const char*, const char*, const char*, const char*>{
                  "vellum-det-yolo11m-seg-1024-fp16",
-                 "Vellum YOLO11m-Seg (9-Class Fast GPU)",
+                 "YOLO11m-Seg · High-Speed GPU",
                  "9-class 1024px layout, bubble, panel & SFX segmentation (GPU FP16)",
                  "vellum-det-yolo11m-seg-1024-fp16.onnx"},
              std::tuple<const char*, const char*, const char*, const char*>{
                  "vellum-det-yolo11m-seg-1024-int8",
-                 "Vellum YOLO11m-Seg (INT8 CPU)",
+                 "YOLO11m-Seg · Lightweight CPU",
                  "9-class 1024px layout, bubble, panel & SFX segmentation (CPU INT8)",
                  "vellum-det-yolo11m-seg-1024-int8.onnx"}}) {
         bool installed = false;
@@ -1477,7 +1480,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
 
         inpainting_models.push_back({
             {"id", "lama-manga"},
-            {"name", "LaMa (GPU • Screentone)"},
+            {"name", "LaMa · Manga & Screentone"},
             {"description", "Manga-tuned Big-LaMa ONNX inpainter optimized for screentones & line art"},
             {"installed", installed},
             {"source", source},
@@ -1619,7 +1622,7 @@ json ModelManager::get_pipeline_models_json(const json& active_settings) const {
 
         inpainting_models.push_back({
             {"id", "lama-fp32"},
-            {"name", "LaMa Standard (GPU • FP32)"},
+            {"name", "LaMa · High-Precision Universal"},
             {"description", "General-purpose Big-LaMa FP32 ONNX inpainter (512×512 tiles)"},
             {"installed", installed},
             {"source", source},

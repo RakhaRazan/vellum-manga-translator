@@ -2,6 +2,8 @@
 Vellum.exe
 Vellum_Runtime/
 models/
+KOHARU_CLEANROOM_SPEC.md
+*.WebView2/
 fonts/*
 !fonts/.gitkeep
 fonts/*.ttf
@@ -21,6 +23,8 @@ settings.json
 
 # C++17 CMake / MSVC build artifacts
 backend-cpp/build/
+backend-cpp/build*/
+backend-cpp/build_deps/
 backend-cpp/out/
 backend-cpp/CMakeUserPresets.json
 *.pdb
@@ -60,6 +64,7 @@ tools/detector_trainer/.venv/
 .env
 .env.*.local
 *.log
+*.bak
 npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*

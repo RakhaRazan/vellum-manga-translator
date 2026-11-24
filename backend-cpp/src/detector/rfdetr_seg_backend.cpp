@@ -103,6 +103,8 @@ PageDetectionResult RfDetrSegBackend::detectPage(
     opts.force_cpu = config.force_cpu;
     opts.auto_unload = !config.keep_session_alive;
     opts.allow_model_fallback = !is_ctd;
+    opts.enable_cv_style_detect = config.enable_cv_style_detect;
+    opts.enable_waist_cut = config.enable_waist_cut;
     opts.nms_threshold = config.nms_iou_threshold;
     opts.conf_threshold = config.class_thresholds[static_cast<size_t>(ClassId::SpeechBubble)];
     opts.text_threshold = config.class_thresholds[static_cast<size_t>(ClassId::SpeechBubble)];
@@ -228,6 +230,16 @@ PageDetectionResult RfDetrSegBackend::detectPage(
                 static_cast<float>(pt[0]),
                 static_cast<float>(pt[1])
             });
+        }
+        det.room_polygon.reserve(b.room_polygon.size());
+        for (const auto& pt : b.room_polygon) {
+            det.room_polygon.push_back(Point2f{pt[0], pt[1]});
+        }
+        det.angle_deg = b.angle_deg;
+        det.estimated_font_size = b.estimated_font_size;
+        det.text_color = b.text_color;
+        if (b.outline.has_value()) {
+            det.outline = BubbleOutlineInfo{b.outline->color, b.outline->width};
         }
 
         result.detections.push_back(std::move(det));

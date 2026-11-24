@@ -3,6 +3,7 @@
 #include "ocr.hpp"
 #include "detector.hpp"
 #include "translator.hpp"
+#include "../detector/cv_refinement.hpp"
 #include "../utils.hpp"
 
 #ifdef _MSC_VER
@@ -338,6 +339,268 @@ ParsedLocalEndpoint parse_local_http_endpoint(const std::string& raw_url) {
     return out;
 }
 
+// -----------------------------------------------------------------------------
+// Neighbor-Mask Blanking Helpers (prevents adjacent dialogue from leaking into OCR)
+// -----------------------------------------------------------------------------
+
+struct BlockGlyphMask {
+    std::array<int, 4> rect{0, 0, 0, 0};  // [x1, y1, x2, y2] in page coords
+    std::vector<uint8_t> mask;            // (x2-x1)*(y2-y1), 0 or 255
+};
+
+std::vector<BlockGlyphMask> build_block_glyph_masks(
+    const uint8_t* rgb_data,
+    int img_w,
+    int img_h,
+    const std::vector<OcrBubbleInput>& bubbles,
+    const OcrOptions& options) {
+    std::vector<BlockGlyphMask> masks(bubbles.size());
+    const bool has_page_mask =
+        (options.page_glyph_mask != nullptr &&
+         options.page_glyph_mask_w == img_w &&
+         options.page_glyph_mask_h == img_h &&
+         options.page_glyph_mask->size() >= static_cast<size_t>(img_w) * static_cast<size_t>(img_h));
+
+    static constexpr int kDx8[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+    static constexpr int kDy8[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
+
+    for (size_t i = 0; i < bubbles.size(); ++i) {
+        const auto& b = bubbles[i];
+
+        // Priority 1: Explicit per-block glyph mask
+        const int gw = b.glyph_mask_rect[2] - b.glyph_mask_rect[0];
+        const int gh = b.glyph_mask_rect[3] - b.glyph_mask_rect[1];
+        if (gw > 0 && gh > 0 && b.glyph_mask.size() >= static_cast<size_t>(gw) * static_cast<size_t>(gh)) {
+            masks[i].rect = b.glyph_mask_rect;
+            masks[i].mask = b.glyph_mask;
+            continue;
+        }
+
+        const int x1 = clampi(b.bbox[0], 0, img_w);
+        const int y1 = clampi(b.bbox[1], 0, img_h);
+        const int x2 = clampi(b.bbox[2], 0, img_w);
+        const int y2 = clampi(b.bbox[3], 0, img_h);
+        const int bw = x2 - x1;
+        const int bh = y2 - y1;
+        if (bw <= 0 || bh <= 0) continue;
+
+        masks[i].rect = {x1, y1, x2, y2};
+        const size_t total = static_cast<size_t>(bw) * static_cast<size_t>(bh);
+        masks[i].mask.assign(total, 0);
+
+        // Priority 2: Slice from full-page text-stroke mask if provided
+        if (has_page_mask) {
+            bool any_px = false;
+            for (int y = 0; y < bh; ++y) {
+                const uint8_t* prow = options.page_glyph_mask->data() +
+                                      static_cast<size_t>(y1 + y) * static_cast<size_t>(img_w) +
+                                      static_cast<size_t>(x1);
+                uint8_t* drow = masks[i].mask.data() + static_cast<size_t>(y) * static_cast<size_t>(bw);
+                for (int x = 0; x < bw; ++x) {
+                    if (prow[x] > 0) {
+                        drow[x] = 255;
+                        any_px = true;
+                    }
+                }
+            }
+            if (any_px) continue;
+        }
+
+        // Priority 3: Synthesize tight Otsu glyph mask inside bbox (excluding border-touching bubble wall ink)
+        std::vector<uint8_t> gray(total, 255);
+        std::array<int, 256> hist{};
+        for (int y = 0; y < bh; ++y) {
+            const uint8_t* srow = rgb_data +
+                                  (static_cast<size_t>(y1 + y) * static_cast<size_t>(img_w) +
+                                   static_cast<size_t>(x1)) * 3ULL;
+            uint8_t* grow = gray.data() + static_cast<size_t>(y) * static_cast<size_t>(bw);
+            for (int x = 0; x < bw; ++x) {
+                const uint8_t* px = srow + static_cast<size_t>(x) * 3ULL;
+                const uint8_t luma = rgb_to_luma(px[0], px[1], px[2]);
+                grow[x] = luma;
+                ++hist[luma];
+            }
+        }
+
+        int acc = 0;
+        const int half = static_cast<int>(total) / 2;
+        uint8_t median_luma = 255;
+        for (int v = 0; v < 256; ++v) {
+            acc += hist[static_cast<size_t>(v)];
+            if (acc >= half) {
+                median_luma = static_cast<uint8_t>(v);
+                break;
+            }
+        }
+        const uint8_t thresh = vellum::detector::computeOtsuThreshold1Tile(gray.data(), bw, bh, 0.1);
+        const bool dark_text = (median_luma >= 128);
+
+        std::vector<uint8_t> raw_ink(total, 0);
+        for (size_t k = 0; k < total; ++k) {
+            const bool is_fg = dark_text ? (gray[k] <= thresh && gray[k] < 220)
+                                         : (gray[k] >= thresh && gray[k] > 35);
+            if (is_fg) raw_ink[k] = 1;
+        }
+
+        // Exclude ink connected to the bbox perimeter (bubble walls), keeping interior text glyphs
+        std::vector<uint8_t> border_ink(total, 0);
+        std::queue<int> q;
+        auto push_b = [&](int lx, int ly) {
+            const size_t idx = static_cast<size_t>(ly) * static_cast<size_t>(bw) + static_cast<size_t>(lx);
+            if (raw_ink[idx] && !border_ink[idx]) {
+                border_ink[idx] = 1;
+                q.push(static_cast<int>(idx));
+            }
+        };
+        for (int lx = 0; lx < bw; ++lx) {
+            push_b(lx, 0);
+            push_b(lx, bh - 1);
+        }
+        for (int ly = 0; ly < bh; ++ly) {
+            push_b(0, ly);
+            push_b(bw - 1, ly);
+        }
+        while (!q.empty()) {
+            const int cur = q.front();
+            q.pop();
+            const int cx = cur % bw;
+            const int cy = cur / bw;
+            for (int d = 0; d < 8; ++d) {
+                const int nx = cx + kDx8[d];
+                const int ny = cy + kDy8[d];
+                if (nx >= 0 && nx < bw && ny >= 0 && ny < bh) {
+                    push_b(nx, ny);
+                }
+            }
+        }
+
+        // Dilate interior glyph mask by 1px to cover anti-aliased fringes
+        for (int ly = 0; ly < bh; ++ly) {
+            for (int lx = 0; lx < bw; ++lx) {
+                const size_t idx = static_cast<size_t>(ly) * static_cast<size_t>(bw) + static_cast<size_t>(lx);
+                if (!raw_ink[idx] || border_ink[idx]) continue;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    const int ny = ly + dy;
+                    if (ny < 0 || ny >= bh) continue;
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int nx = lx + dx;
+                        if (nx < 0 || nx >= bw) continue;
+                        masks[i].mask[static_cast<size_t>(ny) * static_cast<size_t>(bw) + static_cast<size_t>(nx)] = 255;
+                    }
+                }
+            }
+        }
+    }
+
+    return masks;
+}
+
+bool blank_neighbor_masks_in_crop(
+    std::vector<uint8_t>& crop_rgb,
+    int crop_w,
+    int crop_h,
+    const std::array<int, 4>& crop_rect,
+    size_t self_idx,
+    const std::vector<BlockGlyphMask>& all_masks) {
+    if (crop_w <= 0 || crop_h <= 0 || all_masks.size() <= 1) return false;
+    const int cx1 = crop_rect[0];
+    const int cy1 = crop_rect[1];
+    const int cx2 = crop_rect[2];
+    const int cy2 = crop_rect[3];
+    if (cx2 - cx1 != crop_w || cy2 - cy1 != crop_h) return false;
+
+    const size_t total = static_cast<size_t>(crop_w) * static_cast<size_t>(crop_h);
+    std::vector<uint8_t> own_mask(total, 0);
+    std::vector<uint8_t> other_mask(total, 0);
+
+    // Paint self glyph mask into `own_mask`
+    if (self_idx < all_masks.size() && !all_masks[self_idx].mask.empty()) {
+        const auto& sm = all_masks[self_idx];
+        const int mw = sm.rect[2] - sm.rect[0];
+        const int ix1 = std::max(cx1, sm.rect[0]);
+        const int iy1 = std::max(cy1, sm.rect[1]);
+        const int ix2 = std::min(cx2, sm.rect[2]);
+        const int iy2 = std::min(cy2, sm.rect[3]);
+        for (int gy = iy1; gy < iy2; ++gy) {
+            const uint8_t* srow = sm.mask.data() + static_cast<size_t>(gy - sm.rect[1]) * static_cast<size_t>(mw);
+            uint8_t* drow = own_mask.data() + static_cast<size_t>(gy - cy1) * static_cast<size_t>(crop_w);
+            for (int gx = ix1; gx < ix2; ++gx) {
+                if (srow[gx - sm.rect[0]] > 0) {
+                    drow[gx - cx1] = 255;
+                }
+            }
+        }
+    }
+
+    // Union all OTHER blocks' glyph masks overlapping this crop (excluding own_mask)
+    bool has_other = false;
+    for (size_t j = 0; j < all_masks.size(); ++j) {
+        if (j == self_idx || all_masks[j].mask.empty()) continue;
+        const auto& om = all_masks[j];
+        const int ix1 = std::max(cx1, om.rect[0]);
+        const int iy1 = std::max(cy1, om.rect[1]);
+        const int ix2 = std::min(cx2, om.rect[2]);
+        const int iy2 = std::min(cy2, om.rect[3]);
+        if (ix2 <= ix1 || iy2 <= iy1) continue;
+
+        const int mw = om.rect[2] - om.rect[0];
+        for (int gy = iy1; gy < iy2; ++gy) {
+            const uint8_t* srow = om.mask.data() + static_cast<size_t>(gy - om.rect[1]) * static_cast<size_t>(mw);
+            const uint8_t* orow = own_mask.data() + static_cast<size_t>(gy - cy1) * static_cast<size_t>(crop_w);
+            uint8_t* drow = other_mask.data() + static_cast<size_t>(gy - cy1) * static_cast<size_t>(crop_w);
+            for (int gx = ix1; gx < ix2; ++gx) {
+                const int lx = gx - cx1;
+                if (srow[gx - om.rect[0]] > 0 && orow[lx] == 0) {
+                    drow[lx] = 255;
+                    has_other = true;
+                }
+            }
+        }
+    }
+
+    if (!has_other) return false;
+
+    // Compute median RGB of unmasked background pixels inside this crop
+    std::array<int, 256> r_hist{};
+    std::array<int, 256> g_hist{};
+    std::array<int, 256> b_hist{};
+    size_t bg_count = 0;
+    for (size_t i = 0; i < total; ++i) {
+        if (own_mask[i] == 0 && other_mask[i] == 0) {
+            const uint8_t* px = crop_rgb.data() + i * 3ULL;
+            ++r_hist[px[0]];
+            ++g_hist[px[1]];
+            ++b_hist[px[2]];
+            ++bg_count;
+        }
+    }
+
+    auto hist_median = [bg_count](const std::array<int, 256>& h) -> uint8_t {
+        if (bg_count == 0) return 255;
+        size_t acc = 0;
+        const size_t target = bg_count / 2;
+        for (int v = 0; v < 256; ++v) {
+            acc += static_cast<size_t>(h[static_cast<size_t>(v)]);
+            if (acc > target) return static_cast<uint8_t>(v);
+        }
+        return 255;
+    };
+
+    const uint8_t med_r = hist_median(r_hist);
+    const uint8_t med_g = hist_median(g_hist);
+    const uint8_t med_b = hist_median(b_hist);
+
+    for (size_t i = 0; i < total; ++i) {
+        if (other_mask[i] > 0) {
+            uint8_t* px = crop_rgb.data() + i * 3ULL;
+            px[0] = med_r;
+            px[1] = med_g;
+            px[2] = med_b;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 // -----------------------------------------------------------------------------
@@ -642,7 +905,8 @@ OcrEngine::RgbImage OcrEngine::crop_bbox_clean(
     int img_w,
     int img_h,
     const std::array<int, 4>& bbox,
-    bool erase_border_ink) {
+    bool erase_border_ink,
+    std::array<int, 4>* out_crop_rect) {
     int x1 = clampi(bbox[0], 0, img_w);
     int y1 = clampi(bbox[1], 0, img_h);
     int x2 = clampi(bbox[2], 0, img_w);
@@ -650,6 +914,7 @@ OcrEngine::RgbImage OcrEngine::crop_bbox_clean(
 
     RgbImage crop;
     if (x2 <= x1 || y2 <= y1) {
+        if (out_crop_rect) *out_crop_rect = {x1, y1, x1, y1};
         crop.width = 32;
         crop.height = 32;
         crop.data.assign(32ULL * 32ULL * 3ULL, 255);
@@ -770,6 +1035,10 @@ OcrEngine::RgbImage OcrEngine::crop_bbox_clean(
                                static_cast<size_t>(x1)) * 3ULL;
         uint8_t* drow = crop.data.data() + static_cast<size_t>(y) * row_bytes;
         std::memcpy(drow, srow, row_bytes);
+    }
+
+    if (out_crop_rect) {
+        *out_crop_rect = {x1, y1, x2, y2};
     }
 
     if (erase_border_ink) {
@@ -2071,11 +2340,23 @@ OcrStageResult OcrEngine::recognize_rgb(
         }
     }
 
-    for (const auto& b : bubbles) {
+    // Precompute per-block glyph masks so overlapping neighbor dialogue is blanked
+    // with the crop's median unmasked background RGB before ONNX OCR inference.
+    const std::vector<BlockGlyphMask> block_glyph_masks =
+        build_block_glyph_masks(rgb_data, width, height, bubbles, options);
+
+    for (size_t idx = 0; idx < bubbles.size(); ++idx) {
+        const auto& b = bubbles[idx];
         // MangaOCR, Baberu, Hayai & PaddleOCR-VL were trained on raw manga crops;
         // running erase_border_touching_ink on tight crops is reserved for RapidOCR PP-OCRv4.
         const bool clean_border = (effective_model == "rapidocr-ppocrv4");
-        const RgbImage clean_crop = crop_bbox_clean(rgb_data, width, height, b.bbox, clean_border);
+        std::array<int, 4> crop_rect{0, 0, 0, 0};
+        RgbImage clean_crop = crop_bbox_clean(rgb_data, width, height, b.bbox, clean_border, &crop_rect);
+        if (blank_neighbor_masks_in_crop(
+                clean_crop.data, clean_crop.width, clean_crop.height,
+                crop_rect, idx, block_glyph_masks)) {
+            ++result.neighbor_blanked_blocks;
+        }
         std::string text;
         if (effective_model == "manga-ocr") {
             text = recognize_ja_crop(clean_crop, b.text_direction);

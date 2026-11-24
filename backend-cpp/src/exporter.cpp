@@ -595,7 +595,7 @@ std::string sanitize_export_filename(
     }
 
     const std::string lower = util::to_lower_ascii(raw);
-    for (const char* suffix : {".cbz", ".pdf", ".zip"}) {
+    for (const char* suffix : {".cbz", ".pdf", ".zip", ".psd"}) {
         const size_t slen = std::strlen(suffix);
         if (lower.size() >= slen && lower.compare(lower.size() - slen, slen, suffix) == 0) {
             raw.resize(raw.size() - slen);
@@ -1602,6 +1602,52 @@ void build_pdf_to_file(
     if (!ofs.good()) {
         throw ComicExportError("Failed to flush PDF file to disk.");
     }
+}
+
+std::vector<uint8_t> build_zip_from_named_buffers(
+    const std::vector<std::pair<std::string, std::vector<uint8_t>>>& entries) {
+    if (entries.empty()) {
+        throw ComicExportError("At least one file entry is required to build a .zip archive.");
+    }
+    mz_zip_archive zip{};
+    if (!mz_zip_writer_init_heap(&zip, 0, 1024ULL * 1024ULL)) {
+        throw ComicExportError("Failed to initialize in-memory ZIP writer.");
+    }
+    bool finalized = false;
+    struct ZipWriterGuard {
+        mz_zip_archive* z;
+        bool* done;
+        ~ZipWriterGuard() {
+            if (!*done) {
+                mz_zip_writer_end(z);
+            }
+        }
+    } guard{&zip, &finalized};
+
+    for (const auto& [name, bytes] : entries) {
+        if (!mz_zip_writer_add_mem(
+                &zip,
+                name.c_str(),
+                bytes.data(),
+                bytes.size(),
+                MZ_BEST_SPEED)) {
+            throw ComicExportError("Failed to add '" + name + "' to ZIP archive.");
+        }
+    }
+
+    void* out_buf = nullptr;
+    size_t out_size = 0;
+    if (!mz_zip_writer_finalize_heap_archive(&zip, &out_buf, &out_size) || !out_buf) {
+        throw ComicExportError("Failed to finalize ZIP archive.");
+    }
+    mz_zip_writer_end(&zip);
+    finalized = true;
+
+    std::vector<uint8_t> result(
+        static_cast<const uint8_t*>(out_buf),
+        static_cast<const uint8_t*>(out_buf) + out_size);
+    mz_free(out_buf);
+    return result;
 }
 
 }  // namespace mangaflow

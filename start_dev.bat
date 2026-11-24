@@ -41,7 +41,7 @@ echo ===========================================================================
 echo   Workspace   : %ROOT_DIR%
 echo   C++ Backend : http://127.0.0.1:8000 (--headless)
 echo   React Vite  : http://127.0.0.1:5173
-echo   LM Studio   : http://localhost:1235/v1
+echo   LM Studio   : http://localhost:1234/v1
 echo ============================================================================
 echo.
 

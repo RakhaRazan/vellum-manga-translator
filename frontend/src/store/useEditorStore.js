@@ -25,6 +25,7 @@ export const DEFAULT_TYPESETTING_CONFIG = {
   fontFamily: DEFAULT_FONT_FAMILY,
   fontFallbackChain: [...DEFAULT_FONT_FALLBACK_CHAIN],
   autoFitFontSize: true,
+  enableHyphenation: true,
   defaultFontSize: 18,
   defaultStrokeWidth: 4,
   defaultStrokeColor: '#ffffff',
@@ -32,9 +33,27 @@ export const DEFAULT_TYPESETTING_CONFIG = {
   defaultLineHeight: 1.18,
   defaultAlign: 'center',
   allCaps: false,
+  autoTiltText: false,
 };
 
 export const DEFAULT_PROVIDER_PRESETS = [
+  {
+    id: 'none',
+    name: 'None (Manual / No-LLM)',
+    default_base_url: '',
+    default_model: '',
+    default_api_key: '',
+    requires_api_key: false,
+    requires_base_url: false,
+    is_local: true,
+    protocol: 'none',
+    supports_json_schema: false,
+    supports_vision: false,
+    supports_top_k: false,
+    supports_frequency_penalty: false,
+    supports_reasoning_effort: false,
+    fallback_models: [],
+  },
   {
     id: 'lmstudio',
     name: 'LM Studio (Local)',
@@ -601,22 +620,22 @@ export const DEFAULT_TARGET_LANGUAGES = [
 export const DEFAULT_DETECTION_MODELS = [
   {
     id: 'vellum-det-yolo11m-seg-1024-fp16',
-    label: 'Vellum YOLO11m-Seg (9-Class Fast GPU)',
-    name: 'Vellum YOLO11m-Seg (9-Class Fast GPU)',
+    label: 'YOLO11m-Seg · High-Speed GPU',
+    name: 'YOLO11m-Seg · High-Speed GPU',
     description:
       'Primary 9-class 1024px layout & bubble segmentation (CUDA / DirectML FP16)',
   },
   {
     id: 'vellum-det-yolo11m-seg-1024-int8',
-    label: 'Vellum YOLO11m-Seg (INT8 CPU)',
-    name: 'Vellum YOLO11m-Seg (INT8 CPU)',
+    label: 'YOLO11m-Seg · Lightweight CPU',
+    name: 'YOLO11m-Seg · Lightweight CPU',
     description:
       'Static QDQ INT8 9-class 1024px detector optimized for CPU-only desktops',
   },
   {
     id: 'koharu-layout-rfdetr-seg-2xl',
-    label: 'Koharu Layout RF-DETR Seg 2XL (High-Context • Heavy CPU/CUDA)',
-    name: 'Koharu Layout RF-DETR Seg 2XL (High-Context • Heavy CPU/CUDA)',
+    label: 'RF-DETR Seg 2XL (High-Context)',
+    name: 'RF-DETR Seg 2XL (High-Context)',
     description:
       'High-precision 1152px manga layout & text segmentation (text, SFX, bubble, panel)',
   },
@@ -683,8 +702,8 @@ export const DEFAULT_OCR_MODELS = [
 export const DEFAULT_INPAINTING_MODELS = [
   {
     id: 'lama-manga',
-    label: 'LaMa (GPU • Screentone)',
-    name: 'LaMa (GPU • Screentone)',
+    label: 'LaMa · Manga & Screentone',
+    name: 'LaMa · Manga & Screentone',
     hardwareTag: 'GPU • Screentone',
     description:
       'Manga-tuned Big-LaMa ONNX inpainter optimized for screentones & line art',
@@ -715,8 +734,8 @@ export const DEFAULT_INPAINTING_MODELS = [
   },
   {
     id: 'lama-fp32',
-    label: 'LaMa Standard (GPU • FP32)',
-    name: 'LaMa Standard (GPU • FP32)',
+    label: 'LaMa · High-Precision Universal',
+    name: 'LaMa · High-Precision Universal',
     hardwareTag: 'GPU • FP32',
     description: 'General-purpose Big-LaMa FP32 ONNX inpainter (512×512 tiles)',
   },
@@ -742,7 +761,7 @@ export function normalizeOptionalThreshold(value) {
 
 export const DEFAULT_PIPELINE_CONFIG = {
   apiBaseUrl: DEFAULT_API_BASE_URL,
-  provider: 'custom',
+  provider: 'none',
   baseUrl: '',
   apiKey: '',
   model: '',
@@ -776,6 +795,7 @@ export const DEFAULT_PIPELINE_CONFIG = {
   inpaintingModel: 'lama-manga',
   inpaintApiUrl: 'http://127.0.0.1:8188',
   executionMode: 'hybrid', // 'hybrid' | 'force_gpu' | 'cpu_only'
+  preferredBackend: 'auto', // 'auto' | 'cuda' | 'directml' | 'cpu'
   confThreshold: 0.35,
   nmsThreshold: 0.45,
   maskThreshold: 0.5,
@@ -785,6 +805,10 @@ export const DEFAULT_PIPELINE_CONFIG = {
   autoUnloadVram: true,
   refineMask: true,
   autoProcessOnImport: false,
+  enable3TierInpaint: true,
+  enableToneMatch: true,
+  enableCvStyleDetect: true,
+  enableWaistCut: true,
 };
 
 function computeBoxIntersectionArea(a, b) {
@@ -838,6 +862,21 @@ function findContainingRegion(textBox, regions = [], minOverlap = 0.35) {
     }
   }
   return bestIdx;
+}
+
+export function rgbColorToHex(value) {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (Array.isArray(value) && value.length >= 3) {
+    const r = Math.max(0, Math.min(255, Math.round(Number(value[0]) || 0)));
+    const g = Math.max(0, Math.min(255, Math.round(Number(value[1]) || 0)));
+    const b = Math.max(0, Math.min(255, Math.round(Number(value[2]) || 0)));
+    return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+  }
+  return null;
 }
 
 /**
@@ -976,20 +1015,51 @@ export function normalizeBlocks(rawBlocks = [], options = null) {
       defaultX = Math.max(px1, Math.min(x1, px2 - defaultWidth));
     }
 
+    const detectedTextColor = rgbColorToHex(b.text_color);
+    const detectedOutlineObj =
+      b.outline && typeof b.outline === 'object' ? b.outline : null;
+    const detectedOutlineColor = detectedOutlineObj
+      ? rgbColorToHex(detectedOutlineObj.color)
+      : null;
+    const detectedOutlineWidth =
+      detectedOutlineObj && Number.isFinite(Number(detectedOutlineObj.width))
+        ? Math.max(0, Number(detectedOutlineObj.width))
+        : null;
+    const detectedAngleDeg =
+      typeof b.angle_deg === 'number' && Number.isFinite(b.angle_deg)
+        ? Number(b.angle_deg.toFixed(2))
+        : null;
+
     const fontSize = b.font_size || b.style?.font_size || 18;
-    const color = b.color || b.style?.color || '#000000';
+    const color = b._userEditedColor
+      ? b.color || b.style?.color || '#000000'
+      : detectedTextColor || b.color || b.style?.color || '#000000';
     const align = b.align || b.style?.align || 'center';
     const fontFamily =
       b.font_family || b.style?.font_family || DEFAULT_FONT_FAMILY;
-    const strokeColor =
-      b.stroke_color || b.style?.stroke_color || '#ffffff';
-    const strokeWidth =
-      b.stroke_width !== undefined
+    const strokeColor = b._userEditedOutline
+      ? b.stroke_color || b.style?.stroke_color || '#ffffff'
+      : detectedOutlineColor || b.stroke_color || b.style?.stroke_color || '#ffffff';
+    const strokeWidth = b._userEditedOutline
+      ? b.stroke_width !== undefined
         ? b.stroke_width
         : b.style?.stroke_width !== undefined
         ? b.style.stroke_width
-        : 4;
+        : 4
+      : detectedOutlineWidth !== null
+      ? detectedOutlineWidth
+      : b.stroke_width !== undefined
+      ? b.stroke_width
+      : b.style?.stroke_width !== undefined
+      ? b.style.stroke_width
+      : 4;
     const lineHeight = b.line_height || b.style?.line_height || 1.18;
+    const resolvedRotation =
+      typeof b.rotation === 'number'
+        ? b.rotation
+        : detectedAngleDeg !== null
+        ? detectedAngleDeg
+        : 0;
 
     return {
       ...b,
@@ -1002,11 +1072,24 @@ export function normalizeBlocks(rawBlocks = [], options = null) {
       polygon: Array.isArray(b.polygon)
         ? b.polygon.map((pt) => (Array.isArray(pt) ? [...pt] : pt))
         : undefined,
+      room_polygon: Array.isArray(b.room_polygon) && b.room_polygon.length >= 3
+        ? b.room_polygon.map((pt) => (Array.isArray(pt) ? [Number(pt[0]) || 0, Number(pt[1]) || 0] : pt))
+        : undefined,
+      text_color: Array.isArray(b.text_color) ? [...b.text_color] : b.text_color,
+      outline: detectedOutlineObj
+        ? {
+            color: Array.isArray(detectedOutlineObj.color)
+              ? [...detectedOutlineObj.color]
+              : detectedOutlineObj.color,
+            width: detectedOutlineWidth ?? 0,
+          }
+        : b.outline,
+      angle_deg: detectedAngleDeg !== null ? detectedAngleDeg : b.angle_deg,
       x: typeof b.x === 'number' ? b.x : defaultX,
       y: typeof b.y === 'number' ? b.y : defaultY,
       width: typeof b.width === 'number' ? b.width : defaultWidth,
       height: typeof b.height === 'number' ? b.height : defaultHeight,
-      rotation: typeof b.rotation === 'number' ? b.rotation : 0,
+      rotation: resolvedRotation,
       original_text: b.original_text ?? b.source_text ?? '',
       source_text: b.source_text ?? b.original_text ?? '',
       translated_text: b.translated_text ?? '',
@@ -1084,6 +1167,18 @@ function cloneBlock(block) {
     polygon: Array.isArray(block.polygon)
       ? block.polygon.map((pt) => (Array.isArray(pt) ? [...pt] : pt))
       : block.polygon,
+    room_polygon: Array.isArray(block.room_polygon)
+      ? block.room_polygon.map((pt) => (Array.isArray(pt) ? [...pt] : pt))
+      : block.room_polygon,
+    outline:
+      block.outline && typeof block.outline === 'object'
+        ? {
+            ...block.outline,
+            color: Array.isArray(block.outline.color)
+              ? [...block.outline.color]
+              : block.outline.color,
+          }
+        : block.outline,
     style: block.style ? { ...block.style } : undefined,
   };
 }
@@ -1178,9 +1273,19 @@ function mergeBlockUpdates(block, updates) {
     block.style?.line_height ??
     1.18;
 
+  const didEditColor =
+    updates.color !== undefined || updates.style?.color !== undefined;
+  const didEditOutline =
+    updates.stroke_color !== undefined ||
+    updates.stroke_width !== undefined ||
+    updates.style?.stroke_color !== undefined ||
+    updates.style?.stroke_width !== undefined;
+
   return {
     ...block,
     ...updates,
+    ...(didEditColor ? { _userEditedColor: true } : {}),
+    ...(didEditOutline ? { _userEditedOutline: true } : {}),
     font_family: nextFontFamily,
     font_size: nextFontSize,
     color: nextColor,
@@ -1472,6 +1577,7 @@ export const useEditorStore = create((set, get) => ({
       error: null,
     },
     activeProviderSummary: null,
+    hardware: null,
   },
 
   // ── Canvas Viewport Telemetry (for 24px StatusBar) ─────────────────────────
@@ -2426,11 +2532,23 @@ export const useEditorStore = create((set, get) => ({
 
   _writeLocalSnapshot: () => {
     const s = get();
+    const { apiKey: _redactedKey, providerProfiles: rawProfiles, ...restPipelineConfig } = s.pipelineConfig || {};
+    const safeProviderProfiles = rawProfiles && typeof rawProfiles === 'object'
+      ? Object.fromEntries(
+          Object.entries(rawProfiles).map(([pid, prof]) => [
+            pid,
+            prof && typeof prof === 'object' ? { ...prof, api_key: '' } : prof,
+          ])
+        )
+      : undefined;
     writeStoredSettingsSnapshot({
       theme: s.theme,
       accentColor: s.accentColor,
       uiDensity: s.uiDensity,
-      pipelineConfig: s.pipelineConfig,
+      pipelineConfig: {
+        ...restPipelineConfig,
+        ...(safeProviderProfiles ? { providerProfiles: safeProviderProfiles } : {}),
+      },
       typesetting: s.typesetting,
     });
   },
@@ -2606,9 +2724,57 @@ export const useEditorStore = create((set, get) => ({
     }));
   },
 
+  setActiveProvider: (providerId, { syncBackend = true } = {}) => {
+    const nextPid = String(providerId || 'none').trim() || 'none';
+    set((state) => {
+      const prevPid = state.pipelineConfig.provider || 'none';
+      const profiles = { ...(state.pipelineConfig.providerProfiles || {}) };
+      if (prevPid !== 'none') {
+        profiles[prevPid] = {
+          base_url: state.pipelineConfig.baseUrl ?? profiles[prevPid]?.base_url ?? '',
+          api_key: state.pipelineConfig.apiKey ?? profiles[prevPid]?.api_key ?? '',
+          model: state.pipelineConfig.model ?? profiles[prevPid]?.model ?? '',
+        };
+      }
+      const preset = DEFAULT_PROVIDER_PRESETS.find((p) => p.id === nextPid);
+      const nextProfile = profiles[nextPid] || {
+        base_url: preset?.default_base_url || '',
+        api_key: preset?.default_api_key || '',
+        model: preset?.default_model || '',
+      };
+      if (nextPid !== 'none' && !profiles[nextPid]) {
+        profiles[nextPid] = nextProfile;
+      }
+      return {
+        pipelineConfig: {
+          ...state.pipelineConfig,
+          provider: nextPid,
+          baseUrl: nextPid === 'none' ? '' : nextProfile.base_url ?? preset?.default_base_url ?? '',
+          apiKey: nextPid === 'none' ? '' : nextProfile.api_key ?? '',
+          model: nextPid === 'none' ? '' : nextProfile.model ?? preset?.default_model ?? '',
+          providerProfiles: profiles,
+        },
+      };
+    });
+    get()._writeLocalSnapshot();
+    if (syncBackend) {
+      const s = get();
+      const apiBaseUrl = s.pipelineConfig.apiBaseUrl ?? DEFAULT_API_BASE_URL;
+      fetch(`${apiBaseUrl}/api/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          active_provider: nextPid,
+          provider: nextPid,
+          providers: s.pipelineConfig.providerProfiles,
+        }),
+      }).catch(() => {});
+    }
+  },
+
   setActiveModel: (model) => {
     set((state) => {
-      const pid = state.pipelineConfig.provider || 'lmstudio';
+      const pid = state.pipelineConfig.provider || 'none';
       const nextProfiles = {
         ...(state.pipelineConfig.providerProfiles || {}),
         [pid]: {
@@ -2724,6 +2890,10 @@ export const useEditorStore = create((set, get) => ({
           backendSettings.auto_fit_font_size !== undefined
             ? Boolean(backendSettings.auto_fit_font_size)
             : state.typesetting.autoFitFontSize,
+        enableHyphenation:
+          backendSettings.enable_hyphenation !== undefined
+            ? Boolean(backendSettings.enable_hyphenation)
+            : state.typesetting.enableHyphenation ?? true,
         defaultFontSize:
           backendSettings.default_font_size ??
           state.typesetting.defaultFontSize,
@@ -2747,11 +2917,18 @@ export const useEditorStore = create((set, get) => ({
           backendSettings.all_caps !== undefined
             ? Boolean(backendSettings.all_caps)
             : state.typesetting.allCaps,
+        autoTiltText:
+          backendSettings.auto_tilt_text !== undefined
+            ? Boolean(backendSettings.auto_tilt_text)
+            : state.typesetting.autoTiltText ?? false,
       };
 
       const nextPipeline = {
         ...state.pipelineConfig,
-        provider: backendSettings.provider ?? state.pipelineConfig.provider,
+        provider:
+          backendSettings.active_provider ??
+          backendSettings.provider ??
+          state.pipelineConfig.provider,
         baseUrl: backendSettings.base_url ?? state.pipelineConfig.baseUrl,
         apiKey: backendSettings.api_key ?? state.pipelineConfig.apiKey,
         model: backendSettings.model ?? state.pipelineConfig.model,
@@ -2839,6 +3016,10 @@ export const useEditorStore = create((set, get) => ({
           backendSettings.inpaint_api_url ?? state.pipelineConfig.inpaintApiUrl,
         executionMode:
           backendSettings.execution_mode ?? state.pipelineConfig.executionMode,
+        preferredBackend:
+          backendSettings.preferred_backend ??
+          state.pipelineConfig.preferredBackend ??
+          'auto',
         confThreshold:
           backendSettings.conf_threshold ?? state.pipelineConfig.confThreshold,
         nmsThreshold:
@@ -2859,6 +3040,22 @@ export const useEditorStore = create((set, get) => ({
           backendSettings.refine_mask !== undefined
             ? Boolean(backendSettings.refine_mask)
             : state.pipelineConfig.refineMask,
+        enable3TierInpaint:
+          backendSettings.enable_3tier_inpaint !== undefined
+            ? Boolean(backendSettings.enable_3tier_inpaint)
+            : state.pipelineConfig.enable3TierInpaint ?? true,
+        enableToneMatch:
+          backendSettings.enable_tone_match !== undefined
+            ? Boolean(backendSettings.enable_tone_match)
+            : state.pipelineConfig.enableToneMatch ?? true,
+        enableCvStyleDetect:
+          backendSettings.enable_cv_style_detect !== undefined
+            ? Boolean(backendSettings.enable_cv_style_detect)
+            : state.pipelineConfig.enableCvStyleDetect ?? true,
+        enableWaistCut:
+          backendSettings.enable_waist_cut !== undefined
+            ? Boolean(backendSettings.enable_waist_cut)
+            : state.pipelineConfig.enableWaistCut ?? true,
       };
 
       const nextPresets =
@@ -2896,7 +3093,8 @@ export const useEditorStore = create((set, get) => ({
     const p = s.pipelineConfig;
     const t = s.typesetting;
     return {
-      provider: p.provider,
+      active_provider: p.provider || 'none',
+      provider: p.provider || 'none',
       base_url: p.baseUrl,
       api_key: p.apiKey,
       model: p.model,
@@ -2934,6 +3132,7 @@ export const useEditorStore = create((set, get) => ({
       inpainting_model: p.inpaintingModel || 'lama-manga',
       inpaint_api_url: p.inpaintApiUrl || 'http://127.0.0.1:8188',
       execution_mode: p.executionMode || 'hybrid',
+      preferred_backend: p.preferredBackend || 'auto',
       conf_threshold: Number(p.confThreshold ?? 0.35),
       nms_threshold: Number(p.nmsThreshold ?? 0.45),
       mask_threshold: Number(p.maskThreshold ?? 0.5),
@@ -2942,9 +3141,14 @@ export const useEditorStore = create((set, get) => ({
       reading_order: p.readingOrder || 'auto',
       auto_unload_vram: Boolean(p.autoUnloadVram),
       refine_mask: Boolean(p.refineMask),
+      enable_3tier_inpaint: Boolean(p.enable3TierInpaint ?? true),
+      enable_tone_match: Boolean(p.enableToneMatch ?? true),
+      enable_cv_style_detect: Boolean(p.enableCvStyleDetect ?? true),
+      enable_waist_cut: Boolean(p.enableWaistCut ?? true),
       font_family: t.fontFamily || formatFontFamilyChain(t.fontFallbackChain),
       font_fallback_chain: [...(t.fontFallbackChain || DEFAULT_FONT_FALLBACK_CHAIN)],
       auto_fit_font_size: Boolean(t.autoFitFontSize),
+      enable_hyphenation: Boolean(t.enableHyphenation ?? true),
       default_font_size: Math.round(Number(t.defaultFontSize ?? 18)),
       default_stroke_width: Number(t.defaultStrokeWidth ?? 4),
       default_stroke_color: t.defaultStrokeColor || '#ffffff',
@@ -2952,6 +3156,7 @@ export const useEditorStore = create((set, get) => ({
       default_line_height: Number(t.defaultLineHeight ?? 1.18),
       default_align: t.defaultAlign || 'center',
       all_caps: Boolean(t.allCaps),
+      auto_tilt_text: Boolean(t.autoTiltText ?? false),
     };
   },
 
@@ -3058,6 +3263,24 @@ export const useEditorStore = create((set, get) => ({
           availableModels: data.available_models ?? [],
           error: data.error ?? null,
         },
+      },
+    }));
+  },
+
+  setHardwareInfo: (hwData) => {
+    if (!hwData || typeof hwData !== 'object') return;
+    set((state) => ({
+      runtimeStatus: {
+        ...state.runtimeStatus,
+        executionProvider:
+          hwData.execution_provider ?? state.runtimeStatus.executionProvider,
+        executionMode:
+          hwData.execution_mode ?? state.runtimeStatus.executionMode,
+        availableProviders:
+          Array.isArray(hwData.available_providers) && hwData.available_providers.length > 0
+            ? hwData.available_providers
+            : state.runtimeStatus.availableProviders,
+        hardware: hwData,
       },
     }));
   },

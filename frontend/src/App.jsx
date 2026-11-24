@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   AlertTriangle,
@@ -11,13 +11,15 @@ import {
   Trash2,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
-import DownloadModal from './components/DownloadModal.jsx';
-import SettingsModal from './components/SettingsModal.jsx';
+import QuickProviderSetupModal from './components/QuickProviderSetupModal.jsx';
 import MenuBar from './components/MenuBar.jsx';
 import FrontControlBar from './components/FrontControlBar.jsx';
 import MangaCanvas from './components/MangaCanvas.jsx';
 import TextSidebar from './components/TextSidebar.jsx';
 import StatusBar from './components/StatusBar.jsx';
+
+const DownloadModal = React.lazy(() => import('./components/DownloadModal.jsx'));
+const SettingsModal = React.lazy(() => import('./components/SettingsModal.jsx'));
 import useEditorStore, {
   bindSystemThemeListener,
   ensurePageFontsLoaded,
@@ -222,6 +224,7 @@ export default function App() {
   const [startupError, setStartupError] = useState(null);
   const [isWorkspaceUnlocked, setIsWorkspaceUnlocked] = useState(false);
   const [isDownloadModalOpen, setIsDownloadModalOpen] = useState(false);
+  const [quickProviderPrompt, setQuickProviderPrompt] = useState(null); // { onProceedTranslate, onProceedManual } | null
   const [isPipelineRunning, setIsPipelineRunning] = useState(false);
   const [pipelineProgress, setPipelineProgress] = useState(null);
   const [liveBackendStage, setLiveBackendStage] = useState(null);
@@ -247,6 +250,7 @@ export default function App() {
     selectedPageIds,
     selectedBlockId,
     zenMode,
+    uiDensity,
     activeModal,
     pipelineConfig,
     viewLayers,
@@ -279,6 +283,7 @@ export default function App() {
       selectedPageIds: s.selectedPageIds,
       selectedBlockId: s.selectedBlockId,
       zenMode: s.zenMode,
+      uiDensity: s.uiDensity || 'compact',
       activeModal: s.activeModal,
       pipelineConfig: s.pipelineConfig,
       viewLayers: s.viewLayers,
@@ -302,6 +307,7 @@ export default function App() {
       setModelsStatus: s.setModelsStatus,
       setLmStudioStatus: s.setLmStudioStatus,
       setHealthStatus: s.setHealthStatus,
+      setHardwareInfo: s.setHardwareInfo,
       openModal: s.openModal,
       closeModal: s.closeModal,
     }))
@@ -311,6 +317,11 @@ export default function App() {
 
   // Bind Dark / Light / System OS media query synchronization
   useEffect(() => bindSystemThemeListener(), []);
+
+  // Synchronize UI Density (`compact` vs `comfortable`) to root dataset attribute
+  useEffect(() => {
+    document.documentElement.dataset.density = uiDensity || 'compact';
+  }, [uiDensity]);
 
   // Poll live LM Studio telemetry into store
   const fetchLlmAndHealthStatus = useCallback(async () => {
@@ -337,10 +348,10 @@ export default function App() {
     }
   }, [apiBaseUrl, pipelineConfig.baseUrl, setLmStudioStatus]);
 
-  // Hydrate persistent backend settings, languages & health metadata (non-blocking)
+  // Hydrate persistent backend settings, languages, fonts & hardware capabilities (non-blocking)
   const hydrateBackendContext = useCallback(async () => {
     try {
-      const [settingsRes, healthRes, langsRes, fontsRes] = await Promise.allSettled([
+      const [settingsRes, healthRes, langsRes, fontsRes, hwRes] = await Promise.allSettled([
         fetch(`${apiBaseUrl}/api/settings`, {
           headers: { Accept: 'application/json' },
         }),
@@ -353,6 +364,9 @@ export default function App() {
         fetch(`${apiBaseUrl}/api/fonts/list`, {
           headers: { Accept: 'application/json' },
         }),
+        fetch(`${apiBaseUrl}/api/system/hardware`, {
+          headers: { Accept: 'application/json' },
+        }),
       ]);
 
       if (settingsRes.status === 'fulfilled' && settingsRes.value.ok) {
@@ -362,6 +376,10 @@ export default function App() {
       if (healthRes.status === 'fulfilled' && healthRes.value.ok) {
         const healthData = await healthRes.value.json();
         setHealthStatus(healthData);
+      }
+      if (hwRes.status === 'fulfilled' && hwRes.value.ok) {
+        const hwData = await hwRes.value.json();
+        setHardwareInfo(hwData);
       }
       if (langsRes.status === 'fulfilled' && langsRes.value.ok) {
         const langsData = await langsRes.value.json();
@@ -1070,6 +1088,20 @@ export default function App() {
   const runStagesForPages = useCallback(
     async (targetPageIds, stagesToRun, restrictedLayerIds = null) => {
       if (!targetPageIds.length || !stagesToRun.length) return;
+
+      const activePid = useEditorStore.getState().pipelineConfig?.provider || 'none';
+      if (stagesToRun.includes('translate') && activePid === 'none') {
+        const nonTranslateStages = stagesToRun.filter((s) => s !== 'translate');
+        setQuickProviderPrompt({
+          onProceedTranslate: () => runStagesForPages(targetPageIds, stagesToRun, restrictedLayerIds),
+          onProceedManual:
+            nonTranslateStages.length > 0
+              ? () => runStagesForPages(targetPageIds, nonTranslateStages, restrictedLayerIds)
+              : null,
+        });
+        return;
+      }
+
       const controller = new AbortController();
       batchAbortControllerRef.current = controller;
       const { signal } = controller;
@@ -1518,10 +1550,78 @@ export default function App() {
     [pages, apiBaseUrl, targetLang, importBaseName]
   );
 
+  // Export single or multi-page layered Photoshop .psd (or .zip of .psd files) via native C++17 PSD writer
+  const handleExportPsd = useCallback(async () => {
+    if (pages.length === 0) return;
+    setStatusBanner(null);
+    try {
+      const cleanBase = (importBaseName || '').trim();
+      const singlePageName =
+        pages.length === 1
+          ? pages[0].name.replace(/\.[^/.]+$/, '') || cleanBase || 'comic_page'
+          : cleanBase || 'vellum';
+      const exportStem = `${singlePageName}_${targetLang}`;
+
+      if (!canvasRef.current?.exportPsd) {
+        throw new Error('Layered PSD exporter is not ready.');
+      }
+
+      const result = await canvasRef.current.exportPsd(pages, {
+        filename: exportStem,
+        editableTextLayers: true,
+        onProgress: ({ current, total, phase }) => {
+          setStatusBanner({
+            type: 'info',
+            message:
+              phase === 'finalizing'
+                ? `Building ${total}-page layered .PSD on backend...`
+                : `Exporting layered .PSD: preparing page ${current} / ${total}...`,
+          });
+        },
+      });
+
+      const isZip = Boolean(result.isZip);
+      const saveRes = await saveBlobWithPicker(result.blob, result.filename, {
+        description: isZip ? 'Layered PSD Archive (.zip)' : 'Photoshop Document (.psd)',
+        accept: isZip
+          ? { 'application/zip': ['.zip'] }
+          : { 'image/vnd.adobe.photoshop': ['.psd'] },
+      });
+      if (saveRes?.cancelled) {
+        setStatusBanner(null);
+        return;
+      }
+
+      setStatusBanner({
+        type: 'success',
+        message: `Exported ${result.pageCount} layered PSD page${
+          result.pageCount === 1 ? '' : 's'
+        } to ${saveRes.filename || result.filename}.`,
+      });
+    } catch (err) {
+      setStatusBanner({
+        type: 'error',
+        message: `Export Layered .psd failed: ${err?.message || 'Unknown error'}`,
+      });
+    }
+  }, [pages, targetLang, importBaseName]);
+
   // Save Project (.vellum.json) with pinned cache images and full typesetting settings
   const handleSaveProject = useCallback(async () => {
     if (pages.length === 0) return;
-    const { apiKey: _redactedKey, ...safePipelineConfig } = pipelineConfig;
+    const { apiKey: _redactedKey, providerProfiles: rawProfiles, ...restPipelineConfig } = pipelineConfig;
+    const safeProviderProfiles = rawProfiles && typeof rawProfiles === 'object'
+      ? Object.fromEntries(
+          Object.entries(rawProfiles).map(([pid, prof]) => [
+            pid,
+            prof && typeof prof === 'object' ? { ...prof, api_key: '' } : prof,
+          ])
+        )
+      : undefined;
+    const safePipelineConfig = {
+      ...restPipelineConfig,
+      ...(safeProviderProfiles ? { providerProfiles: safeProviderProfiles } : {}),
+    };
     const projectSlug =
       (importBaseName || '').trim().replace(/[^a-zA-Z0-9_-]+/g, '_') ||
       `proj_${Date.now()}`;
@@ -1678,7 +1778,19 @@ export default function App() {
     const timer = setTimeout(() => {
       try {
         const state = useEditorStore.getState();
-        const { apiKey: _redactedKey, ...safePipelineConfig } = state.pipelineConfig;
+        const { apiKey: _redactedKey, providerProfiles: rawProfiles, ...restPipelineConfig } = state.pipelineConfig;
+        const safeProviderProfiles = rawProfiles && typeof rawProfiles === 'object'
+          ? Object.fromEntries(
+              Object.entries(rawProfiles).map(([pid, prof]) => [
+                pid,
+                prof && typeof prof === 'object' ? { ...prof, api_key: '' } : prof,
+              ])
+            )
+          : undefined;
+        const safePipelineConfig = {
+          ...restPipelineConfig,
+          ...(safeProviderProfiles ? { providerProfiles: safeProviderProfiles } : {}),
+        };
         const savedAt = new Date().toISOString();
         const snapshot = {
           format: 'vellum-autosave',
@@ -1861,7 +1973,8 @@ export default function App() {
     return () => window.removeEventListener('resize', updateHeight);
   }, [zenMode]);
 
-  const FILMSTRIP_ITEM_HEIGHT = 68;
+  const FILMSTRIP_ITEM_HEIGHT = uiDensity === 'comfortable' ? 82 : 64;
+  const selectedPageIdSet = useMemo(() => new Set(selectedPageIds), [selectedPageIds]);
   const FILMSTRIP_OVERSCAN = 8;
   const filmstripStartIdx = Math.max(
     0,
@@ -2018,6 +2131,7 @@ export default function App() {
         onExportImage={handleExportImage}
         onExportCbz={() => handleExportMultiPage('cbz')}
         onExportPdf={() => handleExportMultiPage('pdf')}
+        onExportPsd={handleExportPsd}
         onSaveProject={handleSaveProject}
         onOpenProject={handleOpenProject}
         onProcessProject={handleProcessProject}
@@ -2055,7 +2169,7 @@ export default function App() {
             <button
               type="button"
               onClick={handleRestoreAutosave}
-              className="px-2 py-0.5 rounded bg-studio-accent text-white font-medium hover:opacity-90 cursor-pointer"
+              className="px-2 py-0.5 rounded bg-studio-accent text-studio-accent-fg font-medium hover:opacity-90 cursor-pointer"
             >
               Restore
             </button>
@@ -2150,9 +2264,11 @@ export default function App() {
                   <div
                     style={{
                       position: 'absolute',
-                      top: `${filmstripStartIdx * FILMSTRIP_ITEM_HEIGHT}px`,
+                      top: 0,
                       left: 0,
                       right: 0,
+                      transform: `translate3d(0, ${filmstripStartIdx * FILMSTRIP_ITEM_HEIGHT}px, 0)`,
+                      willChange: 'transform',
                     }}
                     className="space-y-1.5"
                   >
@@ -2161,12 +2277,14 @@ export default function App() {
                       .map((p, relIdx) => {
                         const idx = filmstripStartIdx + relIdx;
                         const isActive = p.id === activePageId;
-                        const isSelected = selectedPageIds.includes(p.id);
+                        const isSelected = selectedPageIdSet.has(p.id);
                         return (
                           <div
                             key={p.id}
                             onClick={(e) => handlePageClick(e, p.id)}
-                            className={`group relative h-[62px] rounded-studio border p-2 transition-colors cursor-pointer flex items-center gap-2 ${
+                            className={`group relative ${
+                              uiDensity === 'comfortable' ? 'h-[74px] p-2.5' : 'h-[58px] p-1.5'
+                            } rounded-studio border transition-colors cursor-pointer flex items-center gap-2 ${
                               isActive
                                 ? 'border-studio-accent bg-studio-accent/10'
                                 : isSelected
@@ -2376,27 +2494,44 @@ export default function App() {
         isPollingLlm={isPollingLlm}
       />
 
-      {/* Model Download & SSE Verification Modal */}
-      <DownloadModal
-        isOpen={isDownloadModalOpen}
-        initialStatus={modelsStatus}
-        apiBaseUrl={apiBaseUrl}
-        onModelsReady={handleModelsReady}
-        onClose={
-          modelsStatus?.all_ready ? () => setIsDownloadModalOpen(false) : undefined
-        }
+      {/* Model Download & SSE Verification Modal (lazy-loaded when open) */}
+      {isDownloadModalOpen && (
+        <Suspense fallback={null}>
+          <DownloadModal
+            isOpen={isDownloadModalOpen}
+            initialStatus={modelsStatus}
+            apiBaseUrl={apiBaseUrl}
+            onModelsReady={handleModelsReady}
+            onClose={
+              modelsStatus?.all_ready ? () => setIsDownloadModalOpen(false) : undefined
+            }
+          />
+        </Suspense>
+      )}
+
+      {/* Quick Provider Setup when active_provider === "none" and Translate is triggered */}
+      <QuickProviderSetupModal
+        isOpen={Boolean(quickProviderPrompt)}
+        onClose={() => setQuickProviderPrompt(null)}
+        onConfiguredTranslate={() => quickProviderPrompt?.onProceedTranslate?.()}
+        onRunManualNoLlm={() => quickProviderPrompt?.onProceedManual?.()}
+        onOpenFullSettings={() => openModal('settings', 'providers')}
       />
 
-      {/* Koharu-style 5-Tab Studio Settings Modal */}
-      <SettingsModal
-        isOpen={activeModal === 'settings'}
-        onClose={closeModal}
-        onSaved={() => {
-          hydrateBackendContext();
-          fetchLlmAndHealthStatus();
-        }}
-        onApplyTypesettingToPage={handleApplyStyleToAll}
-      />
+      {/* 5-Tab Studio Settings Modal (lazy-loaded when open) */}
+      {activeModal === 'settings' && (
+        <Suspense fallback={null}>
+          <SettingsModal
+            isOpen={activeModal === 'settings'}
+            onClose={closeModal}
+            onSaved={() => {
+              hydrateBackendContext();
+              fetchLlmAndHealthStatus();
+            }}
+            onApplyTypesettingToPage={handleApplyStyleToAll}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

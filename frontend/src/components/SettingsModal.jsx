@@ -120,6 +120,13 @@ const READING_ORDER_OPTIONS = [
   { id: 'ltr', label: 'LTR', desc: 'Left-to-Right (Manhwa/Manhua)' },
 ];
 
+const BACKEND_OPTIONS = [
+  { id: 'auto', label: 'Auto' },
+  { id: 'directml', label: 'DirectML' },
+  { id: 'cuda', label: 'CUDA' },
+  { id: 'cpu', label: 'CPU' },
+];
+
 const REASONING_LEVELS = [
   { id: 'off', label: 'Off' },
   { id: 'low', label: 'Low' },
@@ -192,7 +199,7 @@ function ToggleSwitch({ checked, onChange, disabled = false, label, id }) {
 
 function SectionCard({ title, subtitle, action, children }) {
   return (
-    <section className="rounded-studio border border-studio-border bg-studio-surface p-3.5 space-y-3">
+    <section className="rounded-studio border border-studio-border bg-studio-surface p-[var(--studio-card-pad)] space-y-3">
       {(title || action) && (
         <div className="flex items-start justify-between gap-2">
           <div>
@@ -319,7 +326,7 @@ function ModelStatusBadge({ model, isLoading, testId }) {
   }
 
   const missingTip = model.needsConversion
-    ? 'Cached in Koharu as .safetensors - click "Import Local Koharu Models" to convert to ONNX.'
+    ? 'Cached as .safetensors - click "Import Local Models..." to convert to ONNX.'
     : 'Model weights are not installed locally.';
 
   return (
@@ -496,6 +503,7 @@ export default function SettingsModal({
     setPipelineModelsCatalog,
     setFontsCatalogCache,
     setModelsStatus,
+    setHardwareInfo,
     setLmStudioStatus,
   } = useEditorStore(
     useShallow((s) => ({
@@ -525,6 +533,7 @@ export default function SettingsModal({
       setPipelineModelsCatalog: s.setPipelineModelsCatalog,
       setFontsCatalogCache: s.setFontsCatalogCache,
       setModelsStatus: s.setModelsStatus,
+      setHardwareInfo: s.setHardwareInfo,
       setLmStudioStatus: s.setLmStudioStatus,
     }))
   );
@@ -575,8 +584,58 @@ export default function SettingsModal({
   // Modal lifecycle & save feedback
   const [isHydrating, setIsHydrating] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isSwitchingBackend, setIsSwitchingBackend] = useState(false);
+  const [requiresBackendRelaunch, setRequiresBackendRelaunch] = useState(false);
+  const [isRelaunchingApp, setIsRelaunchingApp] = useState(false);
   const [saveFeedback, setSaveFeedback] = useState(null); // { type: 'success' | 'error', text: string }
   const [settingsPath, setSettingsPath] = useState('');
+
+  const handleSelectPreferredBackend = useCallback(
+    async (backendId) => {
+      setDraftPipeline((prev) => ({
+        ...prev,
+        preferredBackend: backendId,
+      }));
+      setIsSwitchingBackend(true);
+      try {
+        const resp = await fetch(`${apiBaseUrl}/api/system/backend`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            preferred_backend: backendId,
+          }),
+        });
+        if (resp.ok) {
+          const hwData = await resp.json();
+          setHardwareInfo(hwData);
+          setRequiresBackendRelaunch(Boolean(hwData.requires_relaunch));
+          updatePipelineConfig({
+            preferredBackend: hwData.preferred_backend ?? backendId,
+          });
+        }
+      } catch {
+        // Fallback: draft value will still be saved via Save Settings
+      } finally {
+        setIsSwitchingBackend(false);
+      }
+    },
+    [apiBaseUrl, setHardwareInfo, updatePipelineConfig]
+  );
+
+  const handleRelaunchForBackend = useCallback(async () => {
+    setIsRelaunchingApp(true);
+    try {
+      await fetch(`${apiBaseUrl}/api/system/relaunch`, {
+        method: 'POST',
+        headers: { Accept: 'application/json' },
+      });
+    } catch {
+      // Process exits immediately to trigger Dual-Core launcher restart
+    }
+  }, [apiBaseUrl]);
 
   const providerPresets = useMemo(
     () =>
@@ -641,8 +700,8 @@ export default function SettingsModal({
           data?.detail ||
             data?.conversion_error ||
             (data?.status === 'cache_not_found'
-              ? 'Local Koharu cache directory was not found.'
-              : `Koharu model import failed (HTTP ${resp.status}).`)
+              ? 'Local model cache directory was not found.'
+              : `Local model import failed (HTTP ${resp.status}).`)
         );
       }
 
@@ -658,15 +717,15 @@ export default function SettingsModal({
         type: 'success',
         text:
           newlyImported > 0
-            ? `Imported ${newlyImported} local Koharu model${newlyImported === 1 ? '' : 's'} and refreshed availability.`
+            ? `Imported ${newlyImported} local model${newlyImported === 1 ? '' : 's'} and refreshed availability.`
             : alreadyReady > 0
-            ? 'All available local Koharu models are already imported.'
-            : 'Local Koharu model statuses refreshed.',
+            ? 'All available local models are already imported.'
+            : 'Local model statuses refreshed.',
       });
     } catch (err) {
       setKoharuImportFeedback({
         type: 'error',
-        text: err?.message || 'Failed to import local Koharu models.',
+        text: err?.message || 'Failed to import local models.',
       });
     } finally {
       setIsImportingKoharu(false);
@@ -731,8 +790,11 @@ export default function SettingsModal({
       fetch(`${apiBaseUrl}/api/models/status`, {
         headers: { Accept: 'application/json' },
       }).then((res) => (res.ok ? res.json() : null)),
+      fetch(`${apiBaseUrl}/api/system/hardware`, {
+        headers: { Accept: 'application/json' },
+      }).then((res) => (res.ok ? res.json() : null)),
     ])
-      .then(([settingsRes, modelsRes, statusRes]) => {
+      .then(([settingsRes, modelsRes, statusRes, hwRes]) => {
         if (cancelled) return;
         const settingsData =
           settingsRes.status === 'fulfilled' ? settingsRes.value : null;
@@ -740,8 +802,13 @@ export default function SettingsModal({
           modelsRes.status === 'fulfilled' ? modelsRes.value : null;
         const statusData =
           statusRes.status === 'fulfilled' ? statusRes.value : null;
+        const hwData =
+          hwRes.status === 'fulfilled' ? hwRes.value : null;
         if (statusData) {
           setModelsStatus(statusData);
+        }
+        if (hwData) {
+          setHardwareInfo(hwData);
         }
 
         if (settingsData) {
@@ -1223,6 +1290,7 @@ export default function SettingsModal({
         inpaintingModel: 'lama-manga',
         inpaintApiUrl: 'http://127.0.0.1:8188',
         executionMode: 'hybrid',
+        preferredBackend: 'auto',
         confThreshold: 0.35,
         nmsThreshold: 0.45,
         maskThreshold: 0.5,
@@ -1782,8 +1850,8 @@ export default function SettingsModal({
                         onClick={handleImportKoharuModels}
                         title={
                           pipelineModelsData?.koharu_cache_dir
-                            ? `Import local Koharu models from ${pipelineModelsData.koharu_cache_dir}`
-                            : 'Import local Koharu models into Vellum storage'
+                            ? `Import local .onnx / Hugging Face models from ${pipelineModelsData.koharu_cache_dir}`
+                            : 'Import local .onnx or Hugging Face models into Vellum storage'
                         }
                         className="studio-btn h-7 px-2.5 text-[11px] border-studio-accent/50 text-studio-accent hover:bg-studio-accent/10 shrink-0"
                       >
@@ -1795,7 +1863,7 @@ export default function SettingsModal({
                         ) : (
                           <>
                             <Download className="h-3 w-3" />
-                            <span>Import Local Koharu Models</span>
+                            <span>Import Local Models...</span>
                           </>
                         )}
                       </button>
@@ -1880,6 +1948,65 @@ export default function SettingsModal({
                             testId="detection-model-status-badge"
                           />
                         </div>
+
+                        {String(draftPipeline.detectionModel || '').toLowerCase().includes('rfdetr') && (() => {
+                          const activeEp =
+                            runtimeStatus?.hardware?.execution_provider ||
+                            runtimeStatus?.executionProvider ||
+                            '';
+                          const activeBackend = String(
+                            runtimeStatus?.hardware?.active_backend ||
+                              runtimeStatus?.hardware?.backend ||
+                              (activeEp === 'CUDAExecutionProvider'
+                                ? 'cuda'
+                                : activeEp === 'DmlExecutionProvider'
+                                ? 'directml'
+                                : 'cpu')
+                          ).toLowerCase();
+                          const isCpuMode =
+                            normalizeExecMode(draftPipeline.executionMode) === 'cpu_only' ||
+                            String(draftPipeline.preferredBackend || 'auto').toLowerCase() === 'cpu' ||
+                            activeBackend === 'cpu';
+
+                          if (!isCpuMode && activeBackend === 'cuda') {
+                            const gpuLabel = runtimeStatus?.hardware?.gpu_name || 'NVIDIA GPU';
+                            return (
+                              <div
+                                data-testid="settings-cuda-rfdetr-ready"
+                                className="rounded-studio-sm border border-studio-success/40 bg-studio-success/10 px-2.5 py-1.5 text-[11px] text-studio-success flex items-center gap-1.5"
+                              >
+                                <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                                <span>
+                                  <strong>CUDA Accelerated:</strong> RF-DETR Seg 2XL is ready for full GPU speed on <strong>{gpuLabel}</strong>.
+                                </span>
+                              </div>
+                            );
+                          }
+                          if (!isCpuMode && activeBackend === 'directml') {
+                            return (
+                              <div
+                                data-testid="settings-directml-rfdetr-warning"
+                                className="rounded-studio-sm border border-studio-warning/40 bg-studio-warning/10 px-2.5 py-1.5 text-[11px] text-studio-warning flex items-center gap-1.5"
+                              >
+                                <AlertCircle className="h-3.5 w-3.5 shrink-0 text-studio-warning" />
+                                <span>
+                                  <strong>DirectML note:</strong> RF-DETR Seg 2XL is heavy on DirectML. We recommend <strong>YOLO11m-Seg</strong> for DirectML or <strong>CUDA</strong> for RF-DETR.
+                                </span>
+                              </div>
+                            );
+                          }
+                          return (
+                            <div
+                              data-testid="settings-cpu-rfdetr-warning"
+                              className="rounded-studio-sm border border-studio-warning/40 bg-studio-warning/10 px-2.5 py-1.5 text-[11px] text-studio-warning flex items-center gap-1.5"
+                            >
+                              <AlertCircle className="h-3.5 w-3.5 shrink-0 text-studio-warning" />
+                              <span>
+                                <strong>CPU mode:</strong> RF-DETR Seg 2XL is compute-intensive on CPU. Switch to <strong>CUDA</strong> (NVIDIA GPU) or <strong>YOLO11m-Seg INT8</strong> for faster CPU detection.
+                              </span>
+                            </div>
+                          );
+                        })()}
 
                         {/* 3 side-by-side numeric threshold inputs */}
                         <div className="grid grid-cols-3 gap-2">
@@ -2200,8 +2327,188 @@ export default function SettingsModal({
 
                 <SectionCard
                   title="Execution Provider"
-                  subtitle={`Detected hardware: ${runtimeStatus.executionProvider || 'Auto-detecting…'} · OCR: ${runtimeStatus.ocrProvider || 'CPUExecutionProvider'}`}
+                  subtitle={`Detected hardware: ${runtimeStatus.hardware?.gpu_name || runtimeStatus.executionProvider || 'Auto-detecting…'} · OCR: ${runtimeStatus.ocrProvider || 'CPUExecutionProvider'}`}
                 >
+                  {/* 4-stop Hardware Execution Backend Segmented Control + Live Status Pill */}
+                  {(() => {
+                    const hw = runtimeStatus.hardware || {};
+                    const availBackends = hw.available_backends || {
+                      cuda: false,
+                      directml:
+                        runtimeStatus.executionProvider === 'DmlExecutionProvider' ||
+                        (runtimeStatus.availableProviders || []).includes('DmlExecutionProvider'),
+                      cpu: true,
+                    };
+                    const currentPref = String(
+                      draftPipeline.preferredBackend || hw.preferred_backend || 'auto'
+                    ).toLowerCase();
+                    const activeBackend = String(
+                      hw.active_backend ||
+                        hw.backend ||
+                        (runtimeStatus.executionProvider === 'CUDAExecutionProvider'
+                          ? 'cuda'
+                          : runtimeStatus.executionProvider === 'DmlExecutionProvider'
+                          ? 'directml'
+                          : 'cpu')
+                    ).toLowerCase();
+                    const gpuName = hw.gpu_name || 'GPU';
+                    const cudaReason =
+                      hw.cuda_unavailable_reason ||
+                      'CUDA Runtime Not Installed';
+
+                    let statusText = `${gpuName} • ${
+                      activeBackend === 'cuda'
+                        ? 'CUDA Ready'
+                        : activeBackend === 'directml'
+                        ? 'DirectML Active'
+                        : 'CPU Mode'
+                    }`;
+                    let statusTone =
+                      activeBackend === 'cuda' || activeBackend === 'directml'
+                        ? 'success'
+                        : 'neutral';
+
+                    if (
+                      (currentPref === 'cuda' || !availBackends.cuda) &&
+                      !availBackends.cuda &&
+                      activeBackend !== 'cpu'
+                    ) {
+                      if (currentPref === 'cuda') {
+                        statusText = `${cudaReason} — Fallback to ${
+                          activeBackend === 'directml' ? 'DirectML' : 'CPU'
+                        }`;
+                        statusTone = 'warning';
+                      } else {
+                        statusText = `${gpuName} • ${
+                          activeBackend === 'directml' ? 'DirectML Ready' : 'CPU Mode'
+                        }`;
+                      }
+                    } else if (currentPref === 'cpu') {
+                      statusText = 'CPU ExecutionProvider Active (0 MB VRAM)';
+                      statusTone = 'neutral';
+                    }
+
+                    const pillClasses =
+                      statusTone === 'warning'
+                        ? 'border-studio-warning/40 bg-studio-warning/10 text-studio-warning'
+                        : statusTone === 'success'
+                        ? 'border-studio-success/40 bg-studio-success/10 text-studio-success'
+                        : 'border-studio-border-strong bg-studio-canvas text-studio-text-secondary';
+
+                    const dotClasses =
+                      statusTone === 'warning'
+                        ? 'bg-studio-warning'
+                        : statusTone === 'success'
+                        ? 'bg-studio-success'
+                        : 'bg-studio-text-muted';
+
+                    return (
+                      <div className="space-y-2 pb-2.5 border-b border-studio-border">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="text-[11px] font-medium text-studio-text">
+                            Hardware Execution Backend
+                          </div>
+                          <span
+                            data-testid="hardware-backend-status-pill"
+                            title={
+                              !availBackends.cuda
+                                ? cudaReason
+                                : `Active ONNX provider: ${hw.execution_provider || runtimeStatus.executionProvider || activeBackend}`
+                            }
+                            className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[10px] font-mono font-medium ${pillClasses}`}
+                          >
+                            {isSwitchingBackend ? (
+                              <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                            ) : (
+                              <span className={`h-1.5 w-1.5 rounded-full ${dotClasses}`} />
+                            )}
+                            <span>{statusText}</span>
+                          </span>
+                        </div>
+
+                        <div
+                          role="radiogroup"
+                          aria-label="Hardware Execution Backend"
+                          className="grid grid-cols-4 gap-1 rounded-studio border border-studio-border bg-studio-canvas p-1"
+                        >
+                          {BACKEND_OPTIONS.map((opt) => {
+                            const availabilityMap = {
+                              auto: true,
+                              directml: Boolean(availBackends.directml),
+                              cuda: Boolean(availBackends.cuda),
+                              cpu: true,
+                            };
+                            const isUnavailable = !availabilityMap[opt.id];
+                            // If saved preferred_backend points to an unavailable backend, visually highlight the active fallback
+                            const effectiveSelectedId = availabilityMap[currentPref]
+                              ? currentPref
+                              : availabilityMap[activeBackend]
+                              ? activeBackend
+                              : 'auto';
+                            const isSelected = effectiveSelectedId === opt.id && !isUnavailable;
+                            const tip =
+                              opt.id === 'cuda' && isUnavailable
+                                ? `CUDA disabled: ${cudaReason}`
+                                : opt.id === 'directml' && isUnavailable
+                                ? 'DirectML disabled: DirectML provider is not bundled in this build'
+                                : `Use ${opt.label} execution backend`;
+
+                            return (
+                              <button
+                                key={opt.id}
+                                type="button"
+                                role="radio"
+                                aria-checked={isSelected}
+                                disabled={isSwitchingBackend || isUnavailable}
+                                data-testid={`backend-seg-${opt.id}`}
+                                title={tip}
+                                onClick={() => {
+                                  if (!isUnavailable) {
+                                    handleSelectPreferredBackend(opt.id);
+                                  }
+                                }}
+                                className={`relative flex items-center justify-center h-8 rounded-studio-sm text-xs font-medium transition-all ${
+                                  isSelected
+                                    ? 'bg-studio-accent text-studio-accent-fg font-semibold shadow-sm cursor-pointer'
+                                    : isUnavailable
+                                    ? 'bg-studio-panel/40 border border-studio-border/40 text-studio-text-muted opacity-45 cursor-not-allowed pointer-events-auto'
+                                    : 'text-studio-text-secondary hover:bg-studio-hover hover:text-studio-text cursor-pointer'
+                                }`}
+                              >
+                                <span>{opt.label}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                        {requiresBackendRelaunch && (
+                          <div className="mt-2 flex items-center justify-between gap-2 rounded-studio border border-studio-accent/50 bg-studio-accent/10 px-2.5 py-2">
+                            <p className="text-[11px] text-studio-text leading-snug">
+                              Switching between CUDA and DirectML requires relaunching the matching runtime core.
+                            </p>
+                            <button
+                              type="button"
+                              disabled={isRelaunchingApp}
+                              onClick={handleRelaunchForBackend}
+                              data-testid="relaunch-backend-btn"
+                              className="studio-btn-accent shrink-0 px-2.5 h-7 text-[11px]"
+                            >
+                              {isRelaunchingApp ? 'Restarting…' : 'Restart to Switch Backend'}
+                            </button>
+                          </div>
+                        )}
+                        {!availBackends.cuda && (
+                          <p className="text-[10px] text-studio-text-muted leading-snug">
+                            CUDA unavailable: {cudaReason}. ONNX sessions will run on{' '}
+                            <span className="font-mono text-studio-text-secondary">
+                              {availBackends.directml ? 'DirectML' : 'CPU'}
+                            </span>
+                            .
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })()}
+
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                     {[
                       {
@@ -2498,6 +2805,111 @@ export default function SettingsModal({
 
                     <div className="h-px bg-studio-border" />
 
+                    {/* v2.5 Studio Core Feature Flags */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <label
+                            htmlFor="pipeline-3tier-inpaint"
+                            className="text-xs font-medium text-studio-text block"
+                          >
+                            3-Tier CPU Inpainting
+                          </label>
+                          <p className="text-[11px] text-studio-text-muted">
+                            Fast CPU flat/Telea fill before LaMa/GPU tiles.
+                          </p>
+                        </div>
+                        <ToggleSwitch
+                          id="pipeline-3tier-inpaint"
+                          label="3-Tier CPU Inpainting"
+                          checked={draftPipeline.enable3TierInpaint !== false}
+                          onChange={(val) =>
+                            setDraftPipeline((prev) => ({
+                              ...prev,
+                              enable3TierInpaint: val,
+                            }))
+                          }
+                        />
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <label
+                            htmlFor="pipeline-tone-match"
+                            className="text-xs font-medium text-studio-text block"
+                          >
+                            Screentone Tone Match
+                          </label>
+                          <p className="text-[11px] text-studio-text-muted">
+                            Matches boundary luminance/histogram to remove halos.
+                          </p>
+                        </div>
+                        <ToggleSwitch
+                          id="pipeline-tone-match"
+                          label="Screentone Tone Match"
+                          checked={draftPipeline.enableToneMatch !== false}
+                          onChange={(val) =>
+                            setDraftPipeline((prev) => ({
+                              ...prev,
+                              enableToneMatch: val,
+                            }))
+                          }
+                        />
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <label
+                            htmlFor="pipeline-cv-style"
+                            className="text-xs font-medium text-studio-text block"
+                          >
+                            0-VRAM Auto Style/Outline
+                          </label>
+                          <p className="text-[11px] text-studio-text-muted">
+                            Detects ink color, outline stroke, and tilt angle on CPU.
+                          </p>
+                        </div>
+                        <ToggleSwitch
+                          id="pipeline-cv-style"
+                          label="0-VRAM Auto Style/Outline"
+                          checked={draftPipeline.enableCvStyleDetect !== false}
+                          onChange={(val) =>
+                            setDraftPipeline((prev) => ({
+                              ...prev,
+                              enableCvStyleDetect: val,
+                            }))
+                          }
+                        />
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <label
+                            htmlFor="pipeline-waist-cut"
+                            className="text-xs font-medium text-studio-text block"
+                          >
+                            Conjoined Balloon Waist-Cut
+                          </label>
+                          <p className="text-[11px] text-studio-text-muted">
+                            Splits merged double-bubbles at narrow constriction waists.
+                          </p>
+                        </div>
+                        <ToggleSwitch
+                          id="pipeline-waist-cut"
+                          label="Conjoined Balloon Waist-Cut"
+                          checked={draftPipeline.enableWaistCut !== false}
+                          onChange={(val) =>
+                            setDraftPipeline((prev) => ({
+                              ...prev,
+                              enableWaistCut: val,
+                            }))
+                          }
+                        />
+                      </div>
+                    </div>
+
+                    <div className="h-px bg-studio-border" />
+
                     <div className="flex items-center justify-between gap-3">
                       <div>
                         <span className="text-xs font-medium text-studio-text block">
@@ -2761,14 +3173,42 @@ export default function SettingsModal({
                       </div>
                     </div>
 
-                    {/* Default / Preferred Model */}
-                    <div className="space-y-1">
+                    {/* Default / Preferred Model + Universal Fetch Models Dropdown */}
+                    <div className="space-y-1.5">
                       <label
                         htmlFor="provider-default-model"
                         className="text-[11px] font-medium text-studio-text-secondary block"
                       >
                         Preferred Model ID
                       </label>
+                      {selectedProviderTest?.models?.length > 0 && (
+                        <select
+                          aria-label="Fetched Models Dropdown"
+                          data-testid="provider-fetched-models-select"
+                          value={
+                            selectedProviderTest.models.includes(selectedProfile.model)
+                              ? selectedProfile.model
+                              : ''
+                          }
+                          onChange={(e) => {
+                            if (e.target.value) {
+                              updateDraftProfile(selectedProviderId, {
+                                model: e.target.value,
+                              });
+                            }
+                          }}
+                          className="studio-input w-full h-8 px-2 text-xs font-mono"
+                        >
+                          <option value="">
+                            Select from {selectedProviderTest.models.length} fetched model(s)…
+                          </option>
+                          {selectedProviderTest.models.map((mid) => (
+                            <option key={mid} value={mid}>
+                              {mid}
+                            </option>
+                          ))}
+                        </select>
+                      )}
                       <input
                         id="provider-default-model"
                         type="text"
@@ -3276,7 +3716,7 @@ export default function SettingsModal({
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-3.5">
                   <SectionCard
                     title="Reasoning Control"
-                    subtitle="Configure thinking effort for reasoning models and strip <think> blocks."
+                    subtitle="Configure thinking effort for reasoning models and filter internal thought blocks."
                   >
                     <div className="space-y-3">
                       <div className="grid grid-cols-4 gap-1.5">
@@ -3311,15 +3751,15 @@ export default function SettingsModal({
                             htmlFor="trans-strip-think"
                             className="text-xs font-medium text-studio-text block"
                           >
-                            Strip <code>&lt;think&gt;</code> Tags
+                            Hide AI Thinking Process
                           </label>
                           <p className="text-[10px] text-studio-text-muted">
-                            Removes chain-of-thought tags before parsing JSON dialogue.
+                            Automatically filters out internal model thought blocks before parsing translated dialogue.
                           </p>
                         </div>
                         <ToggleSwitch
                           id="trans-strip-think"
-                          label="Strip think tags"
+                          label="Hide AI Thinking Process"
                           checked={Boolean(draftPipeline.stripThinking ?? true)}
                           onChange={(val) =>
                             setDraftPipeline((prev) => ({
@@ -3935,6 +4375,56 @@ export default function SettingsModal({
                           setDraftTypesetting((prev) => ({
                             ...prev,
                             allCaps: val,
+                          }))
+                        }
+                      />
+                    </div>
+
+                    <div className="flex items-center justify-between gap-2 sm:col-span-2 pt-1 border-t border-studio-border/60">
+                      <div>
+                        <label
+                          htmlFor="ts-enable-hyphenation"
+                          className="text-xs font-medium text-studio-text block"
+                        >
+                          Narrow-Bubble Hyphenation
+                        </label>
+                        <p className="text-[10px] text-studio-text-muted">
+                          Allows syllable hyphenation on Latin words (≥6 letters) as a last resort in narrow vertical bubbles.
+                        </p>
+                      </div>
+                      <ToggleSwitch
+                        id="ts-enable-hyphenation"
+                        label="Narrow-Bubble Hyphenation"
+                        checked={draftTypesetting.enableHyphenation !== false}
+                        onChange={(val) =>
+                          setDraftTypesetting((prev) => ({
+                            ...prev,
+                            enableHyphenation: val,
+                          }))
+                        }
+                      />
+                    </div>
+
+                    <div className="flex items-center justify-between gap-2 sm:col-span-2 pt-1 border-t border-studio-border/60">
+                      <div>
+                        <label
+                          htmlFor="ts-auto-tilt-text"
+                          className="text-xs font-medium text-studio-text block"
+                        >
+                          Auto-Tilt Text Boxes
+                        </label>
+                        <p className="text-[10px] text-studio-text-muted">
+                          Automatically rotate typeset text to match tilted manga speech bubbles or slanted SFX. Keep off for straight horizontal lettering.
+                        </p>
+                      </div>
+                      <ToggleSwitch
+                        id="ts-auto-tilt-text"
+                        label="Auto-Tilt Text Boxes"
+                        checked={Boolean(draftTypesetting.autoTiltText)}
+                        onChange={(val) =>
+                          setDraftTypesetting((prev) => ({
+                            ...prev,
+                            autoTiltText: val,
                           }))
                         }
                       />

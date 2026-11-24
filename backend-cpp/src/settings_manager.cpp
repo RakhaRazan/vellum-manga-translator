@@ -813,6 +813,7 @@ json SettingsManager::build_default_settings() {
         {"inpainting_model", "lama-manga"},
         {"inpaint_api_url", "http://127.0.0.1:8188"},
         {"execution_mode", hw.recommended_execution_mode},
+        {"preferred_backend", "auto"},
         {"conf_threshold", 0.35},
         {"nms_threshold", 0.45},
         {"mask_threshold", 0.5},
@@ -831,6 +832,7 @@ json SettingsManager::build_default_settings() {
         {"font_family", R"("CC Wild Words", "Anime Ace", "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans", sans-serif)"},
         {"font_fallback_chain", json::array({"CC Wild Words", "Anime Ace", "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans", "sans-serif"})},
         {"auto_fit_font_size", true},
+        {"auto_tilt_text", false},
         {"default_font_size", 18},
         {"default_stroke_width", 4.0},
         {"default_stroke_color", "#ffffff"},
@@ -1021,7 +1023,9 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
 
     const bool strip_thinking = (raw.contains("strip_thinking") && !raw["strip_thinking"].is_null())
         ? coerce_bool(raw["strip_thinking"], current.value("strip_thinking", true))
-        : current.value("strip_thinking", true);
+        : ((raw.contains("strip_think_tags") && !raw["strip_think_tags"].is_null())
+            ? coerce_bool(raw["strip_think_tags"], current.value("strip_thinking", true))
+            : current.value("strip_thinking", true));
 
     // Tab 1: Appearance
     std::string theme = current.value("theme", std::string("dark"));
@@ -1111,6 +1115,14 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         }
     }
     util::set_env_utf8(L"MANGA_FORCE_CPU", execution_mode == "cpu_only" ? "1" : "0");
+
+    std::string preferred_backend = pipeline::normalize_preferred_backend(
+        current.value("preferred_backend", std::string("auto")));
+    if (raw.contains("preferred_backend") && !raw["preferred_backend"].is_null()) {
+        preferred_backend = pipeline::normalize_preferred_backend(
+            json_to_string(raw["preferred_backend"]));
+    }
+    pipeline::set_preferred_backend(preferred_backend);
 
     const double conf_threshold = (raw.contains("conf_threshold") && !raw["conf_threshold"].is_null())
         ? clamp_double(raw["conf_threshold"], 0.05, 0.95, current.value("conf_threshold", 0.35))
@@ -1224,6 +1236,10 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         ? coerce_bool(raw["auto_fit_font_size"], current.value("auto_fit_font_size", true))
         : current.value("auto_fit_font_size", true);
 
+    const bool auto_tilt_text = (raw.contains("auto_tilt_text") && !raw["auto_tilt_text"].is_null())
+        ? coerce_bool(raw["auto_tilt_text"], current.value("auto_tilt_text", false))
+        : current.value("auto_tilt_text", false);
+
     const int default_font_size = (raw.contains("default_font_size") && !raw["default_font_size"].is_null())
         ? clamp_int(raw["default_font_size"], 8, 96, current.value("default_font_size", 18))
         : current.value("default_font_size", 18);
@@ -1295,6 +1311,7 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         {"inpainting_model", inpainting_model},
         {"inpaint_api_url", inpaint_api_url},
         {"execution_mode", execution_mode},
+        {"preferred_backend", preferred_backend},
         {"conf_threshold", conf_threshold},
         {"nms_threshold", nms_threshold},
         {"mask_threshold", mask_threshold},
@@ -1311,6 +1328,7 @@ json SettingsManager::sanitize_and_merge(const json& raw, const json& base) cons
         {"font_family", font_family},
         {"font_fallback_chain", font_fallback_chain},
         {"auto_fit_font_size", auto_fit_font_size},
+        {"auto_tilt_text", auto_tilt_text},
         {"default_font_size", default_font_size},
         {"default_stroke_width", default_stroke_width},
         {"default_stroke_color", default_stroke_color},
