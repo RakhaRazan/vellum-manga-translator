@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <!-- Back overlapping dark-graphite sheet (tilted left) -->
+  <g transform="rotate(-8 56 64)">
+    <rect
+      x="18"
+      y="16"
+      width="76"
+      height="96"
+      rx="10"
+      fill="#181A1D"
+      stroke="#2D3139"
+      stroke-width="2.5"
+    />
+  </g>
+
+  <!-- Front overlapping dark-graphite sheet (tilted right) -->
+  <g transform="rotate(6 72 64)">
+    <rect
+      x="34"
+      y="16"
+      width="76"
+      height="96"
+      rx="10"
+      fill="#181A1D"
+      stroke="#383D47"
+      stroke-width="2.5"
+    />
+  </g>
+
+  <!-- Sharp Warm Amber geometric "V" monogram -->
+  <polygon
+    points="36,36 51,36 64,74 77,36 92,36 69,96 59,96"
+    fill="#E59A3C"
+  />
+</svg>
