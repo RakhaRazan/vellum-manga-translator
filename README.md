@@ -46,7 +46,7 @@ Download the latest portable archive from [Releases] (https://github.com/HoldMyA
   - **Loupe (`Z`), Reading Preview (`F11`), Click-to-Order, Batch Series Queue (w/ Minimize-to-Pill), Token Telemetry, & Portable Backup (`.zip`).**
 
 ### 5. Layered `.psd` Export & 10,000-Page Endurance
-- **Native Layered `.psd` Writer:** Exports editable Photoshop documents with `Background`, non-destructive `Cleanup` diff patch, and `Text` layers—including `luni` Unicode names, `TySh` (`EngineData` vector type), and `lfx2` (`FrFX` outline stroke) tagged blocks.
+- **Native Layered `.psd` Writer:** Exports editable Photoshop documents with `Background`, non-destructive `Cleanup` diff patch, and `Text` layers including `luni` Unicode names, `TySh` (`EngineData` vector type), and `lfx2` (`FrFX` outline stroke) tagged blocks.
 - **10,000-Page Volume I/O:** `O(1)`-RAM disk-streaming `.cbz` import (up to `25,000` pages / `32 GiB`), explicit **ZIP64 (`>4 GB`)** `.cbz` export, lossless `/DCTDecode` multi-page **PDF 1.4** export, and lean disk-backed crash-recovery autosave (`./projects_cache/autosave.vellum.json`).
 
 ---
