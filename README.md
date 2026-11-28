@@ -24,7 +24,7 @@ Download the latest portable archive from [Releases](https://github.com/HoldMyAs
 ## Key Capabilities (v3.0.0)
 
 ### 1. Provider-Agnostic LLM Translation, Refusal Guard & DPAPI Security
-- **Zero-Lock-In Providers:** Works out of the box with **Cloud APIs** (`OpenAI`, `Google Gemini`, `Anthropic Claude`, `DeepSeek`, `OpenRouter`), **Local LLMs** (`LM Studio` on `localhost:1234`, `Ollama` on `localhost:11434`), **Custom OpenAI-Compatible** endpoints, or **`None` (Manual / No-LLM)** mode for pure CV/inpainting/typesetting workflows.
+- **Zero-Lock-In Providers:** Works out of the box with **Cloud APIs** (`OpenAI`, `Google Gemini`, `Anthropic-Claude`, `DeepSeek`, `OpenRouter`), **Local LLMs** (`LM Studio` on `localhost:1234`, `Ollama` on default `localhost:11434`), **Custom OpenAI-Compatible** endpoints, or **`None` (Manual / No-LLM)** mode for pure CV/inpainting/typesetting workflows.
 - **Windows DPAPI Secret Protection:** `active_provider` defaults to `"none"`. All non-empty API keys written to `settings.json` are encrypted at rest using Windows `CryptProtectData` (`"dpapi:..."`), while project saves (`.vellum.json`), crash-recovery autosaves, and `localStorage` strip all API keys.
 - **LLM Refusal Guard & Auto-QC:** Automatically detects standard LLM refusal responses, flags affected bubbles in the `Issues` badge, and blocks refusal turns from polluting conversation history. Includes `<think>` tag stripping, `O(N)` JSON salvage recovery, custom prompts, Aho-Corasick + Okapi BM25 glossaries/memory, and optional multimodal page vision.
 
@@ -37,7 +37,7 @@ Download the latest portable archive from [Releases](https://github.com/HoldMyAs
 - **Tier 2.5 (FFT Screentone Detection) & Tier 3 (Neural LaMa / AOT / Diffusion + Poisson SOR):** Textured/screentone bubbles route to `LaMa Manga`, `AOT Inpainting`, `FLUX.2 Klein`, or `RORem Mixed`, followed by `4×3` Ridge-regularized affine color matching and Poisson SOR seam blending.
 - **Text-Stroke-Only Masking:** Separates container `bubble_mask` (typesetting) from the `3px`-eroded interior text-stroke mask (inpainting) to preserve crisp bubble outlines.
 
-### 4. 21 0-VRAM Math Models & Wibu Studio UX
+### 4. 21 0-VRAM Math Models
 - **21 Pure-C++/JS 0-VRAM Math Models:** Covers Sauvola + Otsu binarization, convexity-defect waist cutting, EDT watershed room polygons, RDP simplification, Perona-Malik denoising, SWT furigana masking, Hungarian block matching, Mahalanobis translation Auto-QC, and Knuth–Plass DP narrow-bubble line breaking.
 - **Scanlator Studio Tools:**
   - **Restore-to-Raw Brush & Spot Clean:** Paint stray artifacts out via `/api/inpaint/region` or switch to **Restore Raw** to paint original pixels back over accidental overwrites at 0 ms latency with full Undo/Redo.
