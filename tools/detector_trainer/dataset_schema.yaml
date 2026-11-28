@@ -1,0 +1,70 @@
+# Vellum Detector Engine v2 — Canonical 9-Class Dataset Schema
+# Matches `vellum::detector::ClassId` in `backend-cpp/src/detector/detector_types.hpp` 1:1.
+
+schema_version: "2.0"
+num_classes: 9
+
+classes:
+  0:
+    name: speech_bubble
+    cpp_enum: SpeechBubble
+    color: "#22C55E"
+    default_conf_threshold: 0.42
+  1:
+    name: thought_bubble
+    cpp_enum: ThoughtBubble
+    color: "#38BDF8"
+    default_conf_threshold: 0.35
+  2:
+    name: narration_box
+    cpp_enum: NarrationBox
+    color: "#F59E0B"
+    default_conf_threshold: 0.40
+  3:
+    name: shout_bubble
+    cpp_enum: ShoutBubble
+    color: "#EF4444"
+    default_conf_threshold: 0.35
+  4:
+    name: whisper_bubble
+    cpp_enum: WhisperBubble
+    color: "#A855F7"
+    default_conf_threshold: 0.25
+  5:
+    name: borderless_dialogue
+    cpp_enum: BorderlessDialogue
+    color: "#EC4899"
+    default_conf_threshold: 0.28
+  6:
+    name: text_region
+    cpp_enum: TextRegion
+    color: "#EAB308"
+    default_conf_threshold: 0.35
+  7:
+    name: panel
+    cpp_enum: Panel
+    color: "#64748B"
+    default_conf_threshold: 0.45
+  8:
+    name: sfx_ignore
+    cpp_enum: SfxIgnore
+    color: "#F97316"
+    default_conf_threshold: 0.35
+
+minority_quotas:
+  thought_bubble: 800
+  narration_box: 1200
+  shout_bubble: 800
+  whisper_bubble: 600
+  borderless_dialogue: 1000
+  sfx_ignore: 3000
+
+qa_thresholds:
+  min_polygon_vertices: 3
+  min_area_px2: 144.0
+  duplicate_iou_threshold: 0.85
+
+split_ratios:
+  train: 0.75
+  val: 0.15
+  test: 0.10

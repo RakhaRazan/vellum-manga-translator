@@ -1,0 +1,7 @@
+# CMake build outputs and FetchContent cache
+build/
+out/
+CMakeUserPresets.json
+*.user
+*.suo
+*.pdb
