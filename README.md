@@ -8,7 +8,7 @@ Built with a pure modern **C++17** backend (**ONNX Runtime C++ API** + **Microso
 
 ## Download (Dual-Core Portable Releases)
 
-Download the latest portable archive from [Releases](https://github.com/HoldMyAss/vellum-manga-translator/releases), extract anywhere, and double-click `Vellum.exe`:
+Download the latest portable archive from [Releases] (https://github.com/HoldMyAss/vellum-manga-translator/releases), extract anywhere, and double-click `Vellum.exe`:
 
 | Variant | Archive | Backends Included | Best For |
 | :--- | :--- | :--- | :--- |
