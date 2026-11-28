@@ -12,7 +12,7 @@ Download the latest portable archive from [Releases](https://github.com/HoldMyAs
 
 | Variant | Archive | Backends Included | Best For |
 | :--- | :--- | :--- | :--- |
-| **Universal Dual-Core** (Recommended) | `Vellum-v3.0.0-Windows-x64-Universal.zip` | **CUDA 12.9 + DirectML + CPU** | All Windows x64 PCs — automatically launches `Vellum_Core.exe` (CUDA) on NVIDIA RTX GPUs or `Vellum_Core_DML.exe` (DirectML) on AMD Radeon, Intel Arc/iGPU, GTX, or CPU-only desktops, with 1-click backend switching in Settings. |
+| **Universal Dual-Core** (Recommended) | `Vellum-v3.0.0-Windows-x64-Universal.zip` | **CUDA 12.9 + DirectML + CPU** | All Windows x64 PCs - automatically launches `Vellum_Core.exe` (CUDA) on NVIDIA RTX GPUs or `Vellum_Core_DML.exe` (DirectML) on AMD Radeon, Intel Arc/iGPU, GTX, or CPU-only desktops, with 1-click backend switching in Settings. |
 | **CUDA Edition** | `Vellum-v3.0.0-Windows-x64-CUDA.zip` | **CUDA 12.9 + CPU** | Dedicated NVIDIA RTX systems looking for a smaller single-core footprint. |
 
 - **Requirements:** Windows 10/11 (x64) with Microsoft Edge WebView2 Runtime (pre-installed on Windows 11).
@@ -97,13 +97,13 @@ packaging\build_cpp_release.bat DML
 
 Vellum is built upon open-source computer vision, OCR, and inpainting model weights from the community:
 
-- **[YOLO11m-Seg](https://huggingface.co/ogkalu)** (`ogkalu` / Ultralytics datasets) — Comic and manga speech-bubble, panel, and SFX segmentation research.
-- **[comic-text-detector](https://github.com/dmMaze/comic-text-detector)** (`dmMaze`) — Manga text block and stroke mask detection weights.
-- **[manga-ocr](https://github.com/kha-white/manga-ocr)** (`kha-white`) — Japanese vertical/horizontal manga OCR model.
-- **[RapidOCR](https://github.com/RapidAI/RapidOCR)** & **[PaddleOCR / PaddleOCR-VL 1.6](https://github.com/PaddlePaddle/PaddleOCR)** (`PaddlePaddle`) — PP-OCRv4 Korean/Chinese recognition and PaddleOCR-VL-1.6 GGUF Vision-Language OCR models.
-- **[baberu-ocr](https://huggingface.co/genshiai-daichi/baberu-ocr)** (`genshiai-daichi/baberu-ocr`) — Lightweight quantized `JA`/`ZH`/`EN` and SFX manga OCR weights.
-- **[hayai-ocr-v2](https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2)** (`JustANormalTinkerer/hayai-ocr-v2`) — Aspect-ratio-preserving multilingual manga and webtoon OCR architecture.
-- **[LaMa](https://github.com/advimman/lama)** (`advimman/lama` & `lama-manga`) — Resolution-robust Large Mask Inpainting architecture.
-- **[aot-inpainting](https://huggingface.co/mayocream/aot-inpainting)** (`mayocream/aot-inpainting`) — Fast AOT-GAN manga text-stroke inpainting model.
-- **[RORem-mixed-GGUF](https://huggingface.co/mayocream/RORem-mixed-GGUF)** (`mayocream/RORem-mixed-GGUF`) — Generative manga text and object removal diffusion weights.
-- **[FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)** (`black-forest-labs/FLUX.2-klein-4B`) — High-speed rectified-flow generative inpainting model.
+- **[YOLO11m-Seg](https://huggingface.co/ogkalu)** (`ogkalu` / Ultralytics datasets) - Comic and manga speech-bubble, panel, and SFX segmentation research.
+- **[comic-text-detector](https://github.com/dmMaze/comic-text-detector)** (`dmMaze`) - Manga text block and stroke mask detection weights.
+- **[manga-ocr](https://github.com/kha-white/manga-ocr)** (`kha-white`) - Japanese vertical/horizontal manga OCR model.
+- **[RapidOCR](https://github.com/RapidAI/RapidOCR)** & **[PaddleOCR / PaddleOCR-VL 1.6](https://github.com/PaddlePaddle/PaddleOCR)** (`PaddlePaddle`) - PP-OCRv4 Korean/Chinese recognition and PaddleOCR-VL-1.6 GGUF Vision-Language OCR models.
+- **[baberu-ocr](https://huggingface.co/genshiai-daichi/baberu-ocr)** (`genshiai-daichi/baberu-ocr`) - Lightweight quantized `JA`/`ZH`/`EN` and SFX manga OCR weights.
+- **[hayai-ocr-v2](https://huggingface.co/JustANormalTinkerer/hayai-ocr-v2)** (`JustANormalTinkerer/hayai-ocr-v2`) - Aspect-ratio-preserving multilingual manga and webtoon OCR architecture.
+- **[LaMa](https://github.com/advimman/lama)** (`advimman/lama` & `lama-manga`) - Resolution-robust Large Mask Inpainting architecture.
+- **[aot-inpainting](https://huggingface.co/mayocream/aot-inpainting)** (`mayocream/aot-inpainting`) - Fast AOT-GAN manga text-stroke inpainting model.
+- **[RORem-mixed-GGUF](https://huggingface.co/mayocream/RORem-mixed-GGUF)** (`mayocream/RORem-mixed-GGUF`) - Generative manga text and object removal diffusion weights.
+- **[FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B)** (`black-forest-labs/FLUX.2-klein-4B`) - High-speed rectified-flow generative inpainting model.
