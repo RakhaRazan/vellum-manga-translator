@@ -13,7 +13,6 @@ Download the latest portable archive from [Releases](https://github.com/HoldMyAs
 | Variant | Archive | Backends Included | Best For |
 | :--- | :--- | :--- | :--- |
 | **Universal Dual-Core** (Recommended) | `Vellum-v3.0.0-Windows-x64-Universal.zip` | **CUDA 12.9 + DirectML + CPU** | All Windows x64 PCs - automatically launches `Vellum_Core.exe` (CUDA) on NVIDIA RTX GPUs or `Vellum_Core_DML.exe` (DirectML) on AMD Radeon, Intel Arc/iGPU, GTX, or CPU-only desktops, with 1-click backend switching in Settings. |
-| **CUDA Edition** | `Vellum-v3.0.0-Windows-x64-CUDA.zip` | **CUDA 12.9 + CPU** | Dedicated NVIDIA RTX systems looking for a smaller single-core footprint. |
 
 - **Requirements:** Windows 10/11 (x64) with Microsoft Edge WebView2 Runtime (pre-installed on Windows 11).
 - **100% Portable Relative Paths:** All runtime data resolves strictly relative to `Vellum.exe` (`./models/`, `./fonts/`, `./cache/`, `./projects_cache/`, and `./settings.json`)—zero `%LOCALAPPDATA%` or Registry clutter.
